@@ -23,6 +23,7 @@ const empty = {
   localFolders: new Set<string>(),
   folderTombstones: new Set<string>() as Set<string> | null,
   localFolderIds: new Map<string, string>(),
+  serverFolderIds: new Map<string, string>(),
 };
 
 function plan(over: Partial<typeof empty>) {
@@ -98,6 +99,28 @@ describe("planInbound — folders", () => {
     const p = plan({
       localFolderIds: new Map([["A", "fa"]]),
       folderTombstones: new Set(["fa"]),
+    });
+    expect(p.removeFolders).toEqual([]);
+  });
+
+  it("removes the emptied old directory of a folder the server MOVED", () => {
+    // We recorded id f1 at "Projects/vid"; the server now has f1 at "Archive/vid".
+    const p = plan({
+      localFolders: new Set(["Projects", "Projects/vid"]),
+      localFolderIds: new Map([["Projects", "fp"], ["Projects/vid", "f1"]]),
+      serverFolders: new Set(["Projects", "Archive", "Archive/vid"]),
+      serverFolderIds: new Map([["fp", "Projects"], ["fa", "Archive"], ["f1", "Archive/vid"]]),
+    });
+    expect(p.removeFolders).toEqual(["Projects/vid"]);
+    expect(p.createFolders).toEqual(["Archive", "Archive/vid"]);
+  });
+
+  it("leaves a moved folder's old path alone once the server has re-created it there", () => {
+    const p = plan({
+      localFolders: new Set(["Projects/vid"]),
+      localFolderIds: new Map([["Projects/vid", "f1"]]),
+      serverFolders: new Set(["Projects/vid", "Archive/vid"]),
+      serverFolderIds: new Map([["f1", "Archive/vid"], ["f2", "Projects/vid"]]),
     });
     expect(p.removeFolders).toEqual([]);
   });
@@ -416,5 +439,50 @@ describe("path safety", () => {
     });
     expect(p.renames).toEqual([]);
     expect(p.rejected[0]).toMatchObject({ kind: "rename", docId: "d1" });
+  });
+});
+
+/**
+ * The BenAI OS vault, 2026-09-04, after migration 023 merged its 71
+ * case-duplicated folders and 164 notes.
+ *
+ * The merge keeps ONE server row per case-insensitive path, and the one it kept
+ * spells the folder `Projects/Community`. The directory on disk is
+ * `Projects/community`. Compared exactly, every one of those notes is "on disk
+ * under one path, on the server under another" — 164 renames a pass, each a
+ * no-op or a refusal on a filesystem that has only one such directory — while
+ * `reconcile` separately re-registered all 235. The header read
+ * "Syncing 225/235", finished nothing, and started again.
+ */
+describe("planInbound — a case-variant spelling is the same file", () => {
+  const server = new Map([["doc-1", "Projects/Community/a.md"]]);
+  const local = new Map([["doc-1", "Projects/community/a.md"]]);
+
+  it("plans no rename when only the case differs", () => {
+    const p = plan({ server, local, baseline: new Map(local) });
+    expect(p.renames).toEqual([]);
+    expect(p.trash).toEqual([]);
+    expect(p.suppress.size).toBe(0);
+  });
+
+  it("still moves a note the server genuinely renamed", () => {
+    const p = plan({
+      server: new Map([["doc-1", "Projects/Community/renamed.md"]]),
+      local,
+      baseline: new Map(local),
+    });
+    expect(p.renames).toEqual([
+      { docId: "doc-1", from: "Projects/community/a.md", to: "Projects/Community/renamed.md" },
+    ]);
+  });
+
+  it("leaves an outbound case-only rename to the outbound side", () => {
+    // We moved it, the server has not caught up: `srv === prev` up to case.
+    const p = plan({
+      server: new Map([["doc-1", "Projects/Community/a.md"]]),
+      local: new Map([["doc-1", "Projects/community/moved.md"]]),
+      baseline: new Map([["doc-1", "Projects/community/a.md"]]),
+    });
+    expect(p.renames).toEqual([]);
   });
 });

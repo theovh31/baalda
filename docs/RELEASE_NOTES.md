@@ -1,3 +1,6 @@
-- Notes now open in **tabs** across the top — switch with a click, close with × or a middle-click, and jump back to where you were
-- Tabs follow renames and moves, and close themselves when a note is deleted
-- Teammates now show up in the sidebar the moment they open the app, instead of after their vault finishes syncing
+- Folder badges now count only the notes that actually need syncing (for example "1/2" for two new files), instead of the folder's whole population ("186/187")
+- A fully synced vault shows its synced dots right after connecting, without waiting for a sync run
+- Editing while a sync is running no longer re-reads every note title on each change, so the sidebar stays responsive on large vaults
+- A file added to a folder that a teammate had moved on the server no longer fails to sync forever ("1 not synced"): the folder is re-created at its old path and the file registers normally
+- Empty leftover files of notes deleted on the server are now cleaned up instead of lingering as unsyncable stubs
+- After a teammate moves a folder, the emptied old folder is removed on your device instead of coming back for everyone as an empty duplicate

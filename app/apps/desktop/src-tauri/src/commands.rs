@@ -6,8 +6,8 @@ use crate::attachments::{self, AttachmentMeta};
 use crate::error::{AppError, AppResult};
 use crate::import_export::{self, ImportSummary};
 use crate::index::{
-    Backlink, GraphEdge, Index, NoteMeta, NoteTitle, ResolvedLink, SearchResult, YjsState,
-    YjsStateVector,
+    Backlink, GraphEdge, Index, NoteMeta, NoteTitle, ResolvedLink, SearchResult, YjsPruneReport,
+    YjsState, YjsStateVector,
 };
 use crate::notefile;
 use crate::state::AppState;
@@ -146,16 +146,43 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Label for a path with no `file_name` (a filesystem/drive root): the path
+/// itself minus trailing separators, so `D:\\` reads "D:" — except a bare `/`,
+/// which has nothing left after the trim and stays as it is.
+fn root_label(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        path.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn vault_info(path: &Path, epoch: u64) -> VaultInfo {
+    // A filesystem/drive root (`/`, `D:\`) has no `file_name`, but it is a
+    // legal vault root (opened by path — the native picker can't select one).
+    // Label it by the path itself, trimmed of trailing separators, rather than
+    // the old anonymous "vault".
+    let name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) => n.to_string(),
+        None => root_label(&path.to_string_lossy()),
+    };
     VaultInfo {
         path: path.to_string_lossy().to_string(),
-        name: path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("vault")
-            .to_string(),
+        name,
         epoch,
     }
+}
+
+/// Payload of the `index-ready` event: the background index rebuild that
+/// `open_vault` starts has committed. `epoch` lets the UI drop a stale one.
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexReady {
+    pub path: String,
+    pub epoch: u64,
+    pub ok: bool,
+    pub ms: u64,
 }
 
 /// The epoch of the currently-open vault (0 when none has been opened). The TS
@@ -183,21 +210,68 @@ fn open_vault_inner(app: &AppHandle, state: &State<AppState>, path: PathBuf) -> 
     // stream vault files (e.g. `<img src>` in notes) via convertFileSrc.
     let _ = app.asset_protocol_scope().allow_directory(&path, true);
 
-    let index = Index::open(&path)?;
-    index.rebuild(&path)?;
-    let index = Arc::new(Mutex::new(index));
+    let index = Arc::new(Mutex::new(Index::open(&path)?));
 
+    // The watcher first, so nothing that changes during the rebuild below is
+    // missed: its drain thread queues behind the same index lock and re-indexes
+    // any file the rebuild may have seen too (idempotent).
     let watcher = watcher::start(path.clone(), index.clone(), app.clone())?;
 
     let epoch = {
         let mut inner = state.inner.lock().unwrap();
+        // Every open invalidates the previous vault's epoch, so any command still
+        // in flight for it is rejected rather than applied to this one.
+        let epoch = inner.vault_epoch + 1;
+
+        // Reconcile the index with disk in the BACKGROUND (#84). This used to run
+        // inline, so opening a large vault returned nothing to the UI until every
+        // changed/new `.md` had been re-parsed — a multi-second blank on first
+        // open, read as "the app hangs". The sidebar listing needs no index (it
+        // walks the disk), so the vault is usable at once; anything that does
+        // need the index (titles, search, backlinks, the sync reconcile) simply
+        // waits on its lock and gets the rebuilt answer.
+        //
+        // The rebuild thread takes the index lock BEFORE this open publishes the
+        // index into the state (the `ready` handshake below), so no command can
+        // read a stale index in between: the first reader blocks until the
+        // rebuild commits, exactly as if it had been inline. Correctness of every
+        // index reader is unchanged; only who waits for the rebuild is.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (bg_index, bg_path, bg_app) = (index.clone(), path.clone(), app.clone());
+        std::thread::spawn(move || {
+            let guard = bg_index.lock().unwrap();
+            let _ = ready_tx.send(());
+            let started = std::time::Instant::now();
+            let result = guard.rebuild(&bg_path);
+            drop(guard);
+            let ok = match result {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[index] rebuild failed for {}: {e}", bg_path.display());
+                    false
+                }
+            };
+            // Tells the UI the index is current: titles/backlinks/graph refresh.
+            let _ = bg_app.emit(
+                "index-ready",
+                IndexReady {
+                    path: bg_path.to_string_lossy().to_string(),
+                    epoch,
+                    ok,
+                    ms: started.elapsed().as_millis() as u64,
+                },
+            );
+        });
+        // Wait until the rebuild thread HOLDS the index lock (sub-millisecond),
+        // then publish. A `recv` error means the thread died before locking, in
+        // which case the index is simply stale-but-consistent, as before.
+        let _ = ready_rx.recv();
+
         inner.vault = Some(path.clone());
         inner.index = Some(index);
         inner.watcher = Some(watcher); // replaces & drops any previous watcher
-        // Every open invalidates the previous vault's epoch, so any command still
-        // in flight for it is rejected rather than applied to this one.
-        inner.vault_epoch += 1;
-        inner.vault_epoch
+        inner.vault_epoch = epoch;
+        epoch
     };
 
     let info = vault_info(&path, epoch);
@@ -326,7 +400,9 @@ pub fn delete_vault(app: AppHandle, path: String) -> AppResult<()> {
     write_config(&app, &cfg)
 }
 
-/// Create a brand-new empty vault folder `<parent>/<name>` and open it.
+/// Create a brand-new empty vault folder `<parent>/<name>` and open it. A name
+/// whose folder is taken gets a numeric suffix (see `free_vault_dir`) rather
+/// than an error — duplicate vault names are allowed.
 #[tauri::command]
 pub async fn create_vault(
     app: AppHandle,
@@ -343,12 +419,28 @@ pub async fn create_vault(
     {
         return Err(AppError::new("invalid vault name"));
     }
-    let dir = PathBuf::from(&parent).join(name);
-    if dir.exists() {
-        return Err(AppError::new("a folder with that name already exists"));
-    }
+    let dir = free_vault_dir(Path::new(&parent), name)
+        .ok_or_else(|| AppError::new("a folder with that name already exists"))?;
     std::fs::create_dir_all(&dir)?;
     open_vault_inner(&app, &state, dir)
+}
+
+/// `<parent>/<name>`, or the first free `<parent>/<name> 2`, `… 3`, … if that
+/// folder is taken. None if every candidate up to 99 exists.
+///
+/// A vault's identity is its `doc_id`s, never its name, so two vaults may share
+/// a display name — including one already on this disk. This used to be a hard
+/// error ("a folder with that name already exists"), which made a name someone
+/// else had picked (a teammate's vault, an old folder of your own) un-typeable
+/// rather than merely un-repeatable as a *folder*. A local vault is named by
+/// its folder, so the second "hey" reads "hey 2" — nameable, and renamable
+/// from Finder — instead of refusing to be created at all.
+fn free_vault_dir(parent: &Path, name: &str) -> Option<PathBuf> {
+    let first = parent.join(name);
+    if !first.exists() {
+        return Some(first);
+    }
+    (2..100).map(|n| parent.join(format!("{name} {n}"))).find(|d| !d.exists())
 }
 
 /// Report whether a folder already looks like a vault (has our `.context/` index
@@ -928,6 +1020,18 @@ pub async fn graph_edges(state: State<'_, AppState>) -> AppResult<Vec<GraphEdge>
     guard.graph_edges()
 }
 
+/// The edges touching the given notes only — the Graph view's per-change delta
+/// (#83), so an edit to one note no longer re-reads the whole edge set.
+#[tauri::command]
+pub async fn graph_edges_for(
+    state: State<'_, AppState>,
+    note_ids: Vec<String>,
+) -> AppResult<Vec<GraphEdge>> {
+    let (_, index) = require_vault(&state)?;
+    let guard = index.lock().unwrap();
+    guard.graph_edges_for(&note_ids)
+}
+
 #[tauri::command]
 pub async fn get_note_meta(
     state: State<'_, AppState>,
@@ -1021,6 +1125,45 @@ pub async fn save_yjs_state_vectors(
     guard.save_yjs_state_vectors(&entries)
 }
 
+/// Discard one doc's local CRDT (the local half of an oversized-note repair).
+#[tauri::command]
+pub async fn clear_yjs_doc(
+    state: State<'_, AppState>,
+    doc_id: String,
+    expected_epoch: Option<u64>,
+) -> AppResult<()> {
+    let (_, index) = require_vault_at(&state, expected_epoch)?;
+    let guard = index.lock().unwrap();
+    guard.clear_yjs_doc(&doc_id)
+}
+
+/// Collect dead CRDT docs, then reclaim the file.
+///
+/// `live` is the caller's COMPLETE set of doc ids still in use — the TS registry
+/// owns that map (`.context/config.json`), which is why this is driven from the
+/// UI layer rather than derived here: Rust's `notes.id` and the server's
+/// `doc_id` are not guaranteed to be the same value in a vault whose index was
+/// built before it was registered, so a Rust-side guess would delete live docs.
+///
+/// One command rather than two so a caller cannot prune and then skip the
+/// vacuum, which is the combination that frees nothing a user can see.
+#[tauri::command]
+pub async fn prune_yjs_docs(
+    state: State<'_, AppState>,
+    live: Vec<String>,
+    expected_epoch: Option<u64>,
+) -> AppResult<YjsPruneReport> {
+    let (_, index) = require_vault_at(&state, expected_epoch)?;
+    let guard = index.lock().unwrap();
+    let mut report = guard.prune_yjs_docs(&live)?;
+    // Only rewrite the file when the prune actually freed something; VACUUM on a
+    // clean 900 MB database is minutes of pointless I/O on every vault open.
+    if report.docs_removed > 0 || report.updates_removed > 0 {
+        report.bytes_reclaimed = guard.vacuum()?;
+    }
+    Ok(report)
+}
+
 /// Every state vector this vault holds, for the sync engine's `hello` manifest.
 #[tauri::command]
 pub async fn list_yjs_state_vectors(
@@ -1080,6 +1223,22 @@ pub async fn read_external_file(path: String) -> AppResult<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// A vault opened at a filesystem/drive root has no `file_name`; its label
+    /// must fall back to the path itself, never the anonymous "vault".
+    #[test]
+    fn vault_info_names_filesystem_roots() {
+        // Ordinary folder: the folder's own name.
+        let v = vault_info(Path::new("/home/me/Notes"), 1);
+        assert_eq!(v.name, "Notes");
+        // Unix root: nothing to trim — keep the path.
+        let v = vault_info(Path::new("/"), 1);
+        assert_eq!(v.name, "/");
+        // Windows drive root (verbatim string, host-independent): trailing
+        // separator trimmed so the label reads "D:".
+        assert_eq!(root_label("D:\\"), "D:");
+        assert_eq!(root_label("/"), "/");
+    }
+
     /// The rediscovery probe must identify a vault folder without opening it,
     /// and must answer None (never an error) for everything that isn't one —
     /// a scan over recents can't have one bad candidate abort the whole pass.
@@ -1118,6 +1277,26 @@ mod tests {
             peek_vault_config(file.to_string_lossy().to_string()).unwrap(),
             None
         );
+    }
+
+    /// Two vaults may share a name (identity is the doc_ids, not the name), so
+    /// a taken folder must not make the name un-typeable — it takes a suffix.
+    #[test]
+    fn free_vault_dir_suffixes_a_taken_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Free name: used exactly as typed.
+        assert_eq!(free_vault_dir(root, "hey").unwrap(), root.join("hey"));
+        // Taken twice over: the first free suffix wins, and the user's name
+        // stays recognizable in it.
+        std::fs::create_dir_all(root.join("hey")).unwrap();
+        assert_eq!(free_vault_dir(root, "hey").unwrap(), root.join("hey 2"));
+        std::fs::create_dir_all(root.join("hey 2")).unwrap();
+        assert_eq!(free_vault_dir(root, "hey").unwrap(), root.join("hey 3"));
+        // A file (not a folder) in the way still counts as taken — creating the
+        // vault there would fail.
+        std::fs::write(root.join("note"), "x").unwrap();
+        assert_eq!(free_vault_dir(root, "note").unwrap(), root.join("note 2"));
     }
 
     /// `folder_exists` is what tells "bound folder moved" (rediscover) from

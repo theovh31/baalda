@@ -13,7 +13,8 @@ import {
   writeItemColors,
 } from "./lib/appearance";
 import { readItemOrder, writeItemOrder, type ItemOrder } from "./lib/ordering";
-import { loadedFolderPaths, setChildrenAt } from "./lib/tree/lazyTree";
+import { loadedFolderPaths, mergeChildren, nodeAt, setChildrenAt } from "./lib/tree/lazyTree";
+import { applyTitlePatch } from "./lib/tree/titles";
 import {
   ApiError,
   type BillingConfig,
@@ -66,6 +67,10 @@ import {
   queueNoteLink,
   takePendingNoteLink,
 } from "./lib/noteLinkFlow";
+
+/** Notes already toasted about a failed sync registration — one sticky
+ *  explanation per note is enough; the retry is automatic. */
+const registerFailureToasted = new Set<string>();
 
 export interface OpenNote {
   path: string;
@@ -267,10 +272,21 @@ interface AppStore {
   setRootFrozen: (frozen: boolean) => Promise<void>;
   setItemOrder: (order: ItemOrder) => void;
   setTreeSort: (sort: TreeSort) => void;
-  refreshTree: () => Promise<void>;
+  /**
+   * Re-list the sidebar. With `folders`, ONLY those folder listings are re-read
+   * (the watcher batch said nothing else changed); without it, the root and
+   * every expanded folder are re-listed.
+   */
+  refreshTree: (folders?: ReadonlySet<string>) => Promise<void>;
   /** Lazily load one folder's immediate children into the sidebar tree. */
   loadChildren: (path: string) => Promise<void>;
   refreshTitles: () => Promise<void>;
+  /**
+   * Bring `titles` current for just the notes a watcher batch named: re-read
+   * those rows (one `getNoteMeta` each) and drop the removed ones, instead of
+   * re-listing every note in the vault (`refreshTitles`).
+   */
+  patchTitles: (changes: ReadonlyArray<{ path: string; kind: "modified" | "removed" }>) => Promise<void>;
   /** First-run seeding for a local (not-yet-synced) empty vault. */
   seedLocalVaultIfEmpty: () => Promise<void>;
   /** Open the root Welcome note if it exists and nothing else is open. */
@@ -293,6 +309,13 @@ interface AppStore {
   pruneTabs: (paths: string[]) => void;
   /** Re-point tabs across a rename/move of a file or a folder subtree. */
   remapTabs: (from: string, to: string) => void;
+  /** Close every tab except the given one, which takes (or keeps) the screen. */
+  closeOtherTabs: (path: string) => void;
+  /** Close every tab after the given one; it takes the screen if the active
+   *  tab was among the closed. */
+  closeTabsToRight: (path: string) => void;
+  /** Close every tab and clear the editor. */
+  closeAllTabs: () => void;
 
   // Auth actions
   initAuth: () => Promise<void>;
@@ -455,19 +478,49 @@ export function readOrgVaults(): Record<string, string> {
 }
 
 /**
- * A folder name for a vault that won't collide with a folder already bound
- * to another vault under the managed root. Deterministic-ish for the MVP.
+ * A folder name for a vault that won't collide with a folder already bound to
+ * another vault under the managed root, or with one merely sitting there on
+ * disk. Deterministic-ish for the MVP.
+ *
+ * The on-disk half is not belt-and-braces: `openVaultInRoot({ create: true })`
+ * is a `create_dir_all`, so it opens a folder that already exists just as
+ * happily as it makes a new one. A vault named like a local vault the user
+ * already had ("hello") therefore used to ADOPT that folder — binding it to the
+ * new vault and uploading its notes into it, while the local vault itself
+ * vanished from the switcher. Vault names are allowed to repeat (identity is
+ * the doc_ids); their folders are not.
  */
-function uniqueFolderSlug(name: string, bound: Record<string, string>): string {
+function uniqueFolderSlug(
+  name: string,
+  bound: Record<string, string>,
+  onDisk: readonly string[] = [],
+): string {
   const base = slugify(name);
-  const taken = new Set(
-    Object.values(bound).map((p) => (p.split("/").pop() ?? "").toLowerCase()),
-  );
+  const basename = (p: string) => (p.split("/").pop() ?? "").toLowerCase();
+  const taken = new Set([
+    ...Object.values(bound).map(basename),
+    ...onDisk.map(basename),
+  ]);
   if (!taken.has(base)) return base;
   for (let i = 2; i < 1000; i++) {
     if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
   }
   return base;
+}
+
+/**
+ * Absolute path for a vault that has no local folder on this device yet: a free
+ * name under the managed vaults root (see `uniqueFolderSlug`). Callers have
+ * already exhausted the alternatives — a live binding, then rediscovery of an
+ * existing copy — so anything still standing in the way belongs to something
+ * else.
+ */
+async function freeVaultFolder(name: string): Promise<string> {
+  const [root, onDisk] = await Promise.all([
+    ipc.getVaultsRoot(),
+    ipc.listVaultsRootDirs().catch(() => [] as string[]),
+  ]);
+  return `${root}/${uniqueFolderSlug(name, readOrgVaults(), onDisk)}`;
 }
 
 function rememberOrgVault(orgId: string, vaultPath: string): void {
@@ -962,12 +1015,45 @@ export const useStore = create<AppStore>((set, get) => ({
     set({ treeSort: sort });
   },
 
-  refreshTree: async () => {
+  refreshTree: async (folders) => {
     // Lazy loading: fetch only the vault's top level, not the whole tree.
     // Folders load their children on first expand (see `loadChildren`), so
     // switching a large vault no longer ships/parses the entire node set.
     const vault = get().vault;
     const epoch = vault?.epoch;
+    const current = get().tree;
+    // Targeted refresh (#82): the watcher told us which files changed, so only
+    // their parent folders' listings can differ. Re-list exactly those (and only
+    // if they are on screen — a collapsed folder has no listing to refresh),
+    // patching them into the tree in place. Every file change used to re-list
+    // the root AND every expanded folder, one IPC apiece — a burst of
+    // filesystem work per keystroke egest on a big tree.
+    if (folders && current) {
+      const loaded = new Set(loadedFolderPaths(current));
+      const targets = [...folders].filter((dir) => dir === "" || loaded.has(dir));
+      if (targets.length === 0) return;
+      const listings = await Promise.all(
+        targets.map(async (dir) => {
+          try {
+            return { dir, kids: await ipc.listChildren(dir, epoch) };
+          } catch (e) {
+            if (ipc.isVaultMismatch(e)) return { dir, kids: null };
+            return { dir, kids: null }; // folder gone mid-refresh: leave it, the
+            // structural batch that follows re-lists its parent
+          }
+        }),
+      );
+      if (!sameVault(get, epoch)) return;
+      let next = get().tree; // re-read: another refresh may have landed meanwhile
+      if (!next) return;
+      for (const { dir, kids } of listings) {
+        if (!kids) continue;
+        const merged = mergeChildren(nodeAt(next, dir)?.children, kids);
+        next = setChildrenAt(next, dir, merged);
+      }
+      set({ tree: next });
+      return;
+    }
     // Which folders were already expanded/listed. This refresh runs on every
     // `file-changed` burst and every sync registry pull — i.e. constantly while
     // you work — and rebuilding from the top level alone would drop each of
@@ -1051,6 +1137,34 @@ export const useStore = create<AppStore>((set, get) => ({
     set({ titles });
   },
 
+  patchTitles: async (changes) => {
+    const epoch = get().vault?.epoch;
+    const md = changes.filter((c) => c.path.toLowerCase().endsWith(".md"));
+    if (md.length === 0) return;
+    const removed: string[] = [];
+    const updates: ipc.NoteTitle[] = [];
+    await Promise.all(
+      md.map(async (c) => {
+        if (c.kind === "removed") {
+          removed.push(c.path);
+          return;
+        }
+        try {
+          const meta = await ipc.getNoteMeta(c.path);
+          // Not in the index (yet, or any more): nothing to show for it.
+          if (!meta) removed.push(c.path);
+          else updates.push({ id: meta.id, path: meta.path, title: meta.title });
+        } catch {
+          // Leave that row alone; the next full refresh (a structural batch or a
+          // vault open) reconciles it.
+        }
+      }),
+    );
+    if (!sameVault(get, epoch)) return;
+    const next = applyTitlePatch(get().titles, updates, removed);
+    if (next !== get().titles) set({ titles: next });
+  },
+
   seedLocalVaultIfEmpty: async () => {
     // First-run welcome content for an empty, local-only vault. Reached ONLY
     // from the "New vault" flows (via `adoptOpenedVault({ seed: true })`) —
@@ -1101,6 +1215,27 @@ export const useStore = create<AppStore>((set, get) => ({
           await syncManager.registry.registerNote(path, title, meta?.id);
         } catch (e) {
           console.warn("[sync] registerNote failed", e);
+          if (!sameVault(get, epoch)) return;
+          // The note opens regardless (local-first: the text is safe on disk),
+          // but it opens UNREGISTERED — no docId, so no provider connects and
+          // nothing it says reaches the server. Two things keep that from being
+          // silent (#80): the row stays badged unsynced (it has no mapping, and
+          // the sidebar counts unmapped notes as unsynced), and the same
+          // debounced registry pull a teammate's change triggers is armed here,
+          // which registers the note and uploads its content when it runs.
+          syncManager.handleRegistryChanged();
+          // Say so once per note. Skipped while the vault channel itself is down:
+          // the connection indicator already reads "Retrying…", and a toast per
+          // opened note while offline would only bury it.
+          if (get().syncStatus === "synced" && !registerFailureToasted.has(path)) {
+            registerFailureToasted.add(path);
+            toast(
+              `"${title}" couldn't be registered for sync — ${
+                e instanceof Error ? e.message : String(e)
+              }. It's saved on this device and will be retried.`,
+              "error",
+            );
+          }
         }
         if (!sameVault(get, epoch)) return;
       }
@@ -1283,6 +1418,32 @@ export const useStore = create<AppStore>((set, get) => ({
     if (next.length !== tabs.length || next.some((p, i) => p !== tabs[i])) {
       set({ openTabs: next });
     }
+  },
+
+  closeOtherTabs: (path) => {
+    // No membership guard: the strip can offer this on the phantom tab it
+    // renders for an open note that vault machinery dropped from the list —
+    // "close others" then simply makes that note's tab real and only.
+    set({ openTabs: [path] });
+    // The survivor takes the screen; leaving a closed tab's note up would break
+    // the strip's "active = what's on screen" rule.
+    if (get().openNote?.path !== path) void get().openNoteByPath(path);
+  },
+
+  closeTabsToRight: (path) => {
+    const { openTabs, openNote } = get();
+    const idx = openTabs.indexOf(path);
+    if (idx === -1 || idx === openTabs.length - 1) return;
+    const next = openTabs.slice(0, idx + 1);
+    set({ openTabs: next });
+    // The active tab was among the closed: the anchor of the close is the
+    // nearest survivor, so it takes the screen.
+    if (openNote && !next.includes(openNote.path)) void get().openNoteByPath(path);
+  },
+
+  closeAllTabs: () => {
+    set({ openTabs: [] });
+    get().closeNote();
   },
 
   // ---- Auth ----
@@ -1894,10 +2055,9 @@ export const useStore = create<AppStore>((set, get) => ({
       // The prompt survives as the FALLBACK: if we can't create a folder (a bad
       // vaults root, permissions), asking beats failing silently.
       try {
-        const root = await ipc.getVaultsRoot();
+        const folder = await freeVaultFolder(orgName);
         if (superseded()) return;
-        const slug = uniqueFolderSlug(orgName, readOrgVaults());
-        await get().applyVaultFolder(organizationId, `${root}/${slug}`, {
+        await get().applyVaultFolder(organizationId, folder, {
           create: true,
           seedIfEmpty: opts.seedIfEmpty,
         });
@@ -2159,12 +2319,11 @@ export const useStore = create<AppStore>((set, get) => ({
   startEmptyVault: async () => {
     const pending = get().pendingVaultFolder;
     if (!pending) return;
-    const root = await ipc.getVaultsRoot();
+    const folder = await freeVaultFolder(pending.orgName);
     // A switch during that read would replace the prompt; binding a folder for the
     // superseded vault would point the Rust slot at the wrong folder.
     if (get().pendingVaultFolder?.orgId !== pending.orgId) return;
-    const slug = uniqueFolderSlug(pending.orgName, readOrgVaults());
-    await get().applyVaultFolder(pending.orgId, `${root}/${slug}`, {
+    await get().applyVaultFolder(pending.orgId, folder, {
       create: true,
       seedIfEmpty: pending.seedIfEmpty,
     });

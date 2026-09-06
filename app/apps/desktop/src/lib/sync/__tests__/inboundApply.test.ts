@@ -530,6 +530,200 @@ describe("inbound folder deletion", () => {
     );
   });
 
+  it("removes the emptied old directory after a server-side folder move, and does not re-register it", async () => {
+    const disk = new FakeDisk();
+    disk.folders.add("Projects");
+    disk.folders.add("Projects/vid");
+    disk.notes.set("Projects/vid/a.md", "d1");
+    const { api } = await twoPasses({
+      disk,
+      first: {
+        notes: [{ id: "d1", rel_path: "Projects/vid/a.md" }],
+        folders: [{ id: "fp", path: "Projects" }, { id: "f1", path: "Projects/vid" }],
+      },
+      then: {
+        notes: [{ id: "d1", rel_path: "Archive/vid/a.md" }],
+        folders: [
+          { id: "fp", path: "Projects" },
+          { id: "fa", path: "Archive" },
+          { id: "f1", path: "Archive/vid" },
+        ],
+      },
+    });
+    // The note followed the move, the emptied old directory is gone, and — the
+    // part that used to bite the whole team — no empty twin was created upstream.
+    expect(disk.notes.has("Archive/vid/a.md")).toBe(true);
+    expect(disk.folders.has("Projects/vid")).toBe(false);
+    expect(vi.mocked(api.createFolder)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ path: "Projects/vid" }),
+    );
+  });
+
+  it("re-creates a folder at a path the server MOVED away from, so a file left there registers", async () => {
+    // Production case ("1 not synced", forever): the server moved
+    // `Projects/vid` to `Archive/vid`. The old directory stayed on disk (it held
+    // a file the per-note rename never carried), the old path → id entry stayed
+    // in the map, and every later file dropped into the old directory was
+    // registered with the MOVED folder's id — refused as path_folder_mismatch.
+    const disk = new FakeDisk();
+    disk.folders.add("Projects");
+    disk.folders.add("Projects/vid");
+    const first: ServerState = {
+      notes: [],
+      folders: [{ id: "f1", path: "Projects/vid" }],
+    };
+    install(disk);
+    const reg1 = new VaultRegistry(fakeApi(first));
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    expect(reg1.getFolderId("Projects/vid")).toBe("f1");
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+
+    // The server moved the folder; a new note appears in the OLD directory.
+    disk.notes.set("Projects/vid/new.md", "d-new");
+    const api = fakeApi({
+      notes: [],
+      folders: [
+        { id: "folder-Projects", path: "Projects" },
+        { id: "fa", path: "Archive" },
+        { id: "f1", path: "Archive/vid" },
+      ],
+    });
+    vi.mocked(api.createFolder).mockClear();
+    vi.mocked(api.createNote).mockClear();
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost().host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    // The stale entry is gone, the old path is a NEW folder under its real
+    // parent, and the note registers against it — not against the moved id.
+    expect(vi.mocked(api.createFolder)).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "Projects/vid", parentId: "folder-Projects" }),
+    );
+    expect(reg.getFolderId("Projects/vid")).toBe("folder-Projects/vid");
+    expect(reg.getFolderId("Archive/vid")).toBe("f1");
+    expect(vi.mocked(api.createNote)).toHaveBeenCalledWith(
+      expect.objectContaining({ relPath: "Projects/vid/new.md", folderId: "folder-Projects/vid" }),
+    );
+    expect(reg.getMapping("Projects/vid/new.md")?.docId).toBe("d-new");
+    expect(reg.failures()).toEqual([]);
+  });
+
+  it("trashes an EMPTY leftover of a deleted note that the plan could only suppress", async () => {
+    // The file at the deleted note's path is still on disk, but the local index
+    // keys it under a different id (a re-indexed placeholder). The plan can't
+    // prove it is the same note, so it only suppresses re-registration; for an
+    // empty file that left a zero-byte stub nobody could sync or count.
+    const disk = new FakeDisk();
+    disk.folders.add("Team");
+    disk.notes.set("Team/stub.md", "d1");
+    const { api } = await twoPasses({
+      disk,
+      // Between passes the local index re-keyed the file: swap its id below.
+      first: {
+        notes: [{ id: "d1", rel_path: "Team/stub.md" }],
+        folders: [{ id: "f1", path: "Team" }],
+      },
+      then: { notes: [], tombstones: ["d1"], folders: [{ id: "f1", path: "Team" }] },
+    });
+    // twoPasses already trashed the file under its ORIGINAL id (the plain path,
+    // covered elsewhere). Re-run the deleted state with the file re-keyed and
+    // present again, as the production stubs were.
+    disk.notes.set("Team/stub.md", "local-rekeyed");
+    disk.trashed.length = 0;
+    vi.mocked(api.createNote).mockClear();
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost().host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(disk.trashed.map((t) => t.from)).toEqual(["Team/stub.md"]);
+    expect(vi.mocked(api.createNote)).not.toHaveBeenCalled();
+  });
+
+  it("leaves a NON-empty suppressed leftover alone (it may be someone's work)", async () => {
+    const disk = new FakeDisk();
+    disk.folders.add("Team");
+    disk.notes.set("Team/stub.md", "d1");
+    const { api } = await twoPasses({
+      disk,
+      first: {
+        notes: [{ id: "d1", rel_path: "Team/stub.md" }],
+        folders: [{ id: "f1", path: "Team" }],
+      },
+      then: { notes: [], tombstones: ["d1"], folders: [{ id: "f1", path: "Team" }] },
+    });
+    disk.notes.set("Team/stub.md", "local-rekeyed");
+    disk.bodies.set("Team/stub.md", "typed here after the delete");
+    disk.trashed.length = 0;
+    vi.mocked(api.createNote).mockClear();
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost().host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(disk.trashed).toEqual([]);
+    expect(vi.mocked(api.createNote)).not.toHaveBeenCalled(); // still no ghost
+  });
+
+  it("stops claiming a non-empty leftover, so a LATER pass syncs the user's content", async () => {
+    // The regression behind "dragging a folder in doesn't start syncing, and on
+    // reload it never does". A previously-synced folder was deleted server-side,
+    // leaving tombstones AND baseline entries for its paths. Re-importing the
+    // folder puts files back on those exact paths under fresh local index ids, so
+    // `planInbound` hits `dead && loc === undefined` and suppresses every one of
+    // them — in production, all 176 `Daily/*` notes: `0/174`, nothing queued, no
+    // error shown, and only opening a note synced it (the editor calls
+    // `registerNote` directly, bypassing `suppress`).
+    //
+    // The pass that discovers this still suppresses (no mid-pass ghost), but it
+    // must RELEASE the baseline claim so the next pass can register the file as
+    // the new local note it is.
+    const disk = new FakeDisk();
+    disk.folders.add("Team");
+    disk.notes.set("Team/stub.md", "d1");
+    const { api } = await twoPasses({
+      disk,
+      first: {
+        notes: [{ id: "d1", rel_path: "Team/stub.md" }],
+        folders: [{ id: "f1", path: "Team" }],
+      },
+      then: { notes: [], tombstones: ["d1"], folders: [{ id: "f1", path: "Team" }] },
+    });
+    // Re-imported: same path, fresh local id, real content.
+    disk.notes.set("Team/stub.md", "local-rekeyed");
+    disk.bodies.set("Team/stub.md", "# a day\n\nreal content the user dropped in");
+    disk.trashed.length = 0;
+
+    // Pass 3 discovers the dead-but-present file: suppressed, not trashed, and
+    // the claim is dropped (surfaced, not silent).
+    vi.mocked(api.createNote).mockClear();
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost().host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    expect(disk.trashed).toEqual([]); // never destroy content we can't identify
+    expect(vi.mocked(api.createNote)).not.toHaveBeenCalled(); // no ghost this pass
+    expect(reg.failures().map((f) => f.reason).join(" ")).toContain(
+      "deleted on the server",
+    );
+
+    // Pass 4 — the reload. THIS is what used to never happen. Feed it the config
+    // pass 3 actually persisted (the harness pins `getVaultConfig` otherwise), so
+    // this is a genuine restart against the released baseline.
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(
+      writes[writes.length - 1]?.[0] as never,
+    );
+    vi.mocked(api.createNote).mockClear();
+    const reg2 = new VaultRegistry(api);
+    reg2.setInboundHost(recordingHost().host);
+    await reg2.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(vi.mocked(api.createNote)).toHaveBeenCalledWith(
+      expect.objectContaining({ relPath: "Team/stub.md" }),
+    );
+    expect(reg2.getMapping("Team/stub.md")).not.toBeNull();
+    expect(disk.trashed).toEqual([]); // still never trashed
+  });
+
   it("does nothing on folder tombstones the server did not answer about (null)", async () => {
     const disk = new FakeDisk();
     disk.folders.add("Team");

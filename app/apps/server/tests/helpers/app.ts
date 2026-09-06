@@ -1,5 +1,5 @@
 import type { AppDeps } from "../../src/http/app.js";
-import type { DocActor, DocWriter } from "../../src/mcp/doc-writer.js";
+import { revisionOf, type DocActor, type DocWriter, type TextOp } from "../../src/mcp/doc-writer.js";
 
 /** One recorded write, so a test can assert WHO the server said wrote it. */
 export interface RecordedWrite {
@@ -22,6 +22,18 @@ export function memoryDocWriter(): MemoryDocWriter {
   return {
     store,
     writes,
+    async editContent(vaultId, docId, plan: (current: string) => TextOp[], actor) {
+      let text = store.get(docId) ?? "";
+      for (const op of plan(text)) {
+        if (op.index < 0 || op.deleteLength < 0 || op.index + op.deleteLength > text.length) {
+          throw new Error(`edit out of range: index ${op.index}, delete ${op.deleteLength}, length ${text.length}`);
+        }
+        text = text.slice(0, op.index) + op.insert + text.slice(op.index + op.deleteLength);
+      }
+      store.set(docId, text);
+      writes.push({ vaultId, docId, content: text, actor });
+      return { revision: revisionOf(text), content: text };
+    },
     async setContent(vaultId, docId, content, actor) {
       store.set(docId, content);
       writes.push({ vaultId, docId, content, actor });
@@ -54,6 +66,7 @@ export function memoryDocWriter(): MemoryDocWriter {
 export function testAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
   return {
     disconnectDoc: () => {},
+    evictDoc: () => {},
     docWriter: memoryDocWriter(),
     onRegistryChanged: () => {},
     onAclChanged: () => {},
@@ -69,6 +82,8 @@ export interface RecordingAppDeps {
   aclBroadcasts: string[];
   /** Docs whose live sync sockets were force-closed. */
   disconnected: Array<{ vaultId: string; docId: string }>;
+  /** Docs closed AND dropped from the server's memory (see `AppDeps.evictDoc`). */
+  evicted: Array<{ vaultId: string; docId: string }>;
   docWriter: MemoryDocWriter;
   /** Clear all recordings (call from `beforeEach`). */
   reset(): void;
@@ -84,22 +99,26 @@ export function recordingAppDeps(overrides: Partial<AppDeps> = {}): RecordingApp
   const registryBroadcasts: RecordingAppDeps["registryBroadcasts"] = [];
   const aclBroadcasts: string[] = [];
   const disconnected: RecordingAppDeps["disconnected"] = [];
+  const evicted: RecordingAppDeps["evicted"] = [];
   const docWriter = memoryDocWriter();
   return {
     registryBroadcasts,
     aclBroadcasts,
     disconnected,
+    evicted,
     docWriter,
     reset() {
       registryBroadcasts.length = 0;
       aclBroadcasts.length = 0;
       disconnected.length = 0;
+      evicted.length = 0;
       docWriter.store.clear();
       docWriter.writes.length = 0;
     },
     deps: {
       docWriter,
       disconnectDoc: (vaultId, docId) => disconnected.push({ vaultId, docId }),
+      evictDoc: (vaultId, docId) => evicted.push({ vaultId, docId }),
       onRegistryChanged: (vaultId, originId) => registryBroadcasts.push({ vaultId, originId }),
       onAclChanged: (vaultId) => aclBroadcasts.push(vaultId),
       ...overrides,

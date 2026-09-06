@@ -36,6 +36,9 @@ const fakeRegistry = vi.hoisted(() => {
     reset: vi.fn(),
     getMapping: vi.fn((_relPath: string): { vaultId: string; docId: string } | null => null),
     pathForDocId: vi.fn((_docId: string): string | null => null),
+    /** relPaths the fake disk holds as EMPTY files. */
+    emptyOnDisk: new Set<string>(),
+    isNoteEmptyOnDisk: vi.fn(async (relPath: string) => reg.emptyOnDisk.has(relPath)),
     allDocIds: vi.fn((): string[] => []),
     setProgressSink: vi.fn(),
     setMapListener: vi.fn(),
@@ -190,6 +193,9 @@ beforeEach(() => {
   fakeRegistry.markPushed.mockClear();
   fakeRegistry.mappedNotes.mockReturnValue([]);
   fakeRegistry.getMapping.mockReturnValue(null);
+  fakeRegistry.pathForDocId.mockReturnValue(null);
+  fakeRegistry.emptyOnDisk = new Set();
+  fakeRegistry.isNoteEmptyOnDisk.mockClear();
   engineHooks.opts = null;
   engineHooks.started = 0;
   engineHooks.refreshes = 0;
@@ -290,6 +296,51 @@ describe("SyncManager — ready.empty is the authority", () => {
     expect(engineHooks.refreshes).toBe(0); // nothing was truncated
   });
 
+  it("settles a server-empty doc whose local file is empty too - no push, ever", async () => {
+    // The production loop behind "310 files re-syncing on every reload": the
+    // vault holds hundreds of zero-byte placeholder notes. The server has no
+    // content for them (there is none), names them on every `ready`, and the run
+    // pushed each one over its own socket - seeding nothing - every connect.
+    const notes = [
+      { docId: "stub-1", relPath: "Daily/_Index.md" },
+      { docId: "stub-2", relPath: "Departments/_Index.md" },
+      { docId: "real", relPath: "Real.md" },
+    ];
+    fakeRegistry.mappedNotes.mockReturnValue(notes);
+    fakeRegistry.pathForDocId.mockImplementation(
+      (docId: string) => notes.find((n) => n.docId === docId)?.relPath ?? null,
+    );
+    fakeRegistry.emptyOnDisk = new Set(["Daily/_Index.md", "Departments/_Index.md"]);
+    for (const n of notes) fakeRegistry.pushed.add(n.docId);
+    const sm = new SyncManager();
+    const badges: Record<string, string> = {};
+    sm.setDocStateListener((patch) => {
+      for (const [id, state] of Object.entries(patch)) if (state) badges[id] = state;
+    });
+    await enable(sm);
+    engineHooks.settled = true;
+
+    engineHooks.opts!.onServerEmpty?.(["stub-1", "stub-2", "real"], false);
+    await sm.whenBulkSyncSettled();
+    await flush();
+
+    // Only the note with bytes to give dialled the server; the stubs were settled
+    // from disk, badged synced, and recorded as confirmed.
+    expect(connects.order).toEqual(["real"]);
+    expect(badges["stub-1"]).toBe("synced");
+    expect(badges["stub-2"]).toBe("synced");
+    expect(fakeRegistry.isNoteEmptyOnDisk).toHaveBeenCalledTimes(3);
+
+    // The next connect names them again (the server still has nothing, which is
+    // correct). This time not even the disk is consulted: nothing re-queues.
+    fakeRegistry.isNoteEmptyOnDisk.mockClear();
+    engineHooks.opts!.onServerEmpty?.(["stub-1", "stub-2"], false);
+    await sm.whenBulkSyncSettled();
+    await flush();
+    expect(connects.order).toEqual(["real"]);
+    expect(fakeRegistry.isNoteEmptyOnDisk).not.toHaveBeenCalled();
+  });
+
   it("asks for the next batch when the server truncated its list", async () => {
     fakeRegistry.mappedNotes.mockReturnValue([{ docId: "a", relPath: "A.md" }]);
     const sm = new SyncManager();
@@ -336,6 +387,31 @@ describe("SyncManager — ready.empty is the authority", () => {
     await flush();
     // Each doc connected exactly once: no second run doubled the work.
     expect(connects.order).toEqual(["a", "b"]);
+  });
+
+  it("badges every confirmed note synced even when there is nothing to send", async () => {
+    // Only a run's uploader used to stamp confirmed docs `synced`; a fully
+    // synced vault (empty work list ⇒ no run) sat on unsynced badges until
+    // something happened to start one.
+    fakeRegistry.mappedNotes.mockReturnValue([
+      { docId: "a", relPath: "A.md" },
+      { docId: "b", relPath: "B.md" },
+      { docId: OPEN_DOC, relPath: "Open.md" },
+    ]);
+    for (const id of ["a", "b", OPEN_DOC]) fakeRegistry.pushed.add(id);
+    const sm = new SyncManager();
+    const badges: Record<string, string> = {};
+    sm.setDocStateListener((patch) => {
+      for (const [id, state] of Object.entries(patch)) if (state) badges[id] = state;
+    });
+    await enable(sm);
+    storeHooks.open = OPEN_DOC;
+    engineHooks.settled = true;
+    engineHooks.opts!.onServerEmpty?.([], false);
+    engineHooks.opts!.onInboundIdle?.();
+    await flush();
+    expect(connects.order).toEqual([]);
+    expect(badges).toEqual({ a: "synced", b: "synced" }); // the open note reports itself
   });
 
   it("reaches a terminal phase with nothing to send, and does not re-stamp it", async () => {

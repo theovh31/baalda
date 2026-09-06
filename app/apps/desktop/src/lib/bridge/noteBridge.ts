@@ -36,6 +36,10 @@ export class NoteBridge {
   private logLength = 0;
   /** Monotonic count of every update ever observed on this doc (for assertions). */
   private observedUpdates = 0;
+  /** Whether the oversize refusal has already been reported for the current
+   *  run of oversized reads, so one runaway file logs once, not per watcher
+   *  event. Cleared as soon as a normal-sized read comes through. */
+  private oversizeReported = false;
   /** True once a recovery snapshot has been taken for a large diff. */
   private recoverySnapshotTaken = false;
   /** True once this doc has held non-empty text in this session. Guards egest:
@@ -49,6 +53,9 @@ export class NoteBridge {
   private egestTimer: number | null = null;
   private ingestDirty = false;
   private destroyed = false;
+  /** Consecutive failed egest writes (0 once one lands). Drives the retry
+   *  backoff and the `onWriteFailed`/`onWriteRecovered` UI cues. */
+  private egestFailures = 0;
 
   private readonly setT: (fn: () => void, ms: number) => number;
   private readonly clearT: (id: number) => void;
@@ -183,6 +190,11 @@ export class NoteBridge {
       }
       if (this.seedOnOpen && fileText.length > 0) {
         this.doc.transact(() => {
+          // Same re-assertion as `seedFromFileIfEmpty`: `subscribe()` is already
+          // live and the file read above was awaited, so a remote update can have
+          // arrived in between. Seeding on top of it would fork the history and
+          // double the text.
+          if (this.text.length > 0) return;
           this.text.insert(0, fileText);
         }, ORIGIN_DISK);
       }
@@ -210,9 +222,22 @@ export class NoteBridge {
       return false;
     }
     if (fileText.length === 0) return false;
+    // Re-assert emptiness INSIDE the transaction. The check above ran before an
+    // `await`, and the server's pull can land during that read — at which point
+    // this doc is no longer an orphan and seeding it is not a no-op, it is a
+    // SECOND insert history. Yjs merges two independent histories by keeping
+    // both, so the note comes back holding the server's text *and* the file's,
+    // and every repeat of the race doubles it again. That is the note-doubling
+    // bug, and it is how a daily note reached 68 MB / 2.37M lines of 35 distinct
+    // lines (two interleaved versions, ~43,000 copies each) in the 2026-09-04
+    // vault: not a diff gone wrong, a seed racing a pull.
+    let seeded = false;
     this.doc.transact(() => {
+      if (this.text.length > 0) return; // the pull won — server state stands
       this.text.insert(0, fileText);
+      seeded = true;
     }, ORIGIN_DISK);
+    if (!seeded) return false;
     this.lastWrittenHash = await this.hash(fileText);
     return true;
   }
@@ -269,6 +294,25 @@ export class NoteBridge {
       this.reportError(e, "ingest:readFile");
       return false;
     }
+
+    // Size ceiling BEFORE the echo guard and the diff: a file this big is damage,
+    // not content, and ingesting it would pull that damage into the CRDT and from
+    // there onto every other device and the server. Reported once per drain so
+    // the user learns which file to fix; the doc keeps whatever it already holds.
+    // See `maxIngestBytes`.
+    if (this.cfg.maxIngestBytes > 0 && fileText.length > this.cfg.maxIngestBytes) {
+      if (!this.oversizeReported) {
+        this.oversizeReported = true;
+        const mb = (fileText.length / (1024 * 1024)).toFixed(1);
+        const cap = Math.round(this.cfg.maxIngestBytes / (1024 * 1024));
+        this.reportError(
+          new Error(`${this._path} is ${mb} MB (> ${cap} MB): refusing to ingest it`),
+          "ingest:oversize",
+        );
+      }
+      return false;
+    }
+    this.oversizeReported = false;
 
     const fileHash = await this.hash(fileText);
     if (fileHash === this.lastWrittenHash) return false; // our own write echoing back → DROP
@@ -338,15 +382,88 @@ export class NoteBridge {
         return;
       }
     }
-    // Set the echo guard BEFORE writing so the watcher's ingest sees our bytes
-    // and drops them (this is what closes the loop — spec 03 §5).
-    this.lastWrittenHash = await this.hash(content);
+    // Hash first, assign only once the bytes are CONFIRMED on disk. The guard
+    // used to be primed before the write; a failed write (disk full, permission
+    // lost, path gone) then left it pointing at bytes that never landed, so the
+    // next watcher read of the still-stale file was judged against the wrong
+    // baseline. Assigning after is still in time for the echo: the watcher's
+    // event is debounced ~150ms in Rust and ~150ms more here, while this
+    // assignment runs the moment the IPC resolves (spec 03 §5).
+    const hash = await this.hash(content);
+    // Nothing to write: the file already holds exactly these bytes. That is what
+    // `lastWrittenHash` means on both sides — egest sets it once a write is
+    // CONFIRMED on disk, ingest and the seed paths set it to the hash of the
+    // file they just read. Writing anyway costs a real atomic write, a watcher
+    // event, an index pass and a fresh mtime — and the mtime is the sidebar's
+    // "Recently modified" sort key, so a no-op write reshuffles the rows under
+    // the user's pointer for nothing. A failed write does NOT set the guard, so
+    // a retry still writes.
+    if (hash === this.lastWrittenHash) {
+      // A write that had been failing no longer needs to land: the bytes it was
+      // retrying to put on disk are already there.
+      this.clearWriteFailure();
+      return;
+    }
     try {
       await this.io.writeFileAtomic(this._path, content);
-      if (this.io.reindex) await this.io.reindex(this._path);
     } catch (e) {
+      // The .md on disk is the durable source of truth, so a lost write is a
+      // data-safety event, not a log line: tell the UI, and retry with backoff
+      // until it lands (the CRDT still holds the text; nothing is dropped).
+      this.egestFailures++;
       this.reportError(e, "egest:write");
+      try {
+        this.io.onWriteFailed?.(this._path, e, this.egestFailures);
+      } catch (hookErr) {
+        this.reportError(hookErr, "egest:onWriteFailed");
+      }
+      this.scheduleEgestRetry();
+      return;
     }
+    this.lastWrittenHash = hash;
+    this.clearWriteFailure();
+    // Indexing is derived state: a failure here is worth a log, not a re-write.
+    if (this.io.reindex) {
+      try {
+        await this.io.reindex(this._path);
+      } catch (e) {
+        this.reportError(e, "egest:reindex");
+      }
+    }
+  }
+
+  /** Retract a standing write failure: the file on disk now holds what the doc
+   *  says, whether because a retry landed or because the doc came back around to
+   *  the bytes already there. */
+  private clearWriteFailure(): void {
+    if (this.egestFailures === 0) return;
+    this.egestFailures = 0;
+    try {
+      this.io.onWriteRecovered?.(this._path);
+    } catch (hookErr) {
+      this.reportError(hookErr, "egest:onWriteRecovered");
+    }
+  }
+
+  /** Re-arm the egest after a failed write: 1s, 2s, 4s… capped (`egestRetryMaxMs`).
+   *  Reuses `egestTimer`, so `flushEgest` (close/save) still forces an attempt
+   *  and `destroy` still cancels it. */
+  private scheduleEgestRetry(): void {
+    if (this.destroyed) return;
+    const delay = Math.min(
+      this.cfg.egestRetryMaxMs,
+      this.cfg.egestRetryBaseMs * 2 ** Math.max(0, this.egestFailures - 1),
+    );
+    if (this.egestTimer != null) this.clearT(this.egestTimer);
+    this.egestTimer = this.setT(() => {
+      this.egestTimer = null;
+      void this.drainEgest();
+    }, delay);
+  }
+
+  /** Consecutive failed disk writes for this note (tests / observability). */
+  get pendingWriteFailures(): number {
+    return this.egestFailures;
   }
 
   /**

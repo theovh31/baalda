@@ -31,6 +31,23 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}));
 
+    // The UI's own log, on the dev terminal. A `console.log` inside a WKWebView
+    // goes to the Web Inspector and nowhere else, so anything the React layer
+    // measures about itself is invisible to whoever is reading `tauri dev` —
+    // which is how two wrong diagnoses of "the sidebar blinks while it syncs"
+    // survived as long as they did. The frontend's `@tauri-apps/plugin-log`
+    // calls land on stdout next to the Rust ones, so both halves of a symptom
+    // read as one timeline. Debug builds only; a shipped app logs nothing new.
+    #[cfg(debug_assertions)]
+    let builder = builder.plugin(
+        tauri_plugin_log::Builder::new()
+            .level(log::LevelFilter::Info)
+            .target(tauri_plugin_log::Target::new(
+                tauri_plugin_log::TargetKind::Stdout,
+            ))
+            .build(),
+    );
+
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -85,6 +102,7 @@ pub fn run() {
             commands::search_notes,
             commands::get_backlinks,
             commands::graph_edges,
+            commands::graph_edges_for,
             commands::get_note_meta,
             commands::resolve_wikilink,
             commands::list_note_titles,
@@ -93,6 +111,8 @@ pub fn run() {
             commands::save_yjs_snapshot,
             commands::save_yjs_state_vectors,
             commands::list_yjs_state_vectors,
+            commands::prune_yjs_docs,
+            commands::clear_yjs_doc,
             commands::read_binary_file,
             commands::write_binary_file,
             commands::list_attachments,

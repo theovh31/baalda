@@ -54,6 +54,15 @@ export interface InboundInput {
    * user re-created at the same path gets a fresh id and never matches.
    */
   localFolderIds?: Map<string, string>;
+  /**
+   * Server folder id → its CURRENT path. Lets the plan see a folder the server
+   * MOVED: the id we recorded at a local path now lives elsewhere. The old
+   * directory (emptied by the per-note renames) is then removed if empty, like a
+   * tombstoned one — otherwise it lingered as a trap: a file dropped into it
+   * later re-registered it as a brand-new server folder, and the folder move
+   * "came back" for the whole team as an empty twin.
+   */
+  serverFolderIds?: Map<string, string>;
 }
 
 export interface InboundRename {
@@ -118,6 +127,15 @@ export interface InboundPlan {
    * it here lets the existing prune drop the mapping instead.
    */
   suppress: Set<string>;
+  /**
+   * Paths of DELETED (tombstoned — the server answered) notes whose file is
+   * still on disk but which the local index keys under some other id, so the
+   * plan could only suppress them (see the `dead && loc === undefined` branch).
+   * The executor may trash such a file if — and only if — it is empty: no work
+   * to lose, and otherwise a zero-byte stub nobody can sync or count, forever.
+   * Never populated for revoked notes or when tombstones were not reported.
+   */
+  stubs: string[];
   rejected: InboundRejection[];
 }
 
@@ -133,6 +151,19 @@ export interface InboundPlan {
 // doc map". Hence an explicit allowlist on this side.
 
 /** Mirrors `IGNORED_DIRS` in src-tauri/src/vault.rs. */
+/**
+ * Two vault paths that name the same file.
+ *
+ * Case-insensitively, because that is what the filesystems we ship on do:
+ * macOS/APFS and Windows store ONE entry per case-insensitive name, so
+ * `Projects/community/a.md` and `Projects/Community/a.md` are the same file, not
+ * two. The server agrees since migration 023 (case-insensitive unique paths), so
+ * treating them as distinct here only ever produced work that could not land.
+ */
+export function samePath(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
 const IGNORED_DIRS = [".context", ".git"];
 /** Mirrors `DENIED_DIRS` in src-tauri/src/vault.rs. */
 const DENIED_DIRS = [
@@ -230,6 +261,7 @@ export function planInbound(input: InboundInput): InboundPlan {
     trash: [],
     revoked: new Set(),
     suppress: new Set(),
+    stubs: [],
     rejected: [],
   };
 
@@ -255,6 +287,23 @@ export function planInbound(input: InboundInput): InboundPlan {
     plan.createFolders.push(path);
   }
   plan.createFolders.sort(byDepth);
+
+  // A local folder whose recorded server id now lives at ANOTHER path was moved
+  // remotely. Its notes move via their own renames; the emptied old directory
+  // is removed (empty-only, like a tombstone) so it can't be re-registered as
+  // a new folder on the next pass. Gated on the id still existing on the server
+  // (a deleted id is the tombstone case below) and on the old path not having
+  // been re-created server-side since.
+  if (input.serverFolderIds && input.localFolderIds) {
+    for (const [path, id] of input.localFolderIds) {
+      const now = input.serverFolderIds.get(id);
+      if (now === undefined || now === path) continue;
+      if (!input.localFolders.has(path)) continue; // already gone locally
+      if (input.serverFolders.has(path)) continue; // re-created server-side
+      if (!isSafeFolderPath(path)) continue;
+      plan.removeFolders.push(path);
+    }
+  }
 
   // A local folder whose recorded server id is tombstoned was deleted remotely.
   // Gated on the id match (a same-path successor has a fresh id and never
@@ -282,7 +331,7 @@ export function planInbound(input: InboundInput): InboundPlan {
   // ---- notes --------------------------------------------------------------
   // Every note path on disk, for the "we lost this doc's local identity" case
   // below. `input.local` is docId → path, so its values are exactly that set.
-  const localPaths = new Set(input.local.values());
+  const localPaths = new Set([...input.local.values()].map((p) => p.toLowerCase()));
   const docIds = new Set<string>([...input.baseline.keys(), ...input.server.keys()]);
   for (const docId of docIds) {
     const prev = input.baseline.get(docId);
@@ -293,7 +342,16 @@ export function planInbound(input: InboundInput): InboundPlan {
     if (srv !== undefined) {
       // Already where the server wants it (or we've never seen this doc, in which
       // case the existing materialize step writes it). Nothing to do.
-      if (loc === srv || loc === undefined) continue;
+      //
+      // Compared case-insensitively, because the filesystem is: `community/a.md`
+      // and `Community/a.md` are ONE file on macOS and Windows, so a spelling
+      // disagreement with the server is not a move and renaming to "fix" it
+      // moves the file onto itself. After migration 023 merged the
+      // case-duplicated server rows, a vault that had them disagrees on exactly
+      // that for every merged note — 164 renames a pass, each one a no-op or a
+      // refusal, on top of the re-registration wave. The server's own uniqueness
+      // is case-insensitive now too, so nothing is lost by matching it here.
+      if (loc === undefined || samePath(loc, srv)) continue;
       if (prev === undefined) {
         // On disk under one path, on the server under another, and no baseline to
         // say which one moved. Leave it: without a prior agreement, "the server
@@ -301,10 +359,10 @@ export function planInbound(input: InboundInput): InboundPlan {
         // guessing here would rename a file on a hunch.
         continue;
       }
-      if (loc === prev) {
+      if (samePath(loc, prev)) {
         // The server moved it and we didn't. THE rename-duplicate fix.
         pushRename(plan, docId, loc, srv);
-      } else if (srv === prev) {
+      } else if (samePath(srv, prev)) {
         // We moved it and the server didn't — outbound's job (`renamePath`), not
         // ours. Left alone rather than dragged back.
         continue;
@@ -331,7 +389,10 @@ export function planInbound(input: InboundInput): InboundPlan {
         // match we can't prove the file at that path is still this note, and a
         // wrong guess here deletes someone's work. It stays on disk as a purely
         // local note the user can remove themselves.
-        if (prev !== undefined && localPaths.has(prev)) plan.suppress.add(prev);
+        if (prev !== undefined && localPaths.has(prev.toLowerCase())) {
+          plan.suppress.add(prev);
+          plan.stubs.push(prev);
+        }
         continue;
       }
       // Belt as well as braces: if the trash step is skipped or fails, this still
