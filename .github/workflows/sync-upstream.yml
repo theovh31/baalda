@@ -1,5 +1,4 @@
 name: Sync upstream
-name: Sync upstream
 
 on:
   schedule:
