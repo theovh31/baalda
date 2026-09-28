@@ -9,8 +9,37 @@ on:
           sync:
               runs-on: ubuntu-latest
                   permissions:
+                          contents: write
+name: Sync upstream
+
+on:
+  schedule:
+      - cron: '0 0 * * 0'  # Weekly, Sundays at midnight UTC
+        workflow_dispatch:     # Also allow manual trigger
+        
+        jobs:
+          sync:
+              runs-on: ubuntu-latest
+                  permissions:
                         contents: write
                               pull-requests: write
+                              
+                                  steps:
+                                        - uses: actions/checkout@v4
+                                                with:
+                                                          fetch-depth: 0
+                                                                    token: ${{ secrets.SYNC_PAT }}
+                                                                    
+                                                                          - name: Sync fork
+                                                                                  env:
+                                                                                            GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
+                                                                                                    run: |
+                                                                                                              git config user.name "github-actions[bot]"
+                                                                                                                        git config user.email "github-actions[bot]@users.noreply.github.com"
+                                                                                                                                  git remote add upstream https://github.com/naveedharri/baalda.git
+                                                                                                                                            git fetch upstream
+                                                                                                                                                      git merge upstream/main -m "Sync with upstream"
+                                                                                                                                                                git push origin mainpull-requests: write
 
                                   steps:
                                         - uses: actions/checkout@v4
