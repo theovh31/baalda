@@ -1,55 +1,36 @@
 name: Sync upstream
-on:
-  schedule:
-      - cron: '0 0 * * 0'
-        workflow_dispatch:
-        jobs:
-          sync:
-              runs-on: ubuntu-latest
-                  permissions:
-                        contents: write
-                              pull-requests: write
-                                  steps:
-                                        - uses: actions/checkout@v4
-                                                with:
-                                                          fetch-depth: 0
-                                                                    token: ${{ secrets.SYNC_PAT }}
-                                                                          - name: Sync fork
-                                                                                  env:
-                                                                                            GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
-                                                                                                    run: |
-                                                                                                              git config user.name "github-actions[bot]"
-                                                                                                                        git config user.email "github-actions[bot]@users.noreply.github.com"
-                                                                                                                                  git remote add upstream https://github.com/naveedharri/baalda.git
-                                                                                                                                            git fetch upstream
-                                                                                                                                                      git merge upstream/main -m "Sync with upstream"
-                                                                                                                                                                git push origin mainame: Sync upstream
+
+# Pulls new commits from naveedharri/baalda into this fork's main every day.
+# Pushing with SYNC_PAT (not the default GITHUB_TOKEN) is deliberate: pushes made
+# with GITHUB_TOKEN do not trigger other workflows, so CI would never run on the
+# synced commit. Railway deploys main automatically once it lands.
 
 on:
   schedule:
-      - cron: '0 0 * * 0'
-        workflow_dispatch:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
-        jobs:
-          sync:
-              runs-on: ubuntu-latest
-                  permissions:
-                        contents: write
-                              pull-requests: write
+permissions:
+  contents: write
 
-                                  steps:
-                                        - uses: actions/checkout@v4
-                                                with:
-                                                          fetch-depth: 0
-                                                                    token: ${{ secrets.SYNC_PAT }}
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
 
-                                                                          - name: Sync fork
-                                                                                  env:
-                                                                                            GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
-                                                                                                    run: |
-                                                                                                              git config user.name "github-actions[bot]"
-                                                                                                                        git config user.email "github-actions[bot]@users.noreply.github.com"
-                                                                                                                                  git remote add upstream https://github.com/naveedharri/baalda.git
-                                                                                                                                            git fetch upstream
-                                                                                                                                                      git merge upstream/main -m "Sync with upstream"
-                                                                                                                                                                git push origin main
+      - name: Sync fork
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/naveedharri/baalda.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream."
+            exit 0
+          fi
+          git merge upstream/main --no-edit -m "Sync with upstream"
+          git push origin main
