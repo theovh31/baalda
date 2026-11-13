@@ -4,8 +4,10 @@
 
 import * as ipc from "../ipc";
 import { currentVaultEpoch } from "../sync/vaultScope";
+import { clearLinkRefusal, isSymlinkRefusal, noteLinkRefusal } from "../sync/linkRefusals";
 import { dismissToast, toast } from "../toast";
 import { NoteBridge } from "./noteBridge";
+import { reconcileReport, recoveryAttribution } from "../sync/reconcileReport";
 import type { BridgeIO } from "./types";
 
 /**
@@ -29,7 +31,7 @@ function errorText(err: unknown): string {
 export function reportSaveFailure(relPath: string, err: unknown, attempt: number): void {
   if (saveFailureToasts.has(relPath)) return;
   const id = toast(
-    `Couldn't save "${baseName(relPath)}" to disk — ${errorText(err)}. Your text is kept and the save will be retried.`,
+    `Couldn't save "${baseName(relPath)}" to disk: ${errorText(err)}. Your text is kept and the save will be retried.`,
     "error",
   );
   saveFailureToasts.set(relPath, id);
@@ -70,24 +72,56 @@ export function createTauriBridgeIO(epoch?: ipc.VaultEpoch): BridgeIO {
     readFile: (path) => ipc.readNote(path, epoch),
     // write_note performs the atomic temp-file+rename AND re-indexes in Rust,
     // so egest gets FTS/backlink refresh for free — no separate reindex hook.
-    writeFileAtomic: (path, content) => ipc.writeNote(path, content, epoch),
+    // …and, given the doc id, records the bytes as the doc's disk base (#200).
+    // `expectedSha` is the compare-and-swap (#216): Rust answers "stale" instead
+    // of replacing a file that moved on since the bridge last saw it. A symbolic
+    // link at or above the path is refused outright; that refusal is recorded
+    // for Health (`linkRefusals`) and still reported as a failed save.
+    writeFileAtomic: async (path, content, docId, expectedSha) => {
+      try {
+        const result = await ipc.writeNote(path, content, epoch, docId, expectedSha);
+        clearLinkRefusal(path);
+        return result;
+      } catch (e) {
+        if (isSymlinkRefusal(e)) noteLinkRefusal(path, docId ?? null);
+        throw e;
+      }
+    },
     sha256: sha256Hex,
+    // The server's text is about to win over bytes another app wrote: keep them,
+    // and say so in the reconnect summary (never a silent overwrite).
+    saveRecoveryCopy: async (path, content) => {
+      const dest = await ipc.writeTrashCopy(
+        path, new Date().toISOString().replace(/[:.]/g, "-"), content, epoch,
+      );
+      // A caller that knows WHY the server won (the one-step create merge)
+      // claimed this path: one entry, its kind, never a second generic one.
+      const attr = recoveryAttribution(path);
+      reconcileReport.record({
+        kind: attr?.kind ?? "externalEditSaved",
+        path,
+        ...(attr?.docId ? { docId: attr.docId } : {}),
+        detail: dest,
+      });
+      return dest;
+    },
     // A failed write is the one bridge error a person must see (#81): the .md is
     // the durable copy, and "nothing happened" is how it would otherwise read.
     onWriteFailed: reportSaveFailure,
     onWriteRecovered: reportSaveRecovered,
     persistence: {
-      loadState: async (docId) => {
-        const s = await ipc.loadYjsState(docId, epoch);
-        return {
-          snapshot: s.snapshot ? new Uint8Array(s.snapshot) : null,
-          updates: s.updates.map((u) => new Uint8Array(u)),
-          updateCount: s.updateCount,
-        };
-      },
+      // No conversion: `loadYjsState` decodes Rust's byte frame straight into
+      // `YjsPersistedState` (`ipcCodec.ts`), where it used to hand back number
+      // arrays this had to copy element by element.
+      loadState: (docId) => ipc.loadYjsState(docId, epoch),
+      // The rowid the update landed in — the bridge's compaction watermark.
       appendUpdate: (docId, update) => ipc.appendYjsUpdate(docId, update, epoch),
-      saveSnapshot: (docId, snapshot, stateVector) =>
-        ipc.saveYjsSnapshot(docId, snapshot, stateVector, epoch),
+      // `upTo` is passed straight through: Rust deletes only `id <= upTo`, so a
+      // keystroke appended while this save was in flight survives it.
+      saveSnapshot: (docId, snapshot, stateVector, upTo) =>
+        ipc.saveYjsSnapshot(docId, snapshot, stateVector, epoch, upTo),
+      loadDiskBase: (docId) => ipc.getDiskBase(docId, epoch),
+      saveDiskBase: (docId, sha256) => ipc.setDiskBase(docId, sha256, epoch),
     },
   };
 }
@@ -214,6 +248,13 @@ export class BridgeManager {
     } catch (e) {
       console.error("[bridge] flush on close failed", e);
     }
+    // The ops this bridge applied must reach the CRDT store before it goes
+    // away. `destroy()` is synchronous and appends are fire-and-forget, so
+    // without this a close-then-quit leaves the local log BEHIND the `.md` the
+    // flush above just wrote — the gap the next bridge re-inserts from (see
+    // `NoteBridge.whenPersisted`, and `VaultDocStore.retire`, which already
+    // does this).
+    await bridge.whenPersisted();
     bridge.destroy();
   }
 }

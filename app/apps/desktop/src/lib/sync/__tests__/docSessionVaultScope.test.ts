@@ -19,6 +19,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const fakeRegistry = vi.hoisted(() => {
   const reg = {
     vaultId: null as string | null,
+    // Phase A of `enable`: the local prime. False here — this suite is about the
+    // reconcile-and-teardown path, and a prime that adopts nothing is exactly
+    // the pre-prime behaviour these assertions were written against.
+    primeLocal: vi.fn(async (_orgId: string) => false),
     reconcile: vi.fn(async () => ({ seeded: false })),
     // Resolves true ("something changed") so the tests can assert the tree
     // refresh fires — a false pull deliberately skips it to avoid flicker.
@@ -40,6 +44,7 @@ const fakeRegistry = vi.hoisted(() => {
     setNoteMetaListener: vi.fn(),
     // …and the vault's shared item colors, from that same pull.
     setColorListener: vi.fn(),
+    setFailureListener: vi.fn(),
     // Inbound reconciliation: the manager hands itself over as the host that can
     // make the editor/doc-store let go of a doc before its file moves.
     inboundHost: null as unknown,
@@ -50,8 +55,12 @@ const fakeRegistry = vi.hoisted(() => {
     isPushed: vi.fn(() => false),
     markPushed: vi.fn(),
     flushCheckpoint: vi.fn(async () => {}),
+    materializePendingFromBootstrap: vi.fn(async () => false),
+    pendingFromBootstrapCount: vi.fn(() => 0),
     failures: vi.fn((): unknown[] => []),
     hasFailures: vi.fn(() => false),
+    heldRefusals: vi.fn((): unknown[] => []),
+    retryHeldRefusals: vi.fn(() => false),
     limitCode: vi.fn((): string | null => null),
   };
   return reg;
@@ -66,9 +75,9 @@ vi.mock("../registry", () => ({
 }));
 
 import type { SessionInfo } from "../../api";
-import { SyncManager, shouldReportOpenDocState } from "../docSession";
+import { SyncManager, aclSignalIsFresh, shouldReportOpenDocState } from "../docSession";
 import type { SyncProgressSink } from "../progress";
-import { vaultScopes, type DocSyncState, type SyncProgress } from "../vaultScope";
+import { vaultScopes, type DocSyncState, type SyncProgress, type VaultScope } from "../vaultScope";
 
 const ORG_A = "org-a";
 const ORG_B = "org-b";
@@ -92,8 +101,9 @@ function session(orgId = ORG_A): SessionInfo {
 beforeEach(() => {
   vi.useRealTimers();
   fakeRegistry.reset.mockClear();
+  fakeRegistry.setProgressSink.mockClear();
   fakeRegistry.pull.mockClear();
-  fakeRegistry.reconcile.mockClear().mockImplementation(async () => ({ seeded: false }));
+  fakeRegistry.reconcile.mockReset().mockImplementation(async () => ({ seeded: false }));
   // A vault with nothing mapped and nothing confirmed is the neutral starting
   // point; tests that care set these explicitly.
   fakeRegistry.mappedNotes.mockReturnValue([]);
@@ -119,7 +129,7 @@ describe("SyncManager.disable — teardown completeness", () => {
     fakeRegistry.reset.mockClear();
 
     // Arm the debounced registry pull, then tear down before it can fire.
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     expect(sm.hasPendingRegistryPull()).toBe(true);
 
     const scope = sm.currentScope()!;
@@ -152,7 +162,7 @@ describe("SyncManager.disable — teardown completeness", () => {
 
     // An in-flight frame from the vault we just left. Arming here is what created
     // the original bug, so the guard has to reject it outright.
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     expect(sm.hasPendingRegistryPull()).toBe(false);
     await vi.advanceTimersByTimeAsync(5000);
     expect(fakeRegistry.pull).not.toHaveBeenCalled();
@@ -185,7 +195,7 @@ describe("SyncManager registry-pull timer across a vault switch", () => {
       path: "/vaults/a",
       epoch: 1,
     });
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     expect(sm.hasPendingRegistryPull()).toBe(true);
 
     // Deliberately NOT calling disable(): this models a call site that swaps the
@@ -209,7 +219,7 @@ describe("SyncManager registry-pull timer across a vault switch", () => {
       path: "/vaults/a",
       epoch: 1,
     });
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     await vi.advanceTimersByTimeAsync(300);
     expect(fakeRegistry.pull).toHaveBeenCalledTimes(1);
     expect(refreshed).toHaveBeenCalledTimes(1);
@@ -220,7 +230,7 @@ describe("SyncManager registry-pull timer across a vault switch", () => {
 describe("SyncManager — settling after a teammate's structural change", () => {
   /** Enable, then fire a debounced registry pull and let it land. */
   async function pullOnce(sm: SyncManager) {
-    sm.handleRegistryChanged();
+    sm.handleRegistryChanged("registry-frame");
     await vi.advanceTimersByTimeAsync(300);
     await vi.advanceTimersByTimeAsync(0);
   }
@@ -483,5 +493,237 @@ describe("shouldReportOpenDocState", () => {
     for (const state of ["syncing", "queued", "unsynced", "error", "synced"] as const) {
       expect(shouldReportOpenDocState(state, false)).toBe(true);
     }
+  });
+});
+
+/**
+ * The authority behind a wholesale removal.
+ *
+ * Inbound may drop its revocation caps — the thing that made "Entire vault →
+ * Private" reach a member's disk — only when the session is live AND the server
+ * itself just announced an access change. The second half is what keeps a
+ * server-side regression in the readable-set filter from being destructive: a
+ * routine pull whose listing merely came back empty looks exactly like a total
+ * revocation, and there is one such pull on every reconnect.
+ */
+describe("revocation authority", () => {
+  const NOW = 1_700_000_000_000;
+
+  it("is absent until an acl-changed frame arrives", () => {
+    // The live-pull-with-no-ACL-signal case: liveness alone never authorises it.
+    expect(aclSignalIsFresh(0, NOW)).toBe(false);
+  });
+
+  it("holds for the pull the frame asked for, and for the coalescing after it", () => {
+    // The pull is debounced and frames coalesce, so the pass that reads the new
+    // listing can be several triggers downstream of the announcement.
+    expect(aclSignalIsFresh(NOW, NOW)).toBe(true);
+    expect(aclSignalIsFresh(NOW, NOW + 250)).toBe(true);
+    expect(aclSignalIsFresh(NOW, NOW + 59_999)).toBe(true);
+    expect(aclSignalIsFresh(NOW, NOW + 60_000)).toBe(true);
+  });
+
+  it("expires, so later routine pulls are back under the cap", () => {
+    expect(aclSignalIsFresh(NOW, NOW + 60_001)).toBe(false);
+    expect(aclSignalIsFresh(NOW, NOW + 3_600_000)).toBe(false);
+  });
+
+  it("is not granted by a clock that moved backwards", () => {
+    expect(aclSignalIsFresh(NOW, NOW - 1)).toBe(false);
+  });
+
+  it("a manager that has seen no frame refuses regardless of its own state", async () => {
+    const sm = new SyncManager();
+    expect(sm.revocationAuthority()).toBe(false);
+    await sm.enable(session(), { orgId: ORG_A, name: "a", path: "/vaults/a", epoch: 1 });
+    // Enabled and reconciled, but nothing announced an access change.
+    expect(sm.revocationAuthority()).toBe(false);
+    sm.disable();
+  });
+});
+
+/**
+ * `ready.revoked` — the vault channel naming, on every connect, the docs this
+ * device holds that it may no longer read.
+ *
+ * The live `acl-changed` -> `reauth` announcement only reaches a client that was
+ * CONNECTED when the owner changed the rules, so a vault set to Private while
+ * the member's app was shut left their next launch with no authority to remove
+ * anything. This frame is the same statement, made on connect.
+ */
+describe("server-stated revocation (ready.revoked)", () => {
+  /**
+   * The vault channel reaching `synced` is the other half of liveness, and only
+   * the real engine sets it — this suite runs the registry fake with
+   * `vaultId === null`, so there is no socket and no engine. Pin it directly
+   * rather than leave every assertion below gated on something unreachable.
+   */
+  function pinChannelSynced(sm: SyncManager): void {
+    const inner = sm as unknown as { channelSynced: boolean; markLive: () => void };
+    inner.channelSynced = true;
+    inner.markLive();
+  }
+
+  async function liveManager(): Promise<{ sm: SyncManager; scope: VaultScope }> {
+    const sm = new SyncManager();
+    await sm.enable(session(), { orgId: ORG_A, name: "a", path: "/vaults/a", epoch: 1 });
+    pinChannelSynced(sm);
+    expect(sm.isLive()).toBe(true);
+    return { sm, scope: vaultScopes.current()! };
+  }
+
+  it("grants the authority, names the docs, and asks for the pull", async () => {
+    const { sm, scope } = await liveManager();
+    // Live, but nothing has announced an access change yet.
+    expect(sm.revocationAuthority()).toBe(false);
+    expect(sm.authoritativeRevoked()).toBeNull();
+
+    sm.handleServerRevoked(["d1", "d2"], false, scope);
+
+    expect(sm.revocationAuthority()).toBe(true);
+    expect(sm.authoritativeRevoked()).toEqual(new Set(["d1", "d2"]));
+    // The channel's own `synced` pull is armed after this callback; asking again
+    // is free (both fold into one debounced pass) and is what makes the removal
+    // land on a cold launch rather than on some later, unrelated change.
+    expect(sm.hasPendingRegistryPull()).toBe(true);
+    sm.disable();
+  });
+
+  it("an empty list grants nothing and asks for nothing", async () => {
+    const { sm, scope } = await liveManager();
+    sm.handleServerRevoked([], false, scope);
+    expect(sm.revocationAuthority()).toBe(false);
+    expect(sm.authoritativeRevoked()).toBeNull();
+    expect(sm.hasPendingRegistryPull()).toBe(false);
+    sm.disable();
+  });
+
+  it("replays a cold-start revocation after the initial reconcile enables sync", async () => {
+    vi.useFakeTimers();
+    const sm = new SyncManager();
+    fakeRegistry.reconcile.mockImplementationOnce(async () => {
+      pinChannelSynced(sm);
+      sm.handleServerRevoked(["d1", "d2"], false, vaultScopes.current()!);
+      expect(sm.revocationAuthority()).toBe(false);
+      expect(sm.hasPendingRegistryPull()).toBe(false);
+      return { seeded: false };
+    });
+    await sm.enable(session(), { orgId: ORG_A, name: "a", path: "/vaults/a", epoch: 1 });
+    expect(sm.revocationAuthority()).toBe(true);
+    expect(sm.hasPendingRegistryPull()).toBe(true);
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fakeRegistry.pull).toHaveBeenCalledTimes(1);
+    sm.disable();
+    vi.useRealTimers();
+  });
+
+  it("a truncated list still narrows, rather than lifting the cap wholesale", async () => {
+    // The server is saying "there are more than I will name". Keeping the ids it
+    // DID name is what stops the largest revocations — the only ones that can
+    // truncate — being the only ones with no cross-check at all. The residue
+    // rides the ordinary cap and the next connect names the next batch.
+    const { sm, scope } = await liveManager();
+    sm.handleServerRevoked(["d1", "d2"], true, scope);
+    expect(sm.revocationAuthority()).toBe(true);
+    expect(sm.authoritativeRevoked()).toEqual(new Set(["d1", "d2"]));
+    expect(sm.hasPendingRegistryPull()).toBe(true);
+    sm.disable();
+  });
+
+  it("unions successive lists instead of replacing them", async () => {
+    // A later connect's list is bounded by what is still in the manifest, and a
+    // doc already removed from disk has left it — so replacing would quietly
+    // widen the authority back out over everything the new list omits.
+    const { sm, scope } = await liveManager();
+    sm.handleServerRevoked(["d1"], false, scope);
+    sm.handleServerRevoked(["d2"], false, scope);
+    expect(sm.authoritativeRevoked()).toEqual(new Set(["d1", "d2"]));
+    sm.disable();
+  });
+
+  it("a live `drop` names its doc, so the live path is as narrow as this one", async () => {
+    // `refreshAcl` sends one `drop` per lost doc immediately before the `reauth`.
+    const { sm, scope } = await liveManager();
+    sm.handleServerDrop("d9", scope);
+    expect(sm.authoritativeRevoked()).toEqual(new Set(["d9"]));
+    sm.disable();
+  });
+
+  it("forgets an id the server's resolver says is still readable", async () => {
+    const { sm, scope } = await liveManager();
+    sm.handleServerRevoked(["d1", "d2"], false, scope);
+    sm.revocationRefused(["d1"]);
+    expect(sm.authoritativeRevoked()).toEqual(new Set(["d2"]));
+    sm.disable();
+  });
+
+  it("a `reauth` stamps the clock but never clears the named list", async () => {
+    // The production handler. `reauth` reaches every connected client on every
+    // ACL change in the vault — a lock toggled on a note this user cannot even
+    // see sends one — and it names nothing. If it cleared the list, that
+    // unrelated event would widen a correct three-note authority into a
+    // whole-vault one for the next minute.
+    const { sm, scope } = await liveManager();
+    sm.handleServerRevoked(["d1"], false, scope);
+    sm.handleServerReauth(scope);
+    expect(sm.revocationAuthority()).toBe(true);
+    expect(sm.authoritativeRevoked()).toEqual(new Set(["d1"]));
+    sm.disable();
+  });
+
+  it("a `reauth` on its own grants the old wholesale authority", async () => {
+    // Nothing has ever been named in this session — an older server, or a change
+    // that took nothing away from us — so there is no list to narrow with.
+    const { sm, scope } = await liveManager();
+    sm.handleServerReauth(scope);
+    expect(sm.revocationAuthority()).toBe(true);
+    expect(sm.authoritativeRevoked()).toBeNull();
+    expect(sm.hasPendingRegistryPull()).toBe(true);
+    sm.disable();
+  });
+
+  it("grants nothing without liveness, however loudly the server names docs", async () => {
+    // A launch that has not finished catching up cannot tell "not there yet"
+    // from "taken away", and this frame does not change that.
+    const sm = new SyncManager();
+    await sm.enable(session(), { orgId: ORG_A, name: "a", path: "/vaults/a", epoch: 1 });
+    expect(sm.isLive()).toBe(false); // the vault channel never reached `synced`
+    const scope = vaultScopes.current()!;
+    sm.handleServerRevoked(["d1", "d2"], false, scope);
+    expect(sm.revocationAuthority()).toBe(false);
+    sm.disable();
+  });
+
+  it("hands the named set to the planner through the inbound host", async () => {
+    // The registry asks the manager this question on every inbound pass; the
+    // answer is what narrows the cap lift to docs BOTH server answers agree on.
+    const { sm, scope } = await liveManager();
+    sm.handleServerRevoked(["d1"], false, scope);
+    const host = fakeRegistry.inboundHost as {
+      revocationAuthority?(): boolean;
+      authoritativeRevoked?(): ReadonlySet<string> | null;
+    };
+    expect(host.revocationAuthority?.()).toBe(true);
+    expect(host.authoritativeRevoked?.()).toEqual(new Set(["d1"]));
+    sm.disable();
+  });
+
+  it("ignores a frame from the vault we just left", async () => {
+    // A socket outliving a vault switch must not stamp the NEW vault's
+    // authority — which is why the engine's own scope is passed in rather than
+    // whichever one the manager happens to hold now.
+    const { sm, scope } = await liveManager();
+    sm.disable();
+    sm.handleServerRevoked(["d1", "d2"], false, scope);
+    expect(sm.revocationAuthority()).toBe(false);
+    expect(sm.authoritativeRevoked()).toBeNull();
+  });
+
+  it("forgets the list on teardown", async () => {
+    const { sm, scope } = await liveManager();
+    sm.handleServerRevoked(["d1"], false, scope);
+    sm.disable();
+    expect(sm.authoritativeRevoked()).toBeNull();
+    expect(sm.revocationAuthority()).toBe(false);
   });
 });

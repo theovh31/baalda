@@ -13,6 +13,8 @@ import {
   type SessionInfo,
 } from "../api";
 import * as ipc from "../ipc";
+import { rememberServer } from "./recentServers";
+import type { SessionVerdict } from "../sync/sessionGuard";
 
 /**
  * Keychain key namespace. Bumped from `session:` when macOS builds started being
@@ -71,6 +73,7 @@ export class AuthManager {
       /* config unavailable — fall back to the default URL */
     }
 
+    rememberServer(this.serverUrl);
     let token: string | null = null;
     try {
       token = await ipc.keychainGet(this.keychainKey());
@@ -98,10 +101,12 @@ export class AuthManager {
   /** Change + persist the server URL. Restores that server's token if present. */
   async setServerUrl(url: string): Promise<SessionInfo | null> {
     const clean = stripSlash(url) || DEFAULT_SERVER_URL;
+    // Persist first: a failed config write must leave the current client intact.
+    await ipc.setServerUrl(clean);
+    // Never expose the old server's bearer token under the new base URL.
+    this.api.setToken(null);
     this.serverUrl = clean;
     this.api.setBaseUrl(clean);
-    await ipc.setServerUrl(clean);
-    this.api.setToken(null);
     return this.init();
   }
 
@@ -138,6 +143,15 @@ export class AuthManager {
     const code = await ipc.googleOauthAwait();
     const { user, token } = await this.api.exchangeDesktopCode(code);
     if (token) await ipc.keychainSet(this.keychainKey(), token);
+    // Return only after the exchange and keychain write have succeeded. This
+    // invokes the running native process directly, so dev/staging/production
+    // installs cannot steal the handoff through a shared URL scheme. Focus is
+    // a courtesy: an OS refusal must not turn a valid session into an error.
+    try {
+      await ipc.googleOauthReturnToApp();
+    } catch (e) {
+      console.warn("[oauth] sign-in completed but the app could not be focused", e);
+    }
     return user;
   }
 
@@ -151,6 +165,33 @@ export class AuthManager {
 
   async currentSession(): Promise<SessionInfo | null> {
     return this.api.getSession();
+  }
+
+  /**
+   * Re-check the stored session against the server, and drop it if it is gone.
+   *
+   * The same question `init()` asks on launch, asked MID-RUN: the sync layer
+   * calls this when a token mint comes back 401, because that is the only signal
+   * a session that expired or was revoked while the app was open ever produces
+   * (see `sync/sessionGuard.ts`). It is deliberately the whole decision — the
+   * caller acts on the verdict and never on the 401 alone.
+   *
+   * `getSession()` already draws the only line that matters: `null` means the
+   * server ANSWERED that there is no session (401/403, or Better Auth's literal
+   * null body), while anything it cannot make sense of throws and keeps the
+   * token. So `gone` clears the keychain exactly like `init()`'s invalid-token
+   * branch, and an unreachable server changes nothing at all.
+   */
+  async revalidateSession(): Promise<SessionVerdict> {
+    let session: SessionInfo | null;
+    try {
+      session = await this.api.getSession();
+    } catch {
+      return "unreachable"; // server down / offline — decide nothing
+    }
+    if (session) return "valid";
+    await this.clearToken();
+    return "gone";
   }
 
   private async clearToken(): Promise<void> {

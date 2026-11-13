@@ -5,7 +5,9 @@ import { pool } from "../src/db/pool.js";
 import { resetDb } from "./helpers/db.js";
 import { testAppDeps, memoryDocWriter } from "./helpers/app.js";
 import { authHeaders, createOrg, signUp, type TestUser } from "./helpers/auth.js";
-import { seedMember, seedNote, seedVault } from "./helpers/seed.js";
+import { seedMember, seedNote, seedVault, seedVaultGrant } from "./helpers/seed.js";
+import { bucketImageOrigins } from "../src/http/routes/public-links.js";
+import type { S3Config } from "../src/blobs/config.js";
 
 /**
  * Public note links: /api/notes/:docId/public-link (mint/inspect/revoke, gated
@@ -29,6 +31,37 @@ async function mint(user: TestUser, docId: string) {
   );
 }
 
+// On S3/R2 an embedded image is a 302 to the bucket, and the page's img-src is
+// applied to that redirect: the bucket's origin has to be on it, or every image
+// on a shared page is a broken placeholder.
+describe("bucketImageOrigins", () => {
+  const base = {
+    bucket: "baalda",
+    region: "auto",
+    forcePathStyle: false,
+    proxyDownloads: false,
+  } as S3Config;
+
+  it("allows the R2 bucket host the presigned redirect points at", () => {
+    const origins = bucketImageOrigins({ ...base, endpoint: "https://acct.r2.cloudflarestorage.com" });
+    expect(origins).toContain("https://baalda.acct.r2.cloudflarestorage.com");
+  });
+
+  it("allows the endpoint itself for path-style gateways, and AWS hosts without an endpoint", () => {
+    expect(
+      bucketImageOrigins({ ...base, endpoint: "http://minio:9000", forcePathStyle: true }),
+    ).toEqual(["http://minio:9000"]);
+    expect(bucketImageOrigins({ ...base, region: "eu-west-2" })).toContain(
+      "https://baalda.s3.eu-west-2.amazonaws.com",
+    );
+  });
+
+  it("adds nothing when bytes never leave this server", () => {
+    expect(bucketImageOrigins(null)).toEqual([]);
+    expect(bucketImageOrigins({ ...base, endpoint: "https://x.example", proxyDownloads: true })).toEqual([]);
+  });
+});
+
 describe("public note links", () => {
   let owner: TestUser;
   let orgId: string;
@@ -42,6 +75,9 @@ describe("public note links", () => {
     owner = await signUp(`owner-${randomUUID().slice(0, 8)}@pl.test`);
     orgId = (await createOrg(owner, "PL Co", `pl-co-${randomUUID().slice(0, 8)}`)).id;
     vault = await seedVault(orgId);
+    // Shared. Minting a public link now needs read access as well as the
+    // management gate — you cannot publish what you cannot open.
+    await seedVaultGrant(orgId, "edit");
     docId = await seedNote(vault, null, "shared.md");
     docWriter.store.set(docId, "# Hello\n\nSome **shared** text.");
   });
@@ -63,6 +99,23 @@ describe("public note links", () => {
     expect(b.token).toBe(a.token);
     expect(b.url).toBe(a.url);
     expect(b.existing).toBe(true);
+  });
+
+  it("refuses to mint for a note the minter cannot read", async () => {
+    // The management gate is role-based and the read gate is not, so in a
+    // Private vault an owner can hold one without the other. Publishing to the
+    // open web from that seat would put contents they are not allowed to open
+    // on a public URL.
+    await pool.query("DELETE FROM shares WHERE resource_type = 'vault' AND resource_id = $1", [
+      orgId,
+    ]);
+    const member = await signUp("member@publinks.test");
+    await seedMember(orgId, member.userId, "member");
+    const theirs = await seedNote(vault, null, "Theirs.md", member.userId);
+
+    const res = await mint(owner, theirs);
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("No access to this note");
   });
 
   it("gate: creator-member can mint, other member 403, anon 401, unknown/deleted 404", async () => {
@@ -180,6 +233,71 @@ describe("public note links", () => {
     expect((await app.request(`/p/${token}/a/attachments/secret.png`)).status).toBe(404);
     expect((await app.request(`/p/${token}/a/attachments/page.html`)).status).toBe(404);
     expect((await app.request(`/p/${token}/a/../etc/passwd`)).status).toBe(404);
+  });
+
+  it("serves each attachment type the way it is safe to serve it", async () => {
+    // Every one of these is referenced by the note, so the containment check
+    // passes and the MIME is the only thing deciding the answer.
+    const cases = [
+      { rel: "attachments/a.png", mime: "image/png", expect: "inline" },
+      { rel: "attachments/a.pdf", mime: "application/pdf", expect: "inline" },
+      { rel: "attachments/a.mp4", mime: "video/mp4", expect: "inline" },
+      { rel: "attachments/a.mp3", mime: "audio/mpeg", expect: "inline" },
+      // Allow-listed, but not safe to RENDER: downloads as opaque bytes.
+      {
+        rel: "attachments/a.docx",
+        mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        expect: "attachment",
+      },
+      { rel: "attachments/a.zip", mime: "application/zip", expect: "attachment" },
+      { rel: "attachments/a.csv", mime: "text/csv", expect: "attachment" },
+      // Active documents — never served at all, inline or otherwise.
+      { rel: "attachments/a.svg", mime: "image/svg+xml", expect: "miss" },
+      { rel: "attachments/a.html", mime: "text/html", expect: "miss" },
+      // Not on the allow-list.
+      { rel: "attachments/a.exe", mime: "application/x-msdownload", expect: "miss" },
+    ] as const;
+
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02]);
+    docWriter.store.set(docId, cases.map((x) => `![f](/${x.rel})`).join("\n"));
+    for (const x of cases) {
+      await pool.query(
+        `INSERT INTO blobs (id, vault_id, org_id, sha256, size, mime, data, rel_path, filename)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          randomUUID(),
+          vault,
+          orgId,
+          randomUUID(),
+          bytes.length,
+          x.mime,
+          bytes,
+          x.rel,
+          x.rel.split("/")[1],
+        ],
+      );
+    }
+    const { token } = (await (await mint(owner, docId)).json()) as { token: string };
+
+    for (const x of cases) {
+      const res = await app.request(`/p/${token}/a/${x.rel}`);
+      const label = `${x.rel} → ${res.status}`;
+      if (x.expect === "miss") {
+        expect(label).toBe(`${x.rel} → 404`);
+        continue;
+      }
+      expect(label).toBe(`${x.rel} → 200`);
+      expect([x.rel, res.headers.get("content-disposition")]).toEqual([x.rel, x.expect]);
+      expect([x.rel, res.headers.get("content-type")]).toEqual([
+        x.rel,
+        x.expect === "inline" ? x.mime : "application/octet-stream",
+      ]);
+      // Every asset response, whatever its type: no origin, no scripts, no
+      // sniffing, and (on Postgres) an honest "I cannot do ranges".
+      expect(res.headers.get("content-security-policy")).toBe("default-src 'none'; sandbox");
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(res.headers.get("accept-ranges")).toBe("none");
+    }
   });
 
   it("the page renders the embedded image through the token-scoped route", async () => {

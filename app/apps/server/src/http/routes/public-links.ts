@@ -1,13 +1,37 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { pool } from "../../db/pool.js";
 import { config } from "../../config.js";
 import { BRAND_NAME } from "../../brand.js";
+import { WORDMARK_INK_DATA_URI } from "../../brand-assets.js";
+import { FONT_FACE_CSS } from "../fonts.js";
 import { orgRole } from "../../permissions/lookup.js";
+import { ACCOUNT_READ_ONLY_BODY, refusedForBilling } from "../../permissions/http-gates.js";
+import { effectivePermission } from "../../permissions/resolver.js";
 import { getSession } from "../session.js";
 import { renderNoteHtml } from "../../render/note-html.js";
 import type { DocWriter } from "../../mcp/doc-writer.js";
+import { vaultKeysEnabled } from "../../crypto/config.js";
+import { vaultCheckState, type VaultCheckState } from "../../crypto/conversion.js";
+import { decodeVk, KeyRequiredError, keyRequiredResponse, VK_HEADER } from "../../crypto/transport.js";
+import { verifyVk } from "../../crypto/vk-check.js";
+import {
+  linkCrypto,
+  linkTokenHash,
+  openLinkToken,
+  sealLinkToken,
+  wrapLinkVk,
+} from "../../crypto/link-keys.js";
+import {
+  NEVER_INLINE_MIME,
+  SAFE_INLINE_MIME,
+  isAllowedMime,
+  normalizeMime,
+} from "../../blobs/formats.js";
+import { resolveStoreForRow, storageKeyForRow } from "../../blobs/store.js";
+import { s3Config, type S3Config } from "../../blobs/config.js";
 
 /**
  * Public note links — the "anyone with the link can view" sibling of the
@@ -85,6 +109,13 @@ export const publicLinkApiRoutes = new Hono();
  * Same authority as `shares.ts` canManage for a file: org owner/admin or the
  * note's creator. Publishing a note to the open web is the widest possible
  * share, so it deliberately uses the share-management gate, not edit access.
+ *
+ * Read access is required ON TOP of it, and that is not redundant: the role no
+ * longer implies read. In a Private vault, or under an item set to Private, an
+ * owner can hold the management gate over a note they cannot open — and minting
+ * a public link would have published its contents to the open web from a seat
+ * that is not allowed to see them. Managing a restriction and reading through
+ * it are different powers; only the first one is role-based.
  */
 async function gate(
   userId: string,
@@ -101,14 +132,44 @@ async function gate(
   if (!isAdmin && !isCreator) {
     return { ok: false, status: 403, error: "Not allowed to manage sharing here" };
   }
+  if ((await effectivePermission(userId, docId)) === "none") {
+    return { ok: false, status: 403, error: "No access to this note" };
+  }
   return { ok: true, note };
 }
 
 interface LinkRow {
   id: string;
   doc_id: string;
-  token: string;
+  /** NULL for a link minted in a keyed vault (W3): read `token_enc` instead. */
+  token: string | null;
+  token_enc: Buffer | null;
   created_at: string;
+}
+
+const LINK_COLS = "id, doc_id, token, token_enc, created_at";
+
+/**
+ * W3: the caller's verified VK for this vault, from `X-Baalda-VK`, checked
+ * against the keyed (or pending) check. `state` null = the vault has no key in
+ * play (or the flag is off): today's path.
+ */
+async function presentedLinkKey(
+  c: Context,
+  vaultId: string,
+): Promise<{ state: VaultCheckState | null; vk: Buffer | null }> {
+  if (!vaultKeysEnabled()) return { state: null, vk: null };
+  const state = await vaultCheckState(vaultId, pool);
+  if (!state) return { state: null, vk: null };
+  const vk = decodeVk(c.req.header(VK_HEADER));
+  return { state, vk: vk && verifyVk(vk, vaultId, state.check) ? vk : null };
+}
+
+/** The link's token for a member: plaintext column, else opened from `token_enc`. */
+function readableToken(row: LinkRow, vaultId: string, vk: Buffer | null): string | null {
+  if (row.token) return row.token;
+  if (row.token_enc && vk) return openLinkToken(vk, vaultId, row.id, row.token_enc);
+  return null;
 }
 
 publicLinkApiRoutes.post("/notes/:docId/public-link", async (c) => {
@@ -117,33 +178,55 @@ publicLinkApiRoutes.post("/notes/:docId/public-link", async (c) => {
   const docId = c.req.param("docId");
   const g = await gate(session.userId, docId);
   if (!g.ok) return c.json({ error: g.error }, g.status);
+  // Minting publishes the note: refused while the account is lapsed. Revoking
+  // (DELETE below) stays allowed, since it only narrows exposure.
+  if (await refusedForBilling(g.note.organizationId)) return c.json(ACCOUNT_READ_ONLY_BODY, 402);
+
+  // W3: a keyed vault needs the caller's VK (refused before anything is
+  // written); a pending vault takes it when offered, so the link is wrapped
+  // from birth and never holds up the conversion.
+  const { state, vk } = await presentedLinkKey(c, g.note.vaultId);
+  if (state && !state.pending && !vk) return keyRequiredResponse(c, g.note.vaultId);
 
   // Create-or-get: repeated copies must return the SAME url. The unique
   // doc_id key makes the race harmless — the loser's insert is a no-op and
   // both callers read back the one surviving row.
+  const id = randomUUID();
+  const fresh = mintToken();
+  const keyed = Boolean(state && !state.pending);
   const inserted = await pool.query<LinkRow>(
-    `INSERT INTO public_links (id, doc_id, vault_id, org_id, token, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO public_links
+       (id, doc_id, vault_id, org_id, token, token_hash, token_enc, wrapped_vk, wrap_generation, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (doc_id) DO NOTHING
-     RETURNING id, doc_id, token, created_at`,
-    [randomUUID(), docId, g.note.vaultId, g.note.organizationId, mintToken(), session.userId],
+     RETURNING ${LINK_COLS}`,
+    [
+      id,
+      docId,
+      g.note.vaultId,
+      g.note.organizationId,
+      // Keyed: never the plaintext token, only its hash + sealed copy.
+      keyed ? null : fresh,
+      linkTokenHash(fresh),
+      state && vk ? sealLinkToken(vk, g.note.vaultId, id, fresh, state.generation) : null,
+      state && vk ? wrapLinkVk(fresh, g.note.vaultId, id, vk, state.generation) : null,
+      state && vk ? state.generation : null,
+      session.userId,
+    ],
   );
   const created = inserted.rows[0] ?? null;
   const row =
     created ??
-    (
-      await pool.query<LinkRow>(
-        "SELECT id, doc_id, token, created_at FROM public_links WHERE doc_id = $1",
-        [docId],
-      )
-    ).rows[0];
+    (await pool.query<LinkRow>(`SELECT ${LINK_COLS} FROM public_links WHERE doc_id = $1`, [docId])).rows[0];
   if (!row) return c.json({ error: "Unknown note" }, 404);
+  const token = created ? fresh : readableToken(row, g.note.vaultId, vk);
+  if (!token) return keyRequiredResponse(c, g.note.vaultId);
   return c.json(
     {
       id: row.id,
       docId: row.doc_id,
-      token: row.token,
-      url: linkUrl(row.token),
+      token,
+      url: linkUrl(token),
       createdAt: row.created_at,
       existing: created === null,
     },
@@ -158,21 +241,20 @@ publicLinkApiRoutes.get("/notes/:docId/public-link", async (c) => {
   const g = await gate(session.userId, docId);
   if (!g.ok) return c.json({ error: g.error }, g.status);
 
-  const { rows } = await pool.query<LinkRow>(
-    "SELECT id, doc_id, token, created_at FROM public_links WHERE doc_id = $1",
-    [docId],
-  );
+  const { rows } = await pool.query<LinkRow>(`SELECT ${LINK_COLS} FROM public_links WHERE doc_id = $1`, [docId]);
   const row = rows[0];
+  if (!row) return c.json({ link: null });
+  const { vk } = row.token ? { vk: null } : await presentedLinkKey(c, g.note.vaultId);
+  const token = readableToken(row, g.note.vaultId, vk);
+  if (!token) return keyRequiredResponse(c, g.note.vaultId);
   return c.json({
-    link: row
-      ? {
-          id: row.id,
-          docId: row.doc_id,
-          token: row.token,
-          url: linkUrl(row.token),
-          createdAt: row.created_at,
-        }
-      : null,
+    link: {
+      id: row.id,
+      docId: row.doc_id,
+      token,
+      url: linkUrl(token),
+      createdAt: row.created_at,
+    },
   });
 });
 
@@ -200,63 +282,96 @@ function esc(s: string): string {
 }
 
 const PAGE_CSS = `
+  /* baalda.com's design system, light only: warm off-white page with the
+     violet glow at the top, a white sheet, ink type (Radio Canada Big for
+     headings, Inter for text), black pill buttons and the violet accent. */
   :root {
-    --bg-app: #ececf0; --bg-surface: #ffffff;
-    --text-primary: #1a1a1e; --text-secondary: #6b6b76;
-    --border: rgba(20, 20, 40, 0.09); --code-bg: #f1f1f4;
-    --accent: #6d5ae6;
+    color-scheme: light;
+    --bg-page: #fcf9f7; --bg-sheet: #ffffff; --bg-soft: #f7f4f1;
+    --ink: #030302; --ink-soft: #404040; --ink-muted: #737373; --ink-faint: #a3a3a3;
+    --border: rgba(3, 3, 2, 0.08); --violet: #7c5cff; --violet-tint: rgba(124, 92, 255, 0.08);
+    --display: "Radio Canada Big", "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg-app: #101014; --bg-surface: #1d1d24;
-      --text-primary: #f2f2f5; --text-secondary: #a6a6b2;
-      --border: rgba(255, 255, 255, 0.09); --code-bg: #26262e;
-      --accent: #8d7cf0;
-    }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg-page); color: var(--ink-soft);
+         background-image: radial-gradient(70% 520px at 50% 0%, rgba(124, 92, 255, 0.14), transparent 70%);
+         background-repeat: no-repeat;
+         font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         font-size: 16.5px; line-height: 1.75; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 20px 24px 48px; }
+  .site-top { display: flex; align-items: center; justify-content: space-between;
+              gap: 12px; padding: 10px 4px 24px; }
+  a.brand { display: inline-flex; align-items: center; }
+  a.brand img { height: 18px; width: auto; display: block; }
+  a.open-app { display: inline-flex; align-items: center; height: 40px; padding: 0 20px; border-radius: 999px;
+               background: var(--ink); color: #fff; text-decoration: none; font-weight: 500;
+               font-size: 14px; white-space: nowrap;
+               box-shadow: 0 8px 16px -6px rgba(3, 3, 2, 0.35);
+               transition: background .15s, box-shadow .2s, transform .15s; }
+  a.open-app:hover { background: #262624; box-shadow: 0 12px 22px -8px rgba(3, 3, 2, 0.4); transform: translateY(-1px); }
+  main { background: var(--bg-sheet); border: 1px solid rgba(3, 3, 2, 0.06); border-radius: 24px;
+         padding: 72px 96px 80px;
+         box-shadow: 0 30px 60px -24px rgba(48, 32, 140, 0.16), 0 2px 6px rgba(3, 3, 2, 0.04); }
+  @media (max-width: 720px) {
+    .wrap { padding: 12px 16px 36px; }
+    main { padding: 36px 22px 40px; border-radius: 18px; }
+    a.open-app { height: 36px; padding: 0 16px; font-size: 13px; }
   }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         margin: 0; background: var(--bg-app); color: var(--text-primary);
-         line-height: 1.65; -webkit-font-smoothing: antialiased; }
-  /* The app's editor sheet: a centred column at the same measure. */
-  main { max-width: min(120ch, calc(100vw - 32px)); margin: 24px auto 48px;
-         background: var(--bg-surface); border: 1px solid var(--border);
-         border-radius: 14px; padding: 48px 64px 56px; }
-  @media (max-width: 760px) { main { padding: 28px 20px 36px; margin: 0 auto 24px;
-         border-radius: 0; border-left: none; border-right: none; } }
-  .page-top { display: flex; align-items: center; gap: 12px; justify-content: space-between;
-              margin-bottom: 20px; }
-  a.open-app { display: inline-block; padding: 7px 16px; border-radius: 999px;
-               background: var(--text-primary); color: var(--bg-surface);
-               text-decoration: none; font-weight: 600; font-size: 0.9rem;
-               white-space: nowrap; }
-  article h1, article h2, article h3 { line-height: 1.3; }
-  article img { max-width: 100%; height: auto; border-radius: 6px; }
-  article pre { background: var(--code-bg); padding: 0.8rem 1rem; border-radius: 8px;
-                overflow-x: auto; }
-  article code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px;
-                 font-size: 0.92em; font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace; }
+  h1.doc-title { font-family: var(--display); color: var(--ink); font-size: clamp(2rem, 4.5vw, 2.75rem);
+                 line-height: 1.1; letter-spacing: -0.03em; margin: 0 0 32px; font-weight: 600; }
+  article > :first-child { margin-top: 0; }
+  article h1, article h2, article h3, article h4 { font-family: var(--display); color: var(--ink);
+                                                  font-weight: 600; line-height: 1.25; letter-spacing: -0.02em;
+                                                  margin: 1.9em 0 0.55em; }
+  article h1 { font-size: 1.75rem; } article h2 { font-size: 1.4rem; }
+  article h3 { font-size: 1.15rem; } article h4 { font-size: 1rem; }
+  article strong { color: var(--ink); font-weight: 600; }
+  article p, article ul, article ol { margin: 0 0 1.1em; }
+  article ul, article ol { padding-left: 1.4em; }
+  article li { margin: 0.3em 0; }
+  article li::marker { color: var(--ink-faint); }
+  article img { display: block; max-width: 100%; height: auto; border-radius: 14px; margin: 0.4em 0 1.1em; }
+  article hr { border: 0; border-top: 1px solid var(--border); margin: 2.4em 0; }
+  article a { color: var(--violet); text-decoration: underline; text-decoration-thickness: 1px;
+              text-underline-offset: 3px; text-decoration-color: rgba(124, 92, 255, 0.4); }
+  article a:hover { text-decoration-color: var(--violet); }
+  /* A [[wikilink]] points at a note this page does not carry: the site's
+     violet chip, not a link. */
+  .wikilink { color: var(--violet); background: var(--violet-tint); padding: 0.1em 0.45em;
+              border-radius: 7px; font-weight: 500; }
+  article pre { background: var(--bg-soft); border: 1px solid var(--border); padding: 16px 18px;
+                border-radius: 14px; overflow-x: auto; font-size: 0.86em; line-height: 1.6; }
+  article code { background: var(--bg-soft); padding: 0.14em 0.42em; border-radius: 6px; font-size: 0.86em;
+                 font-family: var(--mono); color: var(--ink); }
   article pre code { background: none; padding: 0; }
-  article blockquote { margin: 0; padding-left: 1rem; border-left: 3px solid var(--border);
-                       color: var(--text-secondary); }
-  article a { color: var(--accent); }
-  .wikilink { color: var(--text-secondary); border-bottom: 1px dotted var(--border); }
+  article blockquote { margin: 0 0 1.1em; padding: 14px 20px; border-left: 3px solid var(--violet);
+                       background: #faf8ff; border-radius: 0 14px 14px 0; color: var(--ink-soft); }
+  article blockquote > :last-child { margin-bottom: 0; }
   /* Tables — the editor's exact treatment: natural column widths, cells wrap
      at a readable measure, a wide table scrolls in its wrapper. */
-  .md-table { margin: 12px 0; overflow-x: auto; contain: inline-size; }
-  .md-table table { border-collapse: collapse; width: max-content; font-size: 0.95em; }
-  .md-table th, .md-table td { border: 1px solid var(--border); padding: 4px 12px;
+  .md-table { margin: 14px 0 1.1em; overflow-x: auto; contain: inline-size;
+              border: 1px solid var(--border); border-radius: 14px; }
+  .md-table table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 0.92em; }
+  .md-table th, .md-table td { border-bottom: 1px solid var(--border); padding: 9px 14px;
                                text-align: left; vertical-align: top; max-width: 42ch; }
-  .md-table th { font-weight: 600; }
+  .md-table tr:last-child td { border-bottom: 0; }
+  .md-table th { font-weight: 600; color: var(--ink); background: var(--bg-soft); }
   .md-table::-webkit-scrollbar { height: 8px; }
   .md-table::-webkit-scrollbar-thumb { background-color: var(--border); border-radius: 4px; }
   .md-table::-webkit-scrollbar-track { background: transparent; }
-  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border);
-           font-size: 0.85rem; color: var(--text-secondary); }
-  footer a { color: inherit; }
-  h1.doc-title { font-size: 1.7rem; margin: 0; }
+  footer { text-align: center; margin-top: 28px; font-family: var(--mono); font-size: 11px;
+           letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-faint); }
+  footer a { color: var(--ink-muted); text-decoration: none; }
+  footer a:hover { color: var(--ink); }
 `;
 
-function pageShell(title: string, inner: string): string {
+/** The page frame: brand bar (with "Open in Baalda" when there is a note to
+ *  open), the white sheet, and a quiet footer under it. */
+export function pageShell(title: string, inner: string, openHref?: string): string {
+  const open = openHref
+    ? `<a class="open-app" href="${esc(openHref)}">Open in ${esc(BRAND_NAME)}</a>`
+    : "";
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -264,15 +379,43 @@ function pageShell(title: string, inner: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex" />
 <title>${esc(title)} · ${esc(BRAND_NAME)}</title>
-<style>${PAGE_CSS}</style>
+<style>${FONT_FACE_CSS}
+${PAGE_CSS}</style>
 </head>
 <body>
+<div class="wrap">
+<header class="site-top"><a class="brand" href="https://baalda.com" rel="noopener noreferrer"><img src="${WORDMARK_INK_DATA_URI}" alt="${esc(BRAND_NAME)}" /></a>${open}</header>
 <main>
 ${inner}
-<footer>Shared via ${esc(BRAND_NAME)} · <a href="https://baalda.com" rel="noopener noreferrer">Get ${esc(BRAND_NAME)}</a></footer>
 </main>
+<footer>Shared with ${esc(BRAND_NAME)} · <a href="https://baalda.com" rel="noopener noreferrer">Get ${esc(BRAND_NAME)} →</a></footer>
+</div>
 </body>
 </html>`;
+}
+
+/**
+ * Where an embedded image's bytes actually come from. On S3/R2 the asset route
+ * answers with a 302 to a presigned bucket URL, and a browser applies the
+ * page's `img-src` to the redirect target too — with only `'self'` allowed,
+ * every image on a shared page rendered as a broken placeholder in production
+ * while working on a Postgres-stored self-host. Origins only, derived from the
+ * same settings the S3 client signs with (virtual-hosted and path-style).
+ */
+export function bucketImageOrigins(cfg: S3Config | null = s3Config()): string[] {
+  if (!cfg || cfg.proxyDownloads) return [];
+  if (cfg.endpoint) {
+    let url: URL;
+    try {
+      url = new URL(cfg.endpoint);
+    } catch {
+      return [];
+    }
+    return cfg.forcePathStyle ? [url.origin] : [`${url.protocol}//${cfg.bucket}.${url.host}`, url.origin];
+  }
+  return cfg.forcePathStyle
+    ? [`https://s3.${cfg.region}.amazonaws.com`]
+    : [`https://${cfg.bucket}.s3.${cfg.region}.amazonaws.com`, `https://${cfg.bucket}.s3.amazonaws.com`];
 }
 
 /** Headers every /p/* response carries — misses included, so 404s don't
@@ -284,7 +427,10 @@ const PAGE_HEADERS: Record<string, string> = {
   "X-Robots-Tag": "noindex",
   "X-Content-Type-Options": "nosniff",
   "Content-Security-Policy":
-    "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'",
+    // data: for the embedded wordmark, the bucket for redirected images (see
+    // `bucketImageOrigins`), and the self-hosted fonts (`http/fonts.ts`).
+    `default-src 'none'; img-src ${["'self'", "data:", ...bucketImageOrigins()].join(" ")}; ` +
+    "style-src 'unsafe-inline'; font-src 'self'",
 };
 
 /** One generic page for malformed/unknown/revoked/deleted — byte-identical on
@@ -296,23 +442,67 @@ const NOT_FOUND_HTML = pageShell(
 );
 
 interface PublicNoteRow {
+  id: string;
   doc_id: string;
   vault_id: string;
   org_id: string;
   title: string | null;
   rel_path: string;
+  token_enc: Buffer | null;
+  wrapped_vk: Buffer | null;
+  wrap_generation: number | null;
+  allow_mac: Buffer | null;
+  /** Who minted the link (null once that account is deleted). */
+  created_by: string | null;
 }
 
+/** Found by the token's sha256 (migration 076 backfilled every existing row). */
 async function noteForToken(token: string): Promise<PublicNoteRow | null> {
   if (!TOKEN_RE.test(token)) return null;
   const { rows } = await pool.query<PublicNoteRow>(
-    `SELECT pl.doc_id, pl.vault_id, pl.org_id, n.title, n.rel_path
+    `SELECT pl.id, pl.doc_id, pl.vault_id, pl.org_id, n.title, n.rel_path,
+            pl.token_enc, pl.wrapped_vk, pl.wrap_generation, pl.allow_mac, pl.created_by
        FROM public_links pl
        JOIN notes n ON n.id = pl.doc_id AND n.deleted_at IS NULL
-      WHERE pl.token = $1`,
-    [token],
+      WHERE pl.token_hash = $1
+         -- A row an older server minted during a rolling deploy has no hash yet.
+         OR (pl.token_hash IS NULL AND pl.token = $2)`,
+    [linkTokenHash(token), token],
   );
   return rows[0] ?? null;
+}
+
+/**
+ * The note's markdown for a view, or null when the link cannot be read (a
+ * keyed vault and no usable key): a miss, never an empty page. W3 only: also
+ * stamps `last_viewed_at` (hourly at most) for the conversion gate.
+ */
+async function viewMarkdown(
+  deps: PublicPageDeps,
+  row: PublicNoteRow,
+  token: string,
+): Promise<{ md: string | null } | null> {
+  const k = await linkCrypto(row, token, pool);
+  if (k === "unavailable") return null;
+  if (vaultKeysEnabled()) {
+    pool
+      .query(
+        `UPDATE public_links SET last_viewed_at = now()
+          WHERE id = $1 AND (last_viewed_at IS NULL OR last_viewed_at < now() - interval '1 hour')`,
+        [row.id],
+      )
+      .catch(() => {});
+  }
+  try {
+    return { md: await deps.docWriter.peekContent(row.vault_id, row.doc_id, k.crypto) };
+  } catch (err) {
+    // A sealed doc this view could not open is a miss; anything else is the
+    // same error as before W3.
+    if (err instanceof KeyRequiredError) return null;
+    throw err;
+  } finally {
+    k.crypto?.key.fill(0);
+  }
 }
 
 /** Display title: stored title, else the filename without extension. */
@@ -323,14 +513,34 @@ function noteTitle(row: PublicNoteRow): string {
   return stem.replace(/\.md$/i, "");
 }
 
-/** Passive image types only — never SVG (active content). */
-const IMAGE_MIME_ALLOWLIST = new Set([
-  "image/png",
-  "image/jpeg",
-  "image/gif",
-  "image/webp",
-  "image/avif",
-]);
+/**
+ * Headers for an ASSET response (not the HTML page).
+ *
+ * The page's CSP is about what the page may load; this one is about what the
+ * asset may DO if a browser ever treats it as a document: `default-src 'none'`
+ * plus `sandbox` (no origin, no scripts, no forms) means even a file that slips
+ * past the type checks below executes nothing. `nosniff` comes from
+ * PAGE_HEADERS and is what stops the browser second-guessing the Content-Type
+ * we set.
+ */
+const ASSET_HEADERS: Record<string, string> = {
+  ...PAGE_HEADERS,
+  "Content-Security-Policy": "default-src 'none'; sandbox",
+};
+
+/** `bytes=<start>-<end?>`, the only form worth honouring here. Anything else
+ *  (multi-range, suffix ranges) is ignored and the whole object is served. */
+function parseRange(header: string | undefined): { start: number; end?: number } | null {
+  if (!header) return null;
+  const m = /^bytes=(\d+)-(\d+)?$/.exec(header.trim());
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = m[2] === undefined ? undefined : Number(m[2]);
+  if (!Number.isFinite(start) || (end !== undefined && (!Number.isFinite(end) || end < start))) {
+    return null;
+  }
+  return end === undefined ? { start } : { start, end };
+}
 
 export function createPublicPageRoutes(deps: PublicPageDeps): Hono {
   const app = new Hono();
@@ -344,7 +554,9 @@ export function createPublicPageRoutes(deps: PublicPageDeps): Hono {
 
     // null = content never reached this server; render as empty, not a miss —
     // the link is real and the note exists.
-    const md = (await deps.docWriter.peekContent(row.vault_id, row.doc_id)) ?? "";
+    const view = await viewMarkdown(deps, row, token);
+    if (!view) return miss(c);
+    const md = view.md ?? "";
     const { bodyHtml } = renderNoteHtml(md, {
       assetUrl: (rel) =>
         `/p/${token}/a/${rel.split("/").map(encodeURIComponent).join("/")}`,
@@ -357,7 +569,8 @@ export function createPublicPageRoutes(deps: PublicPageDeps): Hono {
     return c.html(
       pageShell(
         title,
-        `<div class="page-top"><h1 class="doc-title">${esc(title)}</h1><a class="open-app" href="${esc(openHref)}">Open in ${esc(BRAND_NAME)}</a></div>\n<article>${bodyHtml}</article>`,
+        `<h1 class="doc-title">${esc(title)}</h1>\n<article>${bodyHtml}</article>`,
+        openHref,
       ),
       200,
       PAGE_HEADERS,
@@ -388,29 +601,88 @@ export function createPublicPageRoutes(deps: PublicPageDeps): Hono {
       return miss(c);
     }
 
-    const md = await deps.docWriter.peekContent(row.vault_id, row.doc_id);
+    const md = (await viewMarkdown(deps, row, token))?.md;
     if (!md || !md.includes(relPath)) return miss(c);
 
-    const { rows } = await pool.query<{ id: string; mime: string | null }>(
-      "SELECT id, mime FROM blobs WHERE vault_id = $1 AND rel_path = $2",
+    const { rows } = await pool.query<{
+      id: string;
+      mime: string | null;
+      filename: string | null;
+      storage_provider: string | null;
+      storage_key: string | null;
+      doc_id: string | null;
+    }>(
+      `SELECT id, mime, filename, storage_provider, storage_key, doc_id
+         FROM blobs
+        WHERE vault_id = $1 AND rel_path = $2 AND status = 'ready'`,
       [row.vault_id, relPath],
     );
     const blob = rows[0];
-    // The stored mime is uploader-controlled: only passive image types render.
-    if (!blob || !blob.mime || !IMAGE_MIME_ALLOWLIST.has(blob.mime)) return miss(c);
+    if (!blob) return miss(c);
+    // A tree file (a `files` row with its own doc id and ACL) is served only
+    // while the person who published the link may still read it. Without this
+    // a member denied folder X could write "X/plan.pdf" into a note they may
+    // edit, publish that note, and fetch the file through the link; and a
+    // removed member's link would keep serving files. Hash-named
+    // `attachments/` drops (no doc id) keep the containment rule above.
+    if (blob.doc_id) {
+      if (!row.created_by) return miss(c);
+      if ((await effectivePermission(row.created_by, blob.doc_id)) === "none") return miss(c);
+    }
 
-    const { rows: dataRows } = await pool.query<{ data: Buffer | null }>(
-      "SELECT data FROM blobs WHERE id = $1",
-      [blob.id],
-    );
-    const data = dataRows[0]?.data;
-    if (!data) return miss(c);
-    return c.body(data, 200, {
-      ...PAGE_HEADERS,
-      "Content-Type": blob.mime,
-      "Content-Length": String(data.byteLength),
-      "Content-Disposition": "inline",
-    });
+    // The stored mime is uploader-controlled, so it decides only HOW the bytes
+    // are served, never whether they are trusted:
+    //   · SAFE_INLINE_MIME — passive media (images, PDF, audio, video) — renders
+    //     inline with its real type, which is what makes a shared note show its
+    //     screenshots and play its clips.
+    //   · svg / html — ACTIVE documents. Not served at all, inline or otherwise;
+    //     an attachment disposition would still leave a one-click path to
+    //     executing uploader-authored script on this origin.
+    //   · anything else on the allow-list (docx, zip, csv, …) downloads as
+    //     octet-stream, so the browser never picks a handler off our say-so.
+    //   · anything not on the allow-list is a miss, as before.
+    const mime = normalizeMime(blob.mime);
+    if (mime === "" || NEVER_INLINE_MIME.has(mime) || !isAllowedMime(mime)) return miss(c);
+    const inline = SAFE_INLINE_MIME.has(mime);
+
+    try {
+      const store = await resolveStoreForRow(blob);
+      const range = parseRange(c.req.header("range"));
+      // The type and disposition decided above are PINNED onto the response by
+      // the provider — for S3 that means they are part of the presigned URL's
+      // signature, so the redirect below cannot serve an uploader-chosen
+      // `text/html` inline just because the object's own metadata says so.
+      const result = await store.get(storageKeyForRow(blob), {
+        mime: inline ? mime : "application/octet-stream",
+        filename: blob.filename,
+        disposition: inline ? "inline" : "attachment",
+        ...(range ? { range } : {}),
+      });
+      // s3: a 302 to a short-lived presigned GET. The browser follows it with
+      // no credentials of ours attached, and the bucket serves the bytes —
+      // which is what keeps a shared page's video off this server's egress.
+      if (result.kind === "redirect") return c.redirect(result.url, 302);
+      const headers: Record<string, string> = {
+        ...ASSET_HEADERS,
+        "Content-Type": inline ? mime : "application/octet-stream",
+        "Content-Length": String(result.size),
+        "Content-Disposition": inline ? "inline" : "attachment",
+        // Postgres has to materialize the whole value to reach any byte of it,
+        // so it answers `none` and the browser asks for the lot.
+        "Accept-Ranges": result.acceptRanges ? "bytes" : "none",
+      };
+      if (result.range) {
+        headers["Content-Range"] =
+          `bytes ${result.range.start}-${result.range.end}/${result.totalSize}`;
+        return c.body(Readable.toWeb(result.body) as ReadableStream, 206, headers);
+      }
+      return c.body(Readable.toWeb(result.body) as ReadableStream, 200, headers);
+    } catch {
+      // A blob whose bytes are gone, or whose provider this build cannot reach,
+      // is indistinguishable from a link that never existed — same generic miss
+      // the rest of this route uses, so nothing is confirmed either way.
+      return miss(c);
+    }
   });
 
   return app;

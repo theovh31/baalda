@@ -1,62 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
-import { createAvatar } from "@dicebear/core";
-import { notionists } from "@dicebear/collection";
-import { PRESENCE_PALETTE } from "../lib/presence/color";
+import { useEffect, useState } from "react";
 import { CheckMark } from "./Spinner";
-import type { SyncProgress } from "../lib/sync/vaultScope";
-
-/* ============================================================
-   Character avatars — every user is auto-assigned a unique illustrated
-   character (DiceBear "notionists" — clean, professional Notion-style line
-   art) from a stable seed (their id/email/name), so nobody is stuck with a
-   flat "TU". Generated as pure SVG on-device: no network, no external avatar
-   service (which would break local-first and leak identity), and the same
-   seed renders the same character on every machine. Backgrounds are drawn
-   from our happy palette so the vibe stays coherent.
-   ============================================================ */
-
-// Palette hex values without the leading "#", as DiceBear expects. DiceBear
-// deterministically picks one per seed, so each character gets its own colour.
-const AVATAR_BG = PRESENCE_PALETTE.map((c) => c.slice(1));
-
-/** Build the illustrated-character SVG for a seed. */
-export function characterSvg(seed: string): string {
-  return createAvatar(notionists, {
-    seed,
-    backgroundColor: AVATAR_BG,
-    backgroundType: ["solid"],
-    radius: 50,
-  }).toString();
-}
-
-export function Avatar({ label, image }: { label: string; image?: string | null }) {
-  const svg = useMemo(() => characterSvg(label || "?"), [label]);
-  // Prefer a real profile photo (e.g. from Google) when present; fall back to
-  // the generated character if there's no image or it fails to load.
-  const [imgFailed, setImgFailed] = useState(false);
-  useEffect(() => setImgFailed(false), [image]);
-
-  if (image && !imgFailed) {
-    return (
-      <span className="avatar" aria-hidden="true">
-        <img
-          src={image}
-          alt=""
-          // Google's lh3.googleusercontent.com can 403 when a referrer is sent.
-          referrerPolicy="no-referrer"
-          onError={() => setImgFailed(true)}
-        />
-      </span>
-    );
-  }
-  return (
-    <span
-      className="avatar"
-      aria-hidden="true"
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
-  );
-}
+import { isBulkPhase, type SyncProgress } from "../lib/sync/vaultScope";
+import { syncPauseRemaining, type SyncPause } from "../lib/sync/syncPause";
 
 /** "just now" / "1m ago" / "2h ago" — coarse on purpose; it ticks every 30s. */
 export function relativeAgo(ts: number, now: number): string {
@@ -69,17 +14,62 @@ export function relativeAgo(ts: number, now: number): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-/** Phases in which the vault is actively moving data, as opposed to idle or
- *  terminal. Only these turn the pill into a counted progress report. */
-const ACTIVE_SYNC_PHASES: ReadonlySet<string> = new Set([
-  "registering",
-  "uploading",
-  "downloading",
-]);
-
-/** True while the open vault has a bulk sync run in flight. */
+/**
+ * True while the open vault has a bulk sync run with OUTSTANDING work. A run
+ * opens its phases before it knows their size (the reconcile opens
+ * `registering` at 0, the bulk engine `downloading` at 0); a phase with
+ * nothing left to do is not news, and counting it kept the pill amber through
+ * the whole reconcile on every launch and switch. Display only: the sync
+ * layer's own gating (`liveSince`, the first pull) never reads this.
+ * `removing` always counts (its label is a remaining count of its own), and so
+ * does an upload with notes the server has never had (#258).
+ */
 export function isSyncRunActive(progress: SyncProgress | null | undefined): boolean {
-  return progress != null && ACTIVE_SYNC_PHASES.has(progress.phase);
+  if (!progress || !isBulkPhase(progress.phase)) return false;
+  if (progress.phase === "removing") return true;
+  if (progress.phase === "uploading" && (progress.notUploaded ?? 0) > 0) return true;
+  // A counter that raced past its denominator is a run still in flight.
+  return progress.total > progress.done || (progress.total > 0 && progress.done > progress.total);
+}
+
+/** How long a run that just appeared must last before the pill leaves green. */
+export const SYNC_RUN_HOLD_MS = 500;
+
+/**
+ * Whether the pill should SHOW a run as active: a run that just appeared is
+ * held back for {@link SYNC_RUN_HOLD_MS}, so a burst that finishes inside it
+ * never flickers green → amber → green. `activeSince` is when the run became
+ * active (null when it is not); real work past the hold shows its counts.
+ */
+export function shownRunActive(activeSince: number | null, now: number): boolean {
+  return activeSince != null && now - activeSince >= SYNC_RUN_HOLD_MS;
+}
+
+/** {@link isSyncRunActive}, held back by {@link shownRunActive}. */
+function useShownRunActive(progress: SyncProgress | null | undefined): boolean {
+  const active = isSyncRunActive(progress);
+  const [since, setSince] = useState<number | null>(null);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) {
+      setSince(null);
+      return;
+    }
+    const start = Date.now();
+    setSince((prev) => prev ?? start);
+    const t = setTimeout(() => setTick((n) => n + 1), SYNC_RUN_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [active]);
+  return active && shownRunActive(since, Date.now());
+}
+
+/** The progress the pill renders: a run still inside its hold reads as settled. */
+export function heldProgress(
+  progress: SyncProgress | null | undefined,
+  shown: boolean,
+): SyncProgress | null | undefined {
+  if (!progress || shown || !isSyncRunActive(progress)) return progress;
+  return { ...progress, phase: "done" };
 }
 
 /** The run's completion as a whole percentage, or null when it has no total.
@@ -87,6 +77,33 @@ export function isSyncRunActive(progress: SyncProgress | null | undefined): bool
 export function syncRunPercent(progress: SyncProgress | null | undefined): number | null {
   if (!progress || progress.total <= 0) return null;
   return Math.max(0, Math.min(100, Math.floor((progress.done / progress.total) * 100)));
+}
+
+/**
+ * The run as the pill sees it: a run that ENDED in `error` reads as a finished
+ * run. The pill speaks two words when sync is on and connected — "Syncing" and
+ * "Synced" — and a stopped run is not news that belongs on it: per-note
+ * failures, notes the server refused for access and a failing registry pull
+ * all have their own surfaces (the sidebar's per-doc and vault badges, the
+ * Activity panel, the banners), and `syncManager.syncFailures()` is left
+ * untouched. What the pill shows instead is the state that is still true: the
+ * open note's own connection ("Synced" / "Syncing…" / "Retrying…" / "Offline"),
+ * or, for the vault-wide pill, the vault channel's live status.
+ *
+ * (It used to keep a run with no failed note, or one with refused notes or a
+ * failing pull, as `error` and read "Sync incomplete" with a "Sync now"
+ * action. That label was removed: it was more alarming than accurate.)
+ */
+export function pillProgress(
+  progress: SyncProgress | null | undefined,
+): SyncProgress | null | undefined {
+  if (progress?.phase === "error") return { ...progress, phase: "done" };
+  // A phase opened with nothing outstanding (see `isSyncRunActive`) reads as
+  // settled, so a vault with nothing to move is green, not "Syncing…".
+  if (progress && isBulkPhase(progress.phase) && !isSyncRunActive(progress)) {
+    return { ...progress, phase: "done" };
+  }
+  return progress;
 }
 
 /**
@@ -105,8 +122,10 @@ export function syncRunPercent(progress: SyncProgress | null | undefined): numbe
  * progress exists to kill.
  *
  * `noteOpen: false` puts the pill in vault-wide mode: `status` belongs to a
- * socket that doesn't exist, so the label is derived from `progress` alone —
- * counter while running, "Synced" once done, the failure count on error.
+ * socket that doesn't exist, so the label comes from `progress` while a run is
+ * live (the counter) and from `vaultStatus`, the vault channel's own live
+ * connection, once it has stopped (see {@link vaultWideLabel}). The pill never
+ * says "Synced" for the vault unless that channel is synced.
  */
 export function syncBadgeLabel(args: {
   status: string;
@@ -118,8 +137,15 @@ export function syncBadgeLabel(args: {
   progress?: SyncProgress | null;
   /** False when the pill stands for the vault, not an open note. */
   noteOpen?: boolean;
+  /** The vault channel's live status (`store.vaultSyncStatus`): what the
+   *  vault-wide pill reports once no run is live. */
+  vaultStatus?: string;
 }): string {
-  const { status, pending, lastSyncedAt, now, enabled, progress, noteOpen } = args;
+  const { status, pending, lastSyncedAt, now, enabled, noteOpen, vaultStatus } = args;
+  const progress = pillProgress(args.progress);
+  if (progress?.phase === "removing") {
+    return `Updating access · ${Math.max(0, progress.total - progress.done).toLocaleString()} remaining`;
+  }
   // A grant fact about the open note outranks everything else: there is no point
   // reporting upload progress on a doc we are not allowed to write.
   if (noteOpen !== false) {
@@ -131,7 +157,20 @@ export function syncBadgeLabel(args: {
   // Saying "Syncing…" over a doc the server has permanently refused is the lie
   // the whole badge exists to avoid.
   if (status === "too-large") return "Too large to sync";
+  // The server has no such doc any more (its row is soft-deleted, or it was
+  // never registered), so no reconnect can sync it. One stable word beats the
+  // Synced/Syncing strobe this state used to produce.
+  if (status === "deleted") return "Deleted";
   if (progress && isSyncRunActive(progress)) {
+    // The one exception to "one verb": notes whose content the server has
+    // never had (#258) — an interrupted first upload resuming, or a fresh one.
+    // That is the user's situation, not the mechanism, and the count is what
+    // tells them not to quit yet. `notUploaded` is only stamped when non-zero,
+    // so an already-synced vault never reads "Uploading".
+    const left = progress.notUploaded ?? 0;
+    if (progress.phase === "uploading" && left > 0) {
+      return `Uploading · ${left.toLocaleString()} ${left === 1 ? "note" : "notes"} left`;
+    }
     if (progress.total <= 0) return "Syncing…";
     // One verb for every phase. The old per-phase labels ("Uploading",
     // "Downloading") described the mechanism, not the user's situation — the
@@ -139,21 +178,9 @@ export function syncBadgeLabel(args: {
     // on an already-synced vault "Uploading files" read as "my synced vault is
     // being re-sent". Done is clamped so a racing denominator can never render
     // an impossible "585/164".
-    return `Syncing ${Math.min(progress.done, progress.total)}/${progress.total}`;
+    return `Syncing ${Math.min(progress.done, progress.total)}/${progress.total} updates`;
   }
-  // A run that finished with failures must not read "Synced". `failed` is the
-  // number of notes that are still only on this device.
-  if (progress?.phase === "error") {
-    if (progress.failed > 0) return `${progress.failed} not synced`;
-    // No note failed — the run itself could not proceed because the vault
-    // channel never connected (the download-phase watchdog). Name the situation
-    // the user can act on, not a mystery "incomplete".
-    if (status === "connecting" || status === "error") return "Retrying…";
-    return "Sync incomplete";
-  }
-  if (noteOpen === false) {
-    return progress?.phase === "done" ? "Synced" : "Syncing…";
-  }
+  if (noteOpen === false) return vaultWideLabel(vaultStatus, enabled);
   if (status === "synced") {
     if (pending) return "Syncing…";
     return lastSyncedAt != null ? `Synced · ${relativeAgo(lastSyncedAt, now)}` : "Synced";
@@ -173,19 +200,93 @@ export function syncBadgeTone(args: {
   progress?: SyncProgress | null;
   /** False when the pill stands for the vault, not an open note. */
   noteOpen?: boolean;
+  /** See {@link syncBadgeLabel}. */
+  vaultStatus?: string;
 }): string {
-  const { status, progress, noteOpen } = args;
+  const { status, noteOpen, vaultStatus } = args;
+  const progress = pillProgress(args.progress);
+  if (progress?.phase === "removing") return "connecting";
   if (noteOpen !== false && (status === "no-access" || status === "read-only")) {
     return status;
   }
-  // Red, not amber: nothing about this resolves on its own.
-  if (status === "too-large") return "error";
+  // Red, not amber: nothing about these resolves on its own.
+  if (status === "too-large" || status === "deleted") return "error";
   if (isSyncRunActive(progress)) return "connecting";
-  if (progress?.phase === "error") return "error";
-  if (noteOpen === false) {
-    return progress?.phase === "done" ? "synced" : "connecting";
-  }
+  if (noteOpen === false) return vaultWideTone(vaultStatus);
   return status;
+}
+
+/**
+ * The vault-wide pill once no run is live: the vault channel's own connection,
+ * never a hard-coded "Synced". A channel still opening or backfilling reads
+ * "Syncing…", a dropped one "Retrying…", no channel at all "Offline" (or
+ * "Local only" with sync off).
+ */
+function vaultWideLabel(vaultStatus: string | undefined, enabled: boolean | undefined): string {
+  switch (vaultStatus) {
+    case "synced":
+      return "Synced";
+    case "connecting":
+      return "Syncing…";
+    case "error":
+      return "Retrying…";
+    case "no-access":
+      return "No access";
+    default:
+      return enabled === false ? "Local only" : "Offline";
+  }
+}
+
+/** Tone for {@link vaultWideLabel}, so the colour matches the words. */
+function vaultWideTone(vaultStatus: string | undefined): string {
+  switch (vaultStatus) {
+    case "synced":
+    case "connecting":
+    case "error":
+    case "no-access":
+      return vaultStatus;
+    default:
+      return "offline";
+  }
+}
+
+/**
+ * A vault-wide hold that outranks every per-note and per-run state: while it
+ * lasts nothing syncs, so no call site may claim "Synced" (#273 — a second
+ * badge that skipped these read "Synced · 9m ago" under a paused vault).
+ *
+ * - The vault folder is gone (#228): neutral, not an error — the banner has
+ *   the fix.
+ * - The server's shrink burst brake holds our writes (#252): amber, not red —
+ *   nothing is lost, and it ends on its own or when an owner releases it.
+ */
+export function syncBadgeHold(args: {
+  rootMissing?: boolean;
+  /** Sync turned on for this vault; the brake only means something then. */
+  enabled?: boolean;
+  pause?: Pick<SyncPause, "until"> | null;
+  now: number;
+}): { tone: "offline" | "connecting"; label: string; title: string } | null {
+  const { rootMissing, enabled, pause, now } = args;
+  if (rootMissing) {
+    return {
+      tone: "offline",
+      label: "Paused",
+      title: "Sync is paused until the vault folder is back",
+    };
+  }
+  if (enabled && pause) {
+    const remaining = syncPauseRemaining(pause, now);
+    return {
+      tone: "connecting",
+      label: "Sync paused",
+      title:
+        "Many notes were emptied at once, so the server paused your sync. Your edits are safe " +
+        `on this device and sync when the pause ends${remaining ? ` (in ${remaining})` : ""} ` +
+        "or a vault owner or admin releases it.",
+    };
+  }
+  return null;
 }
 
 function useNowTick(active: boolean): number {
@@ -203,9 +304,11 @@ export function SyncBadge({
   enabled,
   lastSyncedAt,
   pending,
-  progress,
+  progress: rawProgress,
   noteOpen,
-  onRetry,
+  vaultStatus,
+  rootMissing,
+  pause,
 }: {
   status: string;
   enabled?: boolean;
@@ -217,12 +320,19 @@ export function SyncBadge({
    *  with a determinate bar. Omit for a pill that only tracks the connection. */
   progress?: SyncProgress | null;
   /** False when the pill stands for the vault, not an open note: socket-derived
-   *  states are skipped and the label comes from `progress` alone. */
+   *  states are skipped and the label comes from `progress` and `vaultStatus`. */
   noteOpen?: boolean;
-  /** When set, a run that ended with failures ("N not synced") renders as a
-   *  button that retries the whole sync — the remedy lives on the message. */
-  onRetry?: () => void;
+  /** The vault channel's live status — see {@link syncBadgeLabel}. */
+  vaultStatus?: string;
+  /** The vault folder is gone — see {@link syncBadgeHold}. */
+  rootMissing?: boolean;
+  /** The server's shrink brake (`store.syncPause`) — see {@link syncBadgeHold}. */
+  pause?: SyncPause | null;
 }) {
+  // A run that just appeared is held back briefly so the pill never flickers
+  // amber for a burst that settles at once; past the hold its counts show.
+  const shown = useShownRunActive(rawProgress);
+  const progress = heldProgress(rawProgress, shown);
   const running = isSyncRunActive(progress);
   // Only tick the relative clock once we're settled (synced, nothing pending, no
   // bulk run — while one is live the label is a counter, not a timestamp).
@@ -237,20 +347,17 @@ export function SyncBadge({
     enabled,
     progress,
     noteOpen,
+    vaultStatus,
   });
-  const tone = syncBadgeTone({ status, progress, noteOpen });
+  const tone = syncBadgeTone({ status, progress, noteOpen, vaultStatus });
   // A determinate fill whenever the run knows its own size; the pre-existing
   // indeterminate slide covers "working, size unknown" (connecting, saving).
   const percent = running ? syncRunPercent(progress) : null;
   // Hover answers "how far along?" in the same shape as the folder tooltips.
-  const runTitle =
+  const title =
     running && progress && percent != null
-      ? `${progress.done} of ${progress.total} notes · ${percent}%`
+      ? `${progress.done} of ${progress.total} ${progress.phase === "removing" ? "items checked" : "updates"} · ${percent}%`
       : undefined;
-  // A run that ended with failures is actionable when the caller gave us the
-  // action: the pill becomes a button and one click retries everything.
-  const retryable = onRetry != null && !running && progress?.phase === "error";
-  const title = retryable ? "Click to sync now" : runTitle;
   const body = (
     <>
       {tone === "connecting" || (tone === "synced" && pending) ? (
@@ -284,20 +391,16 @@ export function SyncBadge({
       ) : (
         <span className="sync-dot" aria-hidden="true" />
       )}
-      {label}
+      <span className="sync-badge-label">{label}</span>
     </>
   );
-  if (retryable) {
+  const hold = syncBadgeHold({ rootMissing, enabled, pause, now: Date.now() });
+  if (hold) {
     return (
-      <button
-        type="button"
-        className={`sync-badge sync-badge-retry ${tone}`}
-        title={title}
-        onClick={onRetry}
-      >
-        {body}
-        <span className="sync-retry-cta">Sync now</span>
-      </button>
+      <span className={`sync-badge ${hold.tone}`} title={hold.title}>
+        <span className="sync-dot" aria-hidden="true" />
+        <span className="sync-badge-label">{hold.label}</span>
+      </span>
     );
   }
   return (

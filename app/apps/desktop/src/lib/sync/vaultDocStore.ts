@@ -37,6 +37,18 @@ export const HOT_DOC_CAP = 100;
 const RECENT_CAP = 64;
 /** How long state-vector writes are coalesced before hitting SQLite. */
 const SV_FLUSH_MS = 1_000;
+/**
+ * Bounds on updates parked for a doc the registry cannot place yet (see
+ * {@link VaultDocStore.settleParked}). A note created on the server reaches us
+ * as a full backfill within milliseconds of its `registry` frame, while the
+ * registry pull that maps its doc_id is a debounced HTTP round trip — so the
+ * backfill routinely lands first. The caps keep a hostile or runaway stream of
+ * unknown ids from growing without limit; an evicted doc is re-requested.
+ */
+export const PARKED_DOC_CAP = 256;
+export const PARKED_BYTES_CAP = 16 * 1024 * 1024;
+/** A parked doc no pull has placed by now is not coming: discard it. */
+export const PARKED_TTL_MS = 5 * 60_000;
 
 /**
  * Durable home for the per-doc state-vector manifest.
@@ -88,11 +100,26 @@ export interface VaultDocStoreOptions {
    * had already handed us over one socket apiece.
    */
   onConverged?: (docId: string) => void;
+  /**
+   * A cold apply for a doc whose placeholder the registry DEFERRED: create the
+   * file with this content in one create-only write and return the new state
+   * vector, or null to take the ordinary cold-apply path (`deferredArrival.ts`).
+   */
+  createDeferred?: (docId: string, path: string, update: Uint8Array) => Promise<Uint8Array | null>;
   /** Durable manifest. Defaults to {@link nullManifestStore}. */
   manifest?: ManifestStore;
   /** Injected in tests. */
+  now?: () => number;
   setTimeoutImpl?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimeoutImpl?: (h: ReturnType<typeof setTimeout>) => void;
+}
+
+interface ParkedEntry {
+  updates: Uint8Array[];
+  bytes: number;
+  /** `parkSeq` when the doc was FIRST parked — compared against a pull's mark. */
+  seq: number;
+  at: number;
 }
 
 interface HotEntry {
@@ -108,6 +135,7 @@ export class VaultDocStore implements DocUpdateSink {
   private readonly resolvePath: (docId: string) => string | null;
   private readonly onExternalMerge?: (docId: string) => void;
   private readonly onConverged?: (docId: string) => void;
+  private readonly createDeferred?: VaultDocStoreOptions["createDeferred"];
   private readonly hotCap: number;
   private readonly manifest: ManifestStore;
   private readonly setT: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -129,6 +157,19 @@ export class VaultDocStore implements DocUpdateSink {
    *  leaves it alone — deleting a live entry would let the next update for that
    *  doc run in parallel with the one still writing. */
   private readonly coldChains = new Map<string, Promise<void>>();
+  /** In-flight {@link promote} calls, keyed by doc_id — one writer per doc.
+   *  Self-clearing like `coldChains`, and read only by `promote` itself. */
+  private readonly promoting = new Map<string, Promise<NoteBridge>>();
+
+  /** Updates for docs the registry could not resolve yet, oldest first. Never
+   *  written anywhere until the doc_id maps to a path — see `settleParked`. */
+  private readonly parked = new Map<string, ParkedEntry>();
+  private parkedBytes = 0;
+  private parkSeq = 0;
+  /** Docs whose parked base was evicted by the caps: only a fresh backfill
+   *  (a reconnect, whose manifest omits them) can bring it back. */
+  private readonly overflowed = new Set<string>();
+  private readonly now: () => number;
 
   private touchSeq = 0;
   /** The currently-open note, if any: its own Hocuspocus provider syncs it, so
@@ -143,8 +184,10 @@ export class VaultDocStore implements DocUpdateSink {
     this.resolvePath = opts.resolvePath;
     this.onExternalMerge = opts.onExternalMerge;
     this.onConverged = opts.onConverged;
+    this.createDeferred = opts.createDeferred;
     this.hotCap = opts.hotCap ?? HOT_DOC_CAP;
     this.manifest = opts.manifest ?? nullManifestStore;
+    this.now = opts.now ?? (() => Date.now());
     this.setT = opts.setTimeoutImpl ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearT = opts.clearTimeoutImpl ?? ((h) => clearTimeout(h));
     this.hydration = this.hydrateManifest();
@@ -190,6 +233,34 @@ export class VaultDocStore implements DocUpdateSink {
    *  Hocuspocus provider, so the background feed ignores them. */
   setSuppressedDoc(docId: string | null): void {
     this.suppressed = docId;
+  }
+
+  /**
+   * Hold every background writer for `docId` until `done` settles.
+   *
+   * The editor's bridge for a note outlives its provider by one flush: closing
+   * a note tears the provider down synchronously, but the bridge's final egest
+   * and persist (`bridgeManager.closeCurrent`) are still in flight. Lifting the
+   * open-note suppression at that moment let the background feed open a SECOND
+   * bridge on the same doc_id — two egests on one file, and a cold apply
+   * reading a local CRDT store the closing bridge had not finished writing
+   * (#200). The hold rides the per-doc cold chain, so a feed update, a
+   * `promote` and a `release` for this doc all wait behind it — delayed, never
+   * dropped.
+   */
+  holdUntil(docId: string, done: Promise<unknown>): void {
+    const prev = this.coldChains.get(docId) ?? Promise.resolve();
+    const run = prev
+      .catch(() => {})
+      .then(() => done)
+      .then(
+        () => {},
+        () => {},
+      );
+    const chain: Promise<void> = run.finally(() => {
+      if (this.coldChains.get(docId) === chain) this.coldChains.delete(docId);
+    });
+    this.coldChains.set(docId, chain);
   }
 
   /** The doc whose provider is owned elsewhere (the open note), or null. The bulk
@@ -245,11 +316,14 @@ export class VaultDocStore implements DocUpdateSink {
     }
     this.svCache.delete(docId);
     this.dirtySv.delete(docId);
+    this.unpark(docId);
+    this.overflowed.delete(docId);
     const i = this.recent.indexOf(docId);
     if (i !== -1) this.recent.splice(i, 1);
     // coldChains is deliberately untouched: it only holds in-flight work, which
     // must be allowed to finish (and clears itself). A later update for a dropped
-    // doc is skipped by `coldApply` once the registry stops resolving its path.
+    // doc is parked by `coldApply` once the registry stops resolving its path, and
+    // the next settled pull discards it.
     //
     // The PERSISTED state vector is also left alone on purpose: the local CRDT log
     // for this doc is still on disk, so the manifest entry remains truthful. If
@@ -279,6 +353,50 @@ export class VaultDocStore implements DocUpdateSink {
       if (markRecent) this.markRecent(docId);
       return existing.bridge;
     }
+    // ONE writer per doc_id. Two promotes racing each other would each open a
+    // bridge and the second would overwrite the first in `hot`, leaking a live
+    // bridge nobody ever retires — two egests racing one file, two persist
+    // streams, and an `ingestNow` on one re-inserting what the other just
+    // wrote. Second caller in waits for the first and then takes the
+    // `existing` branch above (so its `pin`/`markRecent` still apply).
+    const inflight = this.promoting.get(docId);
+    if (inflight) {
+      await inflight.catch(() => {});
+      return this.promote(docId, path, opts);
+    }
+    const run = this.openHot(docId, path, opts);
+    this.promoting.set(docId, run);
+    try {
+      return await run;
+    } finally {
+      if (this.promoting.get(docId) === run) this.promoting.delete(docId);
+    }
+  }
+
+  /** The bridge-opening half of {@link promote}, serialized by `promoting`. */
+  private async openHot(
+    docId: string,
+    path: string,
+    opts: { seedFromFile?: boolean; markRecent?: boolean; pin?: boolean },
+  ): Promise<NoteBridge> {
+    // Settle any in-flight cold apply FIRST, exactly as `release` does. A cold
+    // apply opens its own transient bridge on this doc_id and holds it across
+    // several awaits (loadYjsState, readFile, the egest write, whenPersisted);
+    // promoting inside that window is the second writer the whole tier exists
+    // to prevent — and on a `force`/`ingestFromFile` run the hot bridge would
+    // then ingest the file the cold one had just written from a remote update,
+    // re-inserting that text under a fresh clientID (the doubling loop that
+    // `isExternalEdit` closed on the cold side).
+    await this.coldChains.get(docId)?.catch(() => {});
+    // The cold chain may have been what created it (it does not promote today,
+    // but the await above is a real window and this is cheap).
+    const already = this.hot.get(docId);
+    if (already) {
+      already.touch = ++this.touchSeq;
+      if (opts.pin) already.pinned = true;
+      if (opts.markRecent ?? true) this.markRecent(docId);
+      return already.bridge;
+    }
     const bridge = await NoteBridge.open(this.io, {
       docId,
       path,
@@ -291,7 +409,7 @@ export class VaultDocStore implements DocUpdateSink {
       pinned: opts.pin ?? false,
     });
     this.rememberSv(docId, Y.encodeStateVector(bridge.doc));
-    if (markRecent) this.markRecent(docId);
+    if (opts.markRecent ?? true) this.markRecent(docId);
     this.evictIfNeeded();
     return bridge;
   }
@@ -343,6 +461,9 @@ export class VaultDocStore implements DocUpdateSink {
     this.coldChains.clear();
     this.recent.length = 0;
     this.suppressed = null;
+    this.parked.clear();
+    this.parkedBytes = 0;
+    this.overflowed.clear();
     await Promise.all([
       ...entries.map((e) => this.retire(e.bridge)),
       ...cold.map((c) => c.catch(() => {})),
@@ -387,6 +508,96 @@ export class VaultDocStore implements DocUpdateSink {
     }
   }
 
+  // ---- parked updates for unmapped docs ---------------------------------
+
+  /** Take BEFORE a registry pull starts and hand to {@link settleParked} once it
+   *  completes: only docs parked before the pull began can be judged by it. */
+  parkMark(): number {
+    return this.parkSeq;
+  }
+
+  /** Docs with parked updates (tests/observability). */
+  parkedDocs(): string[] {
+    return [...this.parked.keys()];
+  }
+
+  /**
+   * After a registry pull: apply every parked doc the registry now places, through
+   * the same `applyUpdate` → cold-apply path a known doc's update takes (so the
+   * file write, echo hash, local CRDT persistence and `onConverged` all behave
+   * identically), and discard the ones it still cannot place.
+   *
+   * A doc parked before `mark` (taken when the pull started) that the completed
+   * pull did not map is not readable, not registered or deleted — it is dropped,
+   * never written at any path. One parked AFTER the mark may simply be newer than
+   * the listing the pull fetched, so it waits for the next pull (or the TTL).
+   */
+  async settleParked(mark: number = Infinity): Promise<void> {
+    const now = this.now();
+    const ready: Array<[string, Uint8Array]> = [];
+    for (const [docId, entry] of [...this.parked]) {
+      if (this.resolvePath(docId)) {
+        this.unpark(docId);
+        ready.push([
+          docId,
+          entry.updates.length === 1 ? entry.updates[0] : Y.mergeUpdates(entry.updates),
+        ]);
+      } else if (entry.seq <= mark || now - entry.at > PARKED_TTL_MS) {
+        this.unpark(docId);
+      }
+    }
+    await Promise.all(ready.map(([docId, update]) => this.applyUpdate(docId, update)));
+  }
+
+  /** Docs whose parked updates the caps evicted and that the registry now
+   *  places, cleared on read. The session reconnects the channel for these: the
+   *  manifest has no entry for them, so the server re-sends their full state.
+   *  One that still does not map is not re-requested — a reconnect would only
+   *  park (and overflow) the same backfill again, on every pull — and the next
+   *  ordinary reconnect brings it once it maps. */
+  takeOverflowed(): string[] {
+    // A doc that reached the manifest some other way already has its base.
+    const ids = [...this.overflowed].filter((id) => !this.svCache.has(id) && this.resolvePath(id));
+    this.overflowed.clear();
+    return ids;
+  }
+
+  private park(docId: string, update: Uint8Array): void {
+    if (this.destroyed) return;
+    const now = this.now();
+    for (const [id, e] of [...this.parked]) {
+      if (now - e.at > PARKED_TTL_MS) this.unpark(id);
+    }
+    if (update.byteLength > PARKED_BYTES_CAP) {
+      // Cannot hold it at all — and the deltas after it depend on it.
+      this.unpark(docId);
+      this.overflowed.add(docId);
+      return;
+    }
+    let entry = this.parked.get(docId);
+    if (!entry) {
+      entry = { updates: [], bytes: 0, seq: ++this.parkSeq, at: now };
+      this.parked.set(docId, entry);
+    }
+    entry.updates.push(update);
+    entry.bytes += update.byteLength;
+    this.parkedBytes += update.byteLength;
+    // Evict the OLDEST parked doc (Map insertion order) until both caps hold.
+    while (this.parked.size > PARKED_DOC_CAP || this.parkedBytes > PARKED_BYTES_CAP) {
+      const oldest = this.parked.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.unpark(oldest);
+      this.overflowed.add(oldest);
+    }
+  }
+
+  private unpark(docId: string): void {
+    const entry = this.parked.get(docId);
+    if (!entry) return;
+    this.parked.delete(docId);
+    this.parkedBytes -= entry.bytes;
+  }
+
   // ---- internals --------------------------------------------------------
 
   private enqueueCold(docId: string, update: Uint8Array): Promise<void> {
@@ -417,19 +628,41 @@ export class VaultDocStore implements DocUpdateSink {
   }
 
   private async coldApply(docId: string, update: Uint8Array): Promise<void> {
+    // The doc may have gone HOT since this update was queued (a promote that
+    // ran while an earlier apply in this chain was in flight). Route it to the
+    // resident bridge instead of opening a second writer for the same doc_id —
+    // the same branch `applyUpdate` takes, re-asserted here because the queue
+    // decided "cold" at enqueue time.
+    const hot = this.hot.get(docId);
+    if (hot) {
+      hot.bridge.applyRemote(update);
+      hot.touch = ++this.touchSeq;
+      this.rememberSv(docId, Y.encodeStateVector(hot.bridge.doc));
+      return;
+    }
     const path = this.resolvePath(docId);
-    if (!path) return; // unknown doc (not yet materialised) — skip; next reconnect retries
+    if (!path) {
+      // Unknown doc: the backfill for a note created on the server usually beats
+      // the registry pull that maps it. Dropping it here left the placeholder the
+      // pull then materialized at 0 bytes forever, with every later delta pending
+      // on the lost base. Park it until the pull settles — see `settleParked`.
+      this.park(docId, update);
+      return;
+    }
+    // A deferred small arrival: its first content creates the file WITH the
+    // text, so no 0-byte placeholder ever shows. Anything the helper declines
+    // (an increment, a file that appeared meanwhile, local CRDT) merges below.
+    if (this.createDeferred) {
+      const sv = await this.createDeferred(docId, path, update);
+      if (sv) {
+        this.rememberSv(docId, sv);
+        return;
+      }
+    }
     // Transient bridge: hydrate from local CRDT, apply the delta, write, persist,
     // evict. seedFromFile:false — the server feed is the source for background docs.
     const bridge = await NoteBridge.open(this.io, { docId, path, seedFromFile: false });
     try {
-      // Fold in any external edit sitting on disk BEFORE the remote delta lands
-      // and gets egested: the flush below rewrites the file from the doc, and a
-      // file the doc has never ingested (an AI edited it while no bridge was
-      // alive) would be silently overwritten. The doc-non-empty guard keeps an
-      // unhydrated placeholder on the pull-before-seed path (never a pre-sync
-      // seed); converged content makes this a no-op read. A genuine merge is
-      // reported up so the session pushes it (see `onExternalMerge`).
       // Whether this doc held ANY local CRDT ops before the remote state landed.
       // Only a doc that had none — the empty placeholder a fresh join
       // materializes — can be declared converged below: a doc with prior local
@@ -437,12 +670,31 @@ export class VaultDocStore implements DocUpdateSink {
       // before the flush; NOT in `divergedDocs`, which only tracks out-of-band
       // file merges), and marking it pushed would strand exactly those bytes.
       const hadLocalState = bridge.doc.store.clients.size > 0;
+      // Apply the server's delta FIRST, then fold in any external edit sitting
+      // on disk — three-way, against the doc as it was BEFORE the delta. A
+      // signed-in bridge opens waiting for exactly this (`awaitingPull`): it
+      // neither ingests nor writes the file until `reconcileAfterPull`, which
+      //  - finds file == doc+delta ⇒ the file is the echo of an apply that
+      //    already happened (this doc's local CRDT is behind its own file), and
+      //    ingesting it would re-insert the delta's text under this bridge's
+      //    fresh clientID — the doubling loop that turned a 686-byte
+      //    `Map of Content.md` into 16 MB on 2026-09-04;
+      //  - finds file == doc (or == its disk base) ⇒ the file is merely behind:
+      //    the flush below writes the delta out;
+      //  - otherwise diffs doc → file on a branch of the pre-delta doc and
+      //    merges it, so an AI's edit made while no bridge was alive and the
+      //    server's both survive. That merge is local-only until a provider
+      //    pushes it, hence `onExternalMerge`.
+      // Before #200 the bridge also armed a DEBOUNCED ingest at open, which a
+      // slow hydrate (a load-time compaction) let fire before this ran — the
+      // same double insert through a timer. An empty doc (an unhydrated
+      // placeholder) does not wait: it stays on the pull-before-seed path.
+      bridge.applyRemote(update);
       let merged = false;
-      if (bridge.serialize().length > 0 && (await bridge.ingestNow())) {
+      if (await bridge.reconcileAfterPull()) {
         merged = true;
         this.onExternalMerge?.(docId);
       }
-      bridge.applyRemote(update);
       await bridge.flushEgest();
       this.rememberSv(docId, Y.encodeStateVector(bridge.doc));
       // Converged: the server's state is on disk and the file had nothing of its
@@ -454,6 +706,11 @@ export class VaultDocStore implements DocUpdateSink {
       // there is" holds by construction.
       if (!merged && !hadLocalState) this.onConverged?.(docId);
     } finally {
+      // The ops this bridge just applied must reach the local CRDT store before
+      // it goes away: the file already holds their text (`flushEgest` above), so
+      // dropping them here would leave the store behind its own file — the exact
+      // gap the next cold apply re-inserts from, and doubles.
+      await bridge.whenPersisted();
       bridge.destroy();
     }
   }
@@ -485,6 +742,7 @@ export class VaultDocStore implements DocUpdateSink {
     } catch (e) {
       console.error("[vaultDocStore] flush on retire failed", e);
     }
+    await bridge.whenPersisted();
     bridge.destroy();
   }
 }

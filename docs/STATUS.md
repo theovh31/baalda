@@ -16,9 +16,24 @@ tags: [baalda, status, roadmap]
   and desktop (bridge + auth + per-doc sync + presence + sharing UI + attachment sync)
   are wired end-to-end and tested.
 - **Deployment:** 🟢 Production-ready (2026-07-15). The sync WebSocket is served on the HTTP
-  port at `/sync` (single-port topology), and the repo ships a Dockerfile, `railway.json`
-  (pre-deploy migrations + healthcheck), and [[DEPLOY]]. The managed backend is live at
+  port at `/sync` (single-port topology), and the repo ships a Dockerfile, Railway IaC at
+  `app/.railway/railway.ts` (Dockerfile build, pre-deploy migrations + healthcheck), and [[DEPLOY]]. The managed backend is live at
   `https://api.baalda.com`; desktop releases ship via `v*` tags → signed installers → Tauri updater.
+- **Billing:** 🟢 Per-vault Pro via Polar, with the full subscription lifecycle (2026-09-09, #109–#111):
+  deleting a vault cancels at period end before it deletes, subscriptions survive as tombstones, and an
+  owner can transfer one between their vaults from Vault Settings → Billing.
+  **2026-10-07 (branch `feat/team-seat-billing`):** Free + Team pricing behind `BILLING_MODEL=team`
+  (default `vault` until the production flip). Free: 2 people per account, 1 synced vault, MCP
+  included, no Assistant, no standalone file sync. Team: $10 per seat per month or $110 per seat
+  per year, minimum 3 seats, unlimited vaults on one account, managed in Account Settings → Plan &
+  Usage. A lapsed account syncs read-only; local files stay editable. Per-vault transfer is retired
+  under the Team model (`transfer_retired`); existing subscribers keep their price through a Polar
+  discount.
+- **Offline reconciliation:** 🟡 In review (2026-09-26, branch `feat/offline-reconciliation`): inbound
+  deletes/revocations gate on a server-acknowledged state vector (unsent edits get a recovery copy
+  first), same-path creates become two notes, closed-app renames keep their id, a once-per-session
+  summary banner, and a server-side 30-day per-vault Trash (Restore, pushes into deleted notes
+  accepted, purge keeps a tombstone row).
 - **Next action:** Phase 4 polish / launch decisions (WYSIWYG, vector search, OAuth, iOS).
 
 > **Requirement coverage:** Phases 0–3 deliver **10 of the 12** core requirements,
@@ -180,6 +195,15 @@ Six changes that together make a vault something a team can actually govern.
   take; owner-only left a team whose owner was away able to take checkpoints and not use them.
 - [x] **Item colors sync.** `folders.color` / `notes.color` ride the registry pull, keyed by id so a
   rename keeps the tint. Colors set before a vault gained sync are adopted upward once.
+- [x] **Future-member access defaults and bulk access.** Owners/admins choose what future joiners
+  initially see (Private by default) without changing existing memberships. The Folder and File
+  list supports multi-selection, Everyone or named-member audiences, and atomic subtree replacement;
+  the same owner/admin operations are available through MCP.
+- [x] **Personal automatic colours.** Every otherwise-uncoloured folder/file gets a stable,
+  account-personal colour when enabled in Account Settings; the optional automatic layer is off by
+  default and never deletes manual colours.
+- [x] **Open an existing vault from Vault Settings.** The Vaults tab exposes the same direct folder
+  chooser as the welcome flow, with safe sync teardown before switching.
 
 ### Google sign-in on an existing password account ✔ (v0.1.30)
 - [x] `account_not_linked` on the Google callback for anyone who first signed up with a password —
@@ -192,9 +216,37 @@ Six changes that together make a vault something a team can actually govern.
   with no verification at sign-up, someone can register an address they don't own, and linking then
   joins the real owner to the squatter's account rather than locking them out. Accepted because the
   squat is already possible without linking and Google's verified email is the strongest signal we
-  have. **Email verification at sign-up is the real fix** and is still owed.
+  have. **Email verification at sign-up is the real fix** — it now ships (soft) when email is
+  configured, see below; requiring it is still owed.
 - [x] Pinned by a config test — the failure mode was a silent default, so the three options that
   have to agree (`enabled`, `trustedProviders`, `requireLocalEmailVerified`) are asserted together.
+
+### Password reset, verification + invitation emails ✔ (#99)
+- [x] Outbound email is opt-in via env (`EMAIL_FROM` + `SMTP_URL` or `RESEND_API_KEY`; `email/mailer.ts`),
+  on the Google-OAuth pattern: unconfigured servers offer none of it, `GET /api/auth-methods`
+  advertises `passwordReset` / `invitationEmail`, and the desktop keys its controls off that.
+- [x] **Password reset**: "Forgot password?" in the desktop dialog and on `/oauth/login` →
+  `POST /api/password-reset/request` (ours, not Better Auth's neutral endpoint: it answers sent /
+  `no_account` / `send_failed` with the provider's reason, so a wrong-server address or a refused
+  send is said out loud) → emailed single-use, 1-hour link to the server-rendered `/reset-password`
+  page → Better Auth `reset-password` (revokes other sessions; creates the credential for a
+  Google-only account, so the same flow sets a first password) → `baalda://signin` bounces back into
+  the app, which notices its revoked session and opens the sign-in card. Admin escape hatch for
+  servers without email: `pnpm run set-password -- <email>`.
+- [x] **Sign-up verification email** (soft): sent on sign-up, `emailVerified` set on click, lands on
+  `/email-verified` → `baalda://verified` → the app re-reads its session; Account settings shows
+  "Email confirmed ✓" / a Resend button. Not yet required to sign in — pre-existing accounts were
+  never verified.
+- [x] **Invitation emails** → `POST /api/invitations/:id/send` (explicit, reports sent/failed; not a
+  Better Auth hook, which swallows send errors) → `/invite/:id` landing page →
+  `baalda://invite/<id>?server=` deep link → the app signs in/up with the invited address and
+  accepts. Members shows "Invitation emailed" only on a confirmed send, the provider's error + the
+  link otherwise, plus Copy-link + Revoke per pending invitation. Re-inviting re-sends.
+- [x] **Invite inbox actually works**: Better Auth's `list-user-invitations` 403s for any unverified
+  email (= every password sign-up), so the in-app inbox had been empty for almost everyone.
+  `GET /api/invitations/mine` reads the table directly; the desktop uses it first.
+- [x] **Join code = email invite**: redeeming a code consumes a pending invitation for the same address
+  (invited role honoured, invitation marked accepted, seat not double-counted).
 
 ### Phase 4: Polish / upgrades _(deferred)_ ⬜
 - [ ] Structural rich-text CRDT (y-prosemirror / `Y.XmlFragment`) for full WYSIWYG.
@@ -215,3 +267,76 @@ Six changes that together make a vault something a team can actually govern.
   we don't depend on them. Hocuspocus/Better Auth/Yjs are the funded, safe dependencies.
 - **Yjs at scale:** some teams report pain; not a v0.1 concern. Loro is the re-evaluation candidate
   if on-disk CRDT size becomes a cost.
+
+
+## Members and access page (2026-10-04)
+
+Vault Settings' Members and Access tabs are merged into one **Members and access** tab. Owners and
+admins set the **Everyone** row (Can edit / Can view / No access, the same `open`/`readonly`/`private`
+wire values), the **New members** row (the existing `join_default`) and a per-person level (Can edit
+everything / Can view everything / No access / Custom). A person's profile has an Access tab with
+per-folder checkboxes that apply immediately; plain members see a read-only roster. Existing
+per-folder Everyone overrides can only be reset, not created. **Invite people** sends invitations
+with a role and an access level, applied on acceptance by email link or join code. On the server a
+per-user vault row is now that person's absolute vault level ("person wins either way"), kept in
+lockstep across the resolver, the readable set, the create gates and the locks listing. Migration 046
+adds `member.last_seen_at` and `invitation_access`; `GET /api/orgs/:orgId/members/overview` and
+`POST /api/orgs/:orgId/invitations` are new. Invitations last 7 days by default
+(`INVITATION_EXPIRES_HOURS`).
+
+Later the same day: the member profile has Personal info / Access / Activity tabs, and the Access
+tab toggles (per device, `context.memberAccess.view`) between **List**, the checkbox tree,
+and **Board**, the default (Can edit / Can view / No access columns, drag-and-drop or arrows, Set everything to
++ Reset to vault default; same one-resource bulk-access writes; single-row moves need no confirm
+and report through the standard toast, with no undo; pointer-event drag, since Tauri swallows
+native HTML5 drag-and-drop). The overview
+now carries `invitedBy`, and `GET /api/orgs/:orgId/members/:userId/activity` (owner/admin or self;
+404 `not_member`) returns joined / created / edited / accessGranted events filtered to the
+caller's readable set. Vault Settings lost its Updates tab (now Account Settings → About), the
+Health tab was removed for good on 2026-10-04 (#289), the two settings dialogs cross-link,
+and hover/pressed colours are one accent tint (`--bg-hover`/`--bg-active`).
+
+## One-step note sync, checkpoint healing, backend notice (2026-10-04)
+
+- **Notes register with their content.** On a server advertising `notes-with-state`, every new
+  note, one or thousands, registers through `notes/batch` carrying its binary Yjs state; the server
+  writes the row and the first state in the same request (`registry/seed-on-register.ts`). No new
+  note opens a per-note socket, and teammates never see a row without content. A conflict or an
+  adopt onto another id is merged over HTTP (`bootstrap` `only` + a docs/batch merge push), never
+  applied blindly. Old servers keep register-then-push; the per-doc uploader is now a fallback.
+- **Receivers skip placeholders** when a bootstrap download will create the files with content;
+  placeholders remain for server-empty docs, small deltas and single live notes.
+- **Rename banner fixed.** The open note's "was removed" banner waits out the delete-grace window and
+  re-checks the disk, and in-app renames re-point the open note before the server call. Renamed
+  empty notes now pair instead of reaching the server as delete + create.
+- **`ackedSv`** is recorded on every push path, including the per-doc uploader and one-step creates.
+- **Checkpoints heal.** A note's first content never triggers the daily checkpoint; captures defer
+  while uploads are in flight (120 s window, 30 min cap); late first content tops up the newest
+  checkpoint within 1 h; files and attachments are pinned per checkpoint (migration 047) and restored
+  under their original ids on revert.
+- **One-step file upload (server only).** A blob intent can carry the file's registration and
+  `complete` creates the `files` row with the bytes (migration 048, `files-with-bytes`); the Pro gate
+  runs before any row exists. The desktop does not use it yet.
+- **`GET /health`** reports `version`, `minDesktopVersion` and `features`; `[sync-metrics]` log lines
+  count seeds, `ready.empty`/`ready.behind` sizes and structure-only checkpoint notes.
+- **Backend-behind notice.** The desktop shows a persistent line at the bottom of the sidebar when its
+  server lacks a feature it needs (judged from `/health` `features`, never the version), with
+  separate copy for the managed service and self-hosted servers.
+
+## Team skills (2026-10-26, staging)
+
+- **Skills catalog per vault.** Owners/admins create a skill (a folder with a root `SKILL.md`), edit
+  its one draft and Publish it into an immutable numbered version with release notes; a skill is
+  Required (every member) or Optional (opted into per device), and a version can be pinned. Stored
+  in the server's own tables (migration 060), free on every plan. Spec: [[SKILLS]].
+- **Delivered to this machine's AI tools.** Every signed-in desktop installs the effective versions
+  from all its vaults into `~/.claude/skills` (Claude Code) and `~/.agents/skills` (Codex, Cursor,
+  Gemini CLI, Copilot, OpenCode) on sign-in, on the `skills-changed` vault-channel frame, every
+  15 min and on Check now. Only folders carrying this server's and this user's marker are touched;
+  an edited copy is never overwritten without "Use team version" (backed up first), and a skill
+  that goes away leaves an edited copy behind as the user's own. A server switch pauses the sync so
+  one server's list can never remove another's skills.
+- **Reach.** MCP `list_skills`/`get_skill`/`read_skill_file`, `.zip` download per version, and a
+  GitHub bridge that publishes a Claude plugin marketplace so claude.ai's org sync reaches
+  Chat/Cowork. `/health` advertises `skills`.
+- **Settings.** Vault Settings → Skills (catalog) and Account Settings → AI tools (this machine).

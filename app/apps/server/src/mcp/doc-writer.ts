@@ -1,11 +1,25 @@
+import type { DocCrypto } from "../crypto/doc-crypto.js";
+import { pool } from "../db/pool.js";
 import { createHash } from "node:crypto";
 import * as Y from "yjs";
 import type { LocalTransactionOrigin, Server } from "@hocuspocus/server";
 import { formatDocName } from "../sync/doc-name.js";
 import type { SyncContext } from "../sync/hocuspocus.js";
-import { appendUpdate, loadDocState } from "../yjs/persistence.js";
-import { indexDoc } from "../index/indexer.js";
+import { loadDocState } from "../yjs/persistence.js";
 import { config } from "../config.js";
+import {
+  applyDetached,
+  setDocBatchRuntime,
+  withDocLock,
+  type DocActor,
+  type DocUpdatePublisher,
+  type DocWrittenHook,
+} from "../sync/doc-batch.js";
+
+/** Re-exported from `sync/doc-batch.ts`, which now owns the write path these
+ *  describe (the MCP tools and the bulk push route share it). Kept on this
+ *  module so every existing importer keeps its import path. */
+export type { DocActor, DocUpdatePublisher, DocWrittenHook };
 
 /**
  * Server-side writer for a note's shared Y.Text `content` — the bridge between
@@ -29,11 +43,6 @@ const CONTENT_FIELD = "content";
 /** Transaction origin tag for edits that originate from the MCP server. */
 export const MCP_ORIGIN = "mcp";
 
-/** Who is behind a server-side write, for attribution (versions, last-edited). */
-export interface DocActor {
-  userId?: string | null;
-}
-
 /**
  * One targeted change to a note body: delete `deleteLength` chars at `index`,
  * then insert `insert` there. Applied IN ORDER, each index relative to the text
@@ -56,7 +65,47 @@ export function revisionOf(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
+const isHighSurrogate = (c: number) => c >= 0xd800 && c <= 0xdbff;
+const isLowSurrogate = (c: number) => c >= 0xdc00 && c <= 0xdfff;
+
+/**
+ * The smallest single replacement that turns `current` into `next`: the shared
+ * prefix and suffix are left alone. So `update_note` on a 20 KB note where one
+ * paragraph changed touches one paragraph's worth of CRDT — a concurrent edit
+ * elsewhere in the note merges instead of being clobbered by a delete-all —
+ * while remaining, by construction, a whole-body replacement in effect.
+ *
+ * The span never starts or ends inside a surrogate pair: Yjs stores inserted
+ * strings as UTF-8, where a lone surrogate becomes U+FFFD, so splitting an emoji
+ * across the boundary would corrupt it on every peer.
+ */
+export function replacementOp(current: string, next: string): TextOp[] {
+  if (current === next) return [];
+  let prefix = 0;
+  const max = Math.min(current.length, next.length);
+  while (prefix < max && current.charCodeAt(prefix) === next.charCodeAt(prefix)) prefix++;
+  if (prefix > 0 && isHighSurrogate(current.charCodeAt(prefix - 1))) prefix--;
+  let suffix = 0;
+  while (
+    suffix < max - prefix &&
+    current.charCodeAt(current.length - 1 - suffix) === next.charCodeAt(next.length - 1 - suffix)
+  ) {
+    suffix++;
+  }
+  if (suffix > 0 && isLowSurrogate(current.charCodeAt(current.length - suffix))) suffix--;
+  return [
+    {
+      index: prefix,
+      deleteLength: current.length - prefix - suffix,
+      insert: next.slice(prefix, next.length - suffix),
+    },
+  ];
+}
+
 /** A mutation's precondition failed: the note is not the text the caller read. */
+/** A write would push the note past `MAX_NOTE_MB`; nothing was written. */
+export class NoteTooLargeError extends Error {}
+
 export class StaleRevisionError extends Error {
   constructor(
     readonly expected: string,
@@ -96,7 +145,12 @@ export interface DocWriter {
     actor?: DocActor,
   ): Promise<void>;
   /** Read the current note body (from the live doc if open, else from storage). */
-  readContent(vaultId: string, docId: string): Promise<string>;
+  /**
+   * W3: `crypto` is the CALLER's verified key for a keyed vault. A sealed doc
+   * read without it throws `KeyRequiredError` — never "" (an empty answer would
+   * let a caller write over text it could not see).
+   */
+  readContent(vaultId: string, docId: string, crypto?: DocCrypto): Promise<string>;
   /**
    * Like {@link readContent}, but `null` when the doc has NO live session and NO
    * persisted CRDT state — i.e. the server has never seen this note's content
@@ -104,74 +158,19 @@ export interface DocWriter {
    * Callers that snapshot content MUST use this: treating "not uploaded yet" as
    * "empty note" is how a checkpoint ends up bulldozing real text with "".
    */
-  peekContent(vaultId: string, docId: string): Promise<string | null>;
+  peekContent(vaultId: string, docId: string, crypto?: DocCrypto): Promise<string | null>;
 }
-
-/**
- * Called after a DETACHED write (no client connected), with the writer's
- * identity. The live path needs no equivalent: it goes through Hocuspocus, whose
- * `onChange` already reports the editor via the transaction origin's context.
- */
-export type DocWrittenHook = (
-  vaultId: string,
-  docId: string,
-  userId: string | null,
-) => void;
-
-/**
- * Publishes a doc update to background vault subscribers — the same fan-out the
- * sync server's `onChange` performs for a live document.
- *
- * The detached path below needs this explicitly. `publishDocUpdate` is driven
- * off Hocuspocus's `onChange`, and the detached path deliberately never touches
- * Hocuspocus, so without this an edit to a note nobody has open is persisted
- * correctly and announced to no one: every connected app keeps the old text on
- * disk until its next full reconcile. Since "nobody has this note open" is the
- * normal case for an AI writing into a vault, that was most MCP edits.
- *
- * Returns `void | Promise<void>` so the contract itself is safe: the real
- * publisher fans out over pub/sub and can REJECT (a Redis blip), and a rejection
- * nobody awaits is an unhandled rejection — which on Node 22 with no
- * `unhandledRejection` handler takes the whole process down. Declaring the
- * promise here means `mutate` below awaits and swallows it once, for every
- * present and future injection site, instead of depending on each caller to
- * remember its own `.catch`.
- */
-export type DocUpdatePublisher = (
-  vaultId: string,
-  docId: string,
-  update: Uint8Array,
-) => void | Promise<void>;
 
 export function createDocWriter(
   server: Server<SyncContext>,
   publishUpdate?: DocUpdatePublisher,
   onDocWritten?: DocWrittenHook,
 ): DocWriter {
-  /**
-   * Per-doc write serialisation. The detached path awaits between reading the
-   * stored state and appending its update, so two concurrent MCP writes to one
-   * note used to each hydrate the SAME state and each apply a whole-body
-   * delete+insert — Yjs merged both inserts and the note held the text twice
-   * (#78's "duplicated" outcome). Chaining per docId makes the second write see
-   * the first's result, which is also what makes a revision precondition mean
-   * anything. Self-cleaning: an entry is removed once its chain settles.
-   */
-  const locks = new Map<string, Promise<unknown>>();
-  async function withDocLock<T>(docId: string, fn: () => Promise<T>): Promise<T> {
-    const prev = locks.get(docId) ?? Promise.resolve();
-    const run = prev.then(fn, fn);
-    const chain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    locks.set(docId, chain);
-    try {
-      return await run;
-    } finally {
-      if (locks.get(docId) === chain) locks.delete(docId);
-    }
-  }
+  // Everything the bulk `docs/batch` applier needs to take the LIVE path and to
+  // fan out a detached write — the live sync server plus these two hooks. This
+  // is the one place that already holds all three, and there is exactly one of
+  // each per process. See `sync/doc-batch.ts DocBatchRuntime`.
+  setDocBatchRuntime({ server, hooks: { publishUpdate, onDocWritten } });
 
   function mutate(
     vaultId: string,
@@ -201,65 +200,38 @@ export function createDocWriter(
       // persist exactly like a human's.
       live.transact(() => fn(live.getText(CONTENT_FIELD)), {
         source: "local",
-        context: { source: MCP_ORIGIN, userId },
+        // W3: the call's own key rides along, so `onChange` seals the update
+        // and any pre-shrink text with it when the live doc remembers none.
+        context: {
+          source: MCP_ORIGIN,
+          userId,
+          // A COPY: `onChange` runs later on Hocuspocus' hook chain, and the
+          // request zeroes its own key when it ends; a zeroed key would refuse
+          // (or, before the zero-key guard, poison) this already-applied edit.
+          ...(actor?.crypto ? { vaultKey: Buffer.from(actor.crypto.key), vaultKeyGeneration: actor.crypto.generation } : {}),
+        },
       } satisfies LocalTransactionOrigin);
       return;
     }
 
-    // Detached path: hydrate, mutate, persist the incremental update.
-    const state = await loadDocState(docId);
-    const doc = new Y.Doc();
-    const updates: Uint8Array[] = [];
-    const capture = (u: Uint8Array) => updates.push(u);
-    try {
-      if (state) Y.applyUpdate(doc, state);
-      // Register AFTER hydration so we capture only our own edit.
-      doc.on("update", capture);
-      try {
-        doc.transact(() => fn(doc.getText(CONTENT_FIELD)), MCP_ORIGIN);
-      } finally {
-        doc.off("update", capture);
-      }
-      if (updates.length > 0) {
-        const merged = Y.mergeUpdates(updates);
-        await appendUpdate(docId, merged);
-        // Fan out to background subscribers, which the live path gets free from
-        // Hocuspocus's onChange. Best-effort like the re-index: the write is
-        // already durable, and failing it here would turn a delivery problem
-        // into a lost edit.
-        //
-        // `await` inside the try so this covers BOTH failure shapes: a
-        // synchronous throw AND a rejected promise. The catch alone only handled
-        // the first, and the production publisher is async — so the case that
-        // actually happens (pub/sub down) was the one going uncaught, where an
-        // unhandled rejection would take the process with it.
-        try {
-          await publishUpdate?.(vaultId, docId, merged);
-        } catch (err) {
-          console.warn(`[mcp] failed to publish update for ${docId}`, err);
-        }
-        // Keep search/graph in sync (best-effort; never fail the write on it).
-        await indexDoc(docId).catch(() => {});
-        // Attribution + version capture, the detached counterpart of the sync
-        // server's `onDocEdited`. Best-effort for the same reason the publish
-        // above is: the write is already durable.
-        try {
-          onDocWritten?.(vaultId, docId, userId);
-        } catch (err) {
-          console.warn(`[mcp] onDocWritten hook failed for ${docId}`, err);
-        }
-      }
-    } finally {
-      doc.destroy();
-    }
+    // Detached path: hydrate, mutate, persist the incremental update. Shared
+    // with the bulk push route — see `sync/doc-batch.ts applyDetached`, which
+    // carries the register-observer-after-hydration subtlety. Tagged `mcp` like
+    // the live path's origin above, so the shrink burst brake treats a detached
+    // tool write the same as a live one (never counted).
+    const detachedActor: DocActor = { ...actor, source: actor?.source ?? MCP_ORIGIN };
+    await applyDetached(vaultId, docId, (doc) => doc.transact(() => fn(doc.getText(CONTENT_FIELD)), MCP_ORIGIN), detachedActor, {
+      hooks: { publishUpdate, onDocWritten },
+    });
   }
 
   // A plain closure, NOT a method using `this`: call sites hand these functions
   // around detached (`readContent: docWriter.readContent`), where `this` dies.
-  async function peekContent(vaultId: string, docId: string): Promise<string | null> {
+  async function peekContent(vaultId: string, docId: string, crypto?: DocCrypto): Promise<string | null> {
     const live = server.hocuspocus.documents.get(formatDocName(vaultId, docId));
     if (live) return live.getText(CONTENT_FIELD).toString();
-    const state = await loadDocState(docId);
+    // W3: a sealed log needs the caller's key (key_required otherwise).
+    const state = await loadDocState(docId, pool, crypto);
     // No state is NOT an empty note: it is a note whose content has never
     // reached this server. The distinction is load-bearing for checkpoints.
     if (!state) return null;
@@ -279,8 +251,8 @@ export function createDocWriter(
   const capChars = () => config.maxNoteMb * 1024 * 1024;
   const requireUnderCap = (resulting: number): void => {
     if (resulting > capChars()) {
-      throw new Error(
-        `note would exceed the ${config.maxNoteMb} MB size ceiling — split the content across smaller notes`,
+      throw new NoteTooLargeError(
+        `note would exceed the ${config.maxNoteMb} MB size ceiling. Split the content across smaller notes`,
       );
     }
   };
@@ -328,8 +300,13 @@ export function createDocWriter(
         docId,
         (text) => {
           requireUnderCap(content.length);
-          if (text.length > 0) text.delete(0, text.length);
-          if (content) text.insert(0, content);
+          // The minimal span, never delete-all + insert (#200). Version revert,
+          // vault revert and create_note's adopt all come through here, and a
+          // whole-body rewrite re-created every character under the server's
+          // client id: an offline peer's insert anchored inside the note then
+          // had nothing left to attach to and merged back as stray fragments.
+          // The resulting text is identical either way.
+          applyOps(text, replacementOp(text.toString(), content));
         },
         actor,
       ),
@@ -345,7 +322,7 @@ export function createDocWriter(
         actor,
       ),
 
-    readContent: async (vaultId, docId) => (await peekContent(vaultId, docId)) ?? "",
+    readContent: async (vaultId, docId, crypto) => (await peekContent(vaultId, docId, crypto)) ?? "",
 
     peekContent,
   };

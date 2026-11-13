@@ -44,16 +44,27 @@ export async function seedVault(organizationId: string, name = "Vault"): Promise
   return id;
 }
 
+/** Vault keys opt-in (migration 081): what "Encrypt this vault" records. */
+export async function markEncryptionRequested(vaultId: string, userId: string | null = null): Promise<void> {
+  await pool.query(
+    "UPDATE vaults SET encryption_requested_at = now(), encryption_requested_by = $2 WHERE id = $1",
+    [vaultId, userId],
+  );
+}
+
 export async function seedFolder(
   vaultId: string,
   parentId: string | null,
   name: string,
   path: string,
+  /** Matches `seedNote`. Authorship is what a Private vault leaves standing, so
+   *  a fixture that wants an owner to still manage a folder has to say so. */
+  createdBy: string | null = null,
 ): Promise<string> {
   const id = randomUUID();
   await pool.query(
-    "INSERT INTO folders (id, vault_id, parent_id, name, path) VALUES ($1, $2, $3, $4, $5)",
-    [id, vaultId, parentId, name, path],
+    "INSERT INTO folders (id, vault_id, parent_id, name, path, created_by) VALUES ($1, $2, $3, $4, $5, $6)",
+    [id, vaultId, parentId, name, path, createdBy],
   );
   return id;
 }
@@ -71,6 +82,67 @@ export async function seedNote(
     [docId, vaultId, folderId, relPath, relPath, createdBy],
   );
   return docId;
+}
+
+/**
+ * A `files` row — a binary that lives in the tree and has a doc_id of its own
+ * (migration 028's premise: its ACL comes from the resolver, like a note's).
+ */
+export async function seedFile(
+  vaultId: string,
+  folderId: string | null,
+  path: string,
+  docId: string = randomUUID(),
+): Promise<string> {
+  await pool.query(
+    "INSERT INTO files (id, vault_id, folder_id, path) VALUES ($1, $2, $3, $4)",
+    [docId, vaultId, folderId, path],
+  );
+  return docId;
+}
+
+/** A `ready` blob row, optionally bound to a `files` doc. Written directly
+ *  rather than through the upload route when a test only needs the row. */
+export async function seedBlob(
+  vaultId: string,
+  orgId: string,
+  relPath: string,
+  opts: { docId?: string | null; sha256?: string; mime?: string; size?: number } = {},
+): Promise<string> {
+  const id = randomUUID();
+  await pool.query(
+    `INSERT INTO blobs (id, vault_id, org_id, sha256, size, mime, rel_path, filename,
+                        storage_provider, status, data, doc_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'postgres', 'ready', $9, $10)`,
+    [
+      id,
+      vaultId,
+      orgId,
+      opts.sha256 ?? randomUUID().replace(/-/g, "").padEnd(64, "0").slice(0, 64),
+      opts.size ?? 3,
+      opts.mime ?? "application/octet-stream",
+      relPath,
+      relPath.split("/").pop() ?? relPath,
+      Buffer.from([1, 2, 3]),
+      opts.docId ?? null,
+    ],
+  );
+  return id;
+}
+
+/** The extracted-text cache row for a blob (migration 028). */
+export async function seedBlobText(
+  blobId: string,
+  vaultId: string,
+  docId: string | null,
+  content: string,
+): Promise<void> {
+  const { embed } = await import("../../src/index/embedder.js");
+  await pool.query(
+    `INSERT INTO blob_text (blob_id, vault_id, doc_id, chars, content, vector, source)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'client')`,
+    [blobId, vaultId, docId, content.length, content, JSON.stringify(embed(content))],
+  );
 }
 
 export async function seedShare(
@@ -107,6 +179,47 @@ export async function seedVaultGrant(
 }
 
 /** A lock row (read-only cap) on a folder/file, for a user or the whole org. */
+/**
+ * A vault-scoped grant for ONE user — the per-person equivalent of
+ * {@link seedVaultGrant}. This is what makes someone a vault-wide reader now
+ * that the owner/admin role is not one on its own: it survives the Private
+ * posture, exactly as the resolver's read-only branch honours it.
+ */
+/**
+ * Seal a vault: the org-principal `denied` row on the vault resource that
+ * `PUT /orgs/:orgId/team-access { mode: "private" }` writes.
+ *
+ * Distinct from having no row at all, which means "never shared" and still
+ * leaves people the notes they wrote. See [[resolver]] `vaultBaseline`.
+ */
+export async function sealVault(organizationId: string): Promise<string> {
+  const id = randomUUID();
+  await pool.query(
+    `INSERT INTO shares
+       (id, org_id, resource_type, resource_id, principal_type, principal_id, permission)
+     VALUES ($1, $2, 'vault', $2, 'org', $2, 'denied')
+     ON CONFLICT (resource_type, resource_id, principal_type, principal_id)
+     DO UPDATE SET permission = 'denied'`,
+    [id, organizationId],
+  );
+  return id;
+}
+
+export async function seedUserVaultGrant(
+  organizationId: string,
+  userId: string,
+  permission: "view" | "edit",
+): Promise<string> {
+  const id = randomUUID();
+  await pool.query(
+    `INSERT INTO shares
+       (id, org_id, resource_type, resource_id, principal_type, principal_id, permission)
+     VALUES ($1, $2, 'vault', $2, 'user', $3, $4)`,
+    [id, organizationId, userId, permission],
+  );
+  return id;
+}
+
 export async function seedLock(
   organizationId: string,
   resourceType: "folder" | "file",

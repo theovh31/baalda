@@ -2,7 +2,18 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { filterReadableBlobs } from "../src/permissions/http-gates.js";
 import { pool } from "../src/db/pool.js";
 import { resetDb } from "./helpers/db.js";
-import { seedMember, seedNote, seedOrg, seedUser, seedVault } from "./helpers/seed.js";
+import {
+  seedBlob,
+  seedFile,
+  seedFolder,
+  seedMember,
+  seedNote,
+  seedOrg,
+  seedShare,
+  seedUser,
+  seedVault,
+  seedVaultGrant,
+} from "./helpers/seed.js";
 
 /**
  * `filterReadableBlobs` decides which attachments a SCOPED member (no vault-wide
@@ -112,7 +123,111 @@ describe("filterReadableBlobs (attachment visibility)", () => {
     expect(out.map((b) => b.rel_path)).toEqual(["attachments/a\\%b.png"]);
   });
 
+  it("matches a path anywhere in the text: repeated folders, overlaps, multi-byte text, no folder", async () => {
+    // The reference check finds paths by their leading `dir/` and cuts the
+    // candidates out of the text. These are the shapes that could trip that
+    // and must answer exactly as plain substring containment does.
+    await seedIndex(
+      vault,
+      memberNote,
+      [
+        "ünïcödé — 日本語 before ![](attachments/attachments/nested.png)", // anchor twice in a row
+        "x/attachments/inner.png", // occurs after another folder
+        "![](attachments/long-name.png)", // a shorter path is a prefix of this
+        "attachments/attachments/attachments/deep.png",
+        "loose.png in the root", // no folder at all
+        "attachments/",
+      ].join("\n"),
+    );
+    // A path under the same folder that only the owner's note, which the
+    // member cannot read, references.
+    await seedIndex(vault, ownerNote, "![](attachments/owner-only.png)");
+    const candidates = [
+      "attachments/attachments/nested.png", // visible
+      "attachments/nested.png", // visible: it is a substring of the first line
+      "attachments/inner.png", // visible: substring of x/attachments/inner.png
+      "x/attachments/inner.png", // visible
+      "attachments/long", // visible: substring of long-name.png
+      "attachments/long-name.png.bak", // hidden: longer than what is there
+      "attachments/attachments/deep.png", // visible
+      "attachments/deep.png", // visible
+      "loose.png", // visible, no folder
+      "missing.png", // hidden, no folder
+      "attachments/owner-only.png", // hidden: only an unreadable note has it
+      "Attachments/nested.png", // hidden: case-sensitive
+      "日本語 before", // visible: no folder, multi-byte
+    ];
+    const out = await filterReadableBlobs(member, vault, candidates.map(blob));
+    const text = (
+      await pool.query<{ content: string }>("SELECT content FROM note_index WHERE doc_id = $1", [memberNote])
+    ).rows[0].content;
+    // Plain substring containment over the readable note is the oracle.
+    expect(out.map((b) => b.rel_path)).toEqual(candidates.filter((p) => text.includes(p)));
+    expect(out.map((b) => b.rel_path)).toEqual([
+      "attachments/attachments/nested.png",
+      "attachments/nested.png",
+      "attachments/inner.png",
+      "x/attachments/inner.png",
+      "attachments/long",
+      "attachments/attachments/deep.png",
+      "attachments/deep.png",
+      "loose.png",
+      "日本語 before",
+    ]);
+  });
+
+  it("scopes a folder-granted member to exactly the right blobs (#343)", async () => {
+    // The member reads one folder by name and nothing else; the vault itself
+    // gives no vault-wide read. Every case is a real blob row, run through the
+    // same `SELECT … ORDER BY rel_path` shape the list route hands in.
+    const shared = await seedFolder(vault, null, "Shared", "Shared", owner);
+    const closed = await seedFolder(vault, null, "Closed", "Closed", owner);
+    await seedShare(org, "folder", shared, member, "view");
+    const readNote = await seedNote(vault, shared, "Shared/Read.md", owner);
+    const hiddenNote = await seedNote(vault, closed, "Closed/Hidden.md", owner);
+    const openFile = await seedFile(vault, shared, "Shared/report.pdf");
+    const closedFile = await seedFile(vault, closed, "Closed/budget.xlsx");
+    await seedBlob(vault, org, "Shared/report.pdf", { docId: openFile });
+    await seedBlob(vault, org, "Closed/budget.xlsx", { docId: closedFile });
+    // Paths of several lengths, embedded more than once and back to back, as a
+    // wikilink and a markdown image; one is a prefix of another, one has the
+    // anchor again inside it, and one appears only in the unreadable note.
+    const visible = [
+      "attachments/a.png",
+      "attachments/a.png.bak",
+      "attachments/Screenshot 2026-10-01 at 12.33.07 é.png",
+      "attachments/sub/attachments/deep.png",
+    ];
+    for (const p of [...visible, "attachments/secret.png", "attachments/orphan.png"]) {
+      await seedBlob(vault, org, p);
+    }
+    await seedIndex(
+      vault,
+      readNote,
+      "Résumé ✓\n![[attachments/a.png]]![](attachments/a.png.bak)\n" +
+        "![](attachments/Screenshot 2026-10-01 at 12.33.07 é.png) and again " +
+        "![[attachments/Screenshot 2026-10-01 at 12.33.07 é.png]]\n" +
+        "see attachments/sub/attachments/deep.png\n",
+    );
+    await seedIndex(vault, hiddenNote, "![](attachments/secret.png) ![](attachments/a.png)");
+
+    const { rows } = await pool.query<{ id: string; rel_path: string; doc_id: string | null }>(
+      "SELECT id, rel_path, doc_id FROM blobs WHERE vault_id = $1 AND status = 'ready' ORDER BY rel_path",
+      [vault],
+    );
+    const out = await filterReadableBlobs(member, vault, rows);
+    expect(out.map((b) => b.rel_path)).toEqual(
+      rows.map((b) => b.rel_path).filter((p) => p === "Shared/report.pdf" || visible.includes(p)),
+    );
+  });
+
   it("gives a vault-wide reader every blob, referenced or not", async () => {
+    // "Vault-wide" is the org grant, not the role. The rest of this file keeps
+    // the vault Private on purpose — that is what gives the member an empty
+    // readable set — so the grant goes on here and nowhere else. Before
+    // Private stopped exempting owners, the role alone answered this and the
+    // distinction was invisible.
+    await seedVaultGrant(org, "edit");
     const all = [blob("attachments/pic.png"), blob("attachments/orphan.png"), blob(null)];
     // Owner: no note_index rows at all, and still sees everything.
     expect(await filterReadableBlobs(owner, vault, all)).toEqual(all);

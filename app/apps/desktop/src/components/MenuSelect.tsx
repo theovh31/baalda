@@ -21,11 +21,12 @@ import { placeMenu, type Placement } from "../lib/menuPlacement";
  * It is also PORTALLED to `document.body`, which `position: fixed` alone does
  * not achieve. Any ancestor with a transform becomes the containing block for
  * fixed descendants and clips them with its own overflow — and the settings
- * page has one by accident: `.settings-content` animates in with
- * `animation-fill-mode: both`, so its final keyframe's `transform: translateY(0)`
- * stays applied forever. The menu was landing inside that card's coordinate
- * space and being sliced by its scrollbar. A portal is immune to that whatever
- * gets styled above it later.
+ * surface had one by accident: `.settings-content` used to animate in with
+ * `rise-in` and `animation-fill-mode: both`, so its final keyframe's
+ * `transform: translateY(0)` stayed applied forever. The menu landed inside that
+ * card's coordinate space and got sliced by its scrollbar. Those animations are
+ * opacity-only now (see `SettingsModal.tsx`), but the portal stays: it is immune
+ * to whatever gets styled above it later.
  *
  * Self-contained dismissal (outside-mousedown + Escape), unlike FileTree's menu
  * which owns a window-level dismiss of its own.
@@ -49,6 +50,10 @@ export function MenuSelect<T extends string>({
   ariaLabel,
   triggerClassName,
   menuClassName,
+  triggerContent,
+  caret = true,
+  direction = "auto",
+  anchorClosest,
 }: {
   value: T;
   options: ReadonlyArray<MenuSelectOption<T>>;
@@ -58,6 +63,21 @@ export function MenuSelect<T extends string>({
   /** Trigger styling — the caller decides whether it's a field or a pill. */
   triggerClassName: string;
   menuClassName?: string;
+  /**
+   * Replace the trigger's label with something else (the Properties panel puts
+   * the type's icon there). The menu itself is unchanged, so this stays one
+   * control rather than becoming two that drift.
+   */
+  triggerContent?: React.ReactNode;
+  /**
+   * Anchor the menu to the nearest ancestor matching this selector (e.g. the
+   * labelled field box the trigger sits in) instead of the bare trigger: the
+   * menu then lines up with the box's edges and is at least as wide as it.
+   */
+  anchorClosest?: string;
+  /** Icon triggers have no room for the caret. */
+  caret?: boolean;
+  direction?: "auto" | "down";
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<Placement | null>(null);
@@ -80,7 +100,10 @@ export function MenuSelect<T extends string>({
     // The menu is fixed to the viewport, so anything that moves the trigger
     // underneath it (a scroll, a resize) would leave it stranded. Closing is the
     // honest response — re-anchoring mid-scroll makes the menu chase the cursor.
-    const dismiss = () => setOpen(false);
+    const dismiss = (event: Event) => {
+      if (event.type === "scroll" && event.target instanceof Node && menuRef.current?.contains(event.target)) return;
+      setOpen(false);
+    };
     document.addEventListener("mousedown", onMouseDown);
     document.addEventListener("keydown", onKeyDown);
     window.addEventListener("resize", dismiss);
@@ -104,8 +127,15 @@ export function MenuSelect<T extends string>({
     const menu = menuRef.current;
     const trigger = triggerRef.current;
     if (!menu || !trigger) return;
-    const anchor = trigger.getBoundingClientRect();
+    const box = anchorClosest ? trigger.closest<HTMLElement>(anchorClosest) : null;
+    const anchor = (box ?? trigger).getBoundingClientRect();
+    if (box) menu.style.minWidth = `${Math.round(anchor.width)}px`;
     const size = { width: menu.offsetWidth, height: menu.offsetHeight };
+    if (direction === "down") {
+      setPos({ left: Math.max(8, Math.min(anchor.left, window.innerWidth - size.width - 8)), top: anchor.bottom + OFFSET,
+        maxHeight: Math.max(0, window.innerHeight - anchor.bottom - OFFSET - 8) });
+      return;
+    }
     setPos(
       placeMenu(
         {
@@ -118,7 +148,7 @@ export function MenuSelect<T extends string>({
         { width: window.innerWidth, height: window.innerHeight },
       ),
     );
-  }, [open, options.length]);
+  }, [open, options.length, direction, anchorClosest]);
 
   // A value with no matching option still has to render something — falling
   // back to the raw value beats an empty trigger that looks broken.
@@ -137,10 +167,14 @@ export function MenuSelect<T extends string>({
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
-        <span className="role-trigger-label">{current?.label ?? value}</span>
-        <span className="role-caret" aria-hidden="true">
-          ▾
-        </span>
+        {triggerContent ?? (
+          <span className="role-trigger-label">{current?.label ?? value}</span>
+        )}
+        {caret && (
+          <span className="role-caret" aria-hidden="true">
+            ▾
+          </span>
+        )}
       </button>
       {open &&
         createPortal(

@@ -6,7 +6,17 @@ import { orgRole } from "../../permissions/lookup.js";
 import { getSession } from "../session.js";
 import { setVaultBinding } from "../../mcp/oauth.js";
 import { BRAND_NAME } from "../../brand.js";
-import { GLYPH_FAVICON_DATA_URI, WORDMARK_DATA_URI } from "../../brand-assets.js";
+import { emailEnabled } from "../../email/mailer.js";
+import { esc, page } from "../pages.js";
+import { VK_HEADER } from "../../crypto/transport.js";
+import {
+  completeConsent,
+  consentFor,
+  consentNeedsDesktop,
+  openConsent,
+  readyConsent,
+  redirectHostsOf,
+} from "../../mcp/oauth-consent.js";
 
 /**
  * The human-facing pages of the MCP OAuth flow (the Better Auth `mcp` plugin
@@ -18,101 +28,11 @@ import { GLYPH_FAVICON_DATA_URI, WORDMARK_DATA_URI } from "../../brand-assets.js
  *                          bounces back to the client's redirect_uri.
  *
  * Served by this (headless) server itself so the flow works on api.baalda.com
- * and any self-hoster with no separate web frontend. Branded with the official
- * Baalda logos (embedded, see brand-assets.ts).
+ * and any self-hoster with no separate web frontend. Page chrome + branding come
+ * from ../pages.ts (shared with the account pages).
  */
 
 const AUTHORIZE_PATH = "/api/auth/mcp/authorize";
-
-function esc(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-/** Shared chrome: dark, premium, matches the Baalda brand (black + chrome). */
-function page(opts: { title: string; body: string; head?: string }): string {
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="robots" content="noindex" />
-<title>${esc(opts.title)} · ${esc(BRAND_NAME)}</title>
-<link rel="icon" href="${GLYPH_FAVICON_DATA_URI}" />
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px;
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    color: #ededea; background: #08080b;
-    background-image:
-      radial-gradient(1100px 600px at 50% -10%, rgba(150,170,210,0.14), transparent 60%),
-      radial-gradient(800px 500px at 50% 120%, rgba(90,110,150,0.10), transparent 60%);
-  }
-  .card {
-    width: 100%; max-width: 400px; background: rgba(20,20,26,0.72);
-    border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; padding: 34px 30px;
-    box-shadow: 0 24px 70px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.05);
-    backdrop-filter: blur(14px);
-  }
-  .wordmark { display:block; height: 34px; margin: 2px auto 22px; object-fit: contain; }
-  h1 { font-size: 18px; font-weight: 600; margin: 0 0 6px; text-align: center; letter-spacing: -0.01em; }
-  .sub { color: #9a9aa6; text-align: center; margin: 0 0 24px; font-size: 13.5px; }
-  .sub b { color: #d7d7dc; font-weight: 600; }
-  label { display:block; font-size: 12.5px; color: #a6a6b0; margin: 0 0 6px; }
-  input[type=email], input[type=password] {
-    width: 100%; padding: 11px 13px; margin-bottom: 15px; font-size: 14px; color: #f2f2ef;
-    background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.12); border-radius: 10px;
-    transition: border-color .15s, box-shadow .15s;
-  }
-  input:focus { outline: none; border-color: rgba(170,190,230,0.7); box-shadow: 0 0 0 3px rgba(120,150,210,0.18); }
-  button, .btn {
-    width: 100%; padding: 11px 14px; font-size: 14px; font-weight: 600; border-radius: 10px;
-    border: 0; cursor: pointer; font-family: inherit; text-align: center;
-  }
-  .primary { background: linear-gradient(180deg,#f4f5f7,#d9dde3); color: #16161b; }
-  .primary:hover { background: linear-gradient(180deg,#ffffff,#e6e9ee); }
-  .ghost {
-    background: rgba(255,255,255,0.05); color: #ededea; border: 1px solid rgba(255,255,255,0.14);
-    display:flex; align-items:center; justify-content:center; gap:9px; margin-top: 4px; text-decoration:none;
-  }
-  .ghost:hover { background: rgba(255,255,255,0.09); }
-  .divider { display:flex; align-items:center; gap:12px; color:#6a6a74; font-size:12px; margin: 18px 0; }
-  .divider::before, .divider::after { content:""; height:1px; flex:1; background: rgba(255,255,255,0.1); }
-  .err { background: rgba(220,80,80,0.12); border:1px solid rgba(220,80,80,0.35); color:#f4b6b6;
-         padding:10px 12px; border-radius:9px; font-size:13px; margin-bottom:16px; }
-  .ws { display:block; border:1px solid rgba(255,255,255,0.12); border-radius:11px; padding:12px 14px;
-        margin-bottom:10px; cursor:pointer; display:flex; align-items:center; gap:12px; transition:border-color .12s, background .12s; }
-  .ws:hover { border-color: rgba(170,190,230,0.5); background: rgba(255,255,255,0.03); }
-  .ws input { accent-color:#c6d2ea; width:16px; height:16px; margin:0; }
-  .ws-name { font-weight:600; font-size:14px; }
-  .ws-role { color:#8a8a94; font-size:12px; text-transform:capitalize; }
-  .ws-meta { display:flex; flex-direction:column; gap:1px; }
-  .scopes { background: rgba(0,0,0,0.28); border:1px solid rgba(255,255,255,0.08); border-radius:11px;
-            padding:13px 15px; margin: 6px 0 22px; }
-  .scopes li { color:#c3c3cb; font-size:13px; margin: 4px 0; list-style:none; position:relative; padding-left:22px; }
-  .scopes li::before { content:"✓"; position:absolute; left:0; color:#8fb99b; font-weight:700; }
-  .scopes ul { margin:0; padding:0; }
-  .row { display:flex; gap:10px; margin-top: 4px; }
-  .row button { flex:1; }
-  .foot { text-align:center; color:#6a6a74; font-size:11.5px; margin-top:20px; }
-  .foot a { color:#9a9aa6; }
-</style>
-${opts.head ?? ""}
-</head>
-<body>
-  <div class="card">
-    <img class="wordmark" src="${WORDMARK_DATA_URI}" alt="${esc(BRAND_NAME)}" />
-    ${opts.body}
-  </div>
-</body>
-</html>`;
-}
 
 async function clientName(clientId: string | undefined): Promise<string> {
   if (!clientId) return "An application";
@@ -123,7 +43,199 @@ async function clientName(clientId: string | undefined): Promise<string> {
   return rows[0]?.name?.trim() || "An application";
 }
 
+/** The client's registered redirect hosts: its name is self-chosen, the host is not. */
+async function clientRedirectHosts(clientId: string | undefined): Promise<string[]> {
+  if (!clientId) return [];
+  const { rows } = await pool.query<{ redirect_urls: string | null }>(
+    'SELECT "redirectUrls" AS redirect_urls FROM "oauthApplication" WHERE "clientId" = $1',
+    [clientId],
+  );
+  return redirectHostsOf(rows[0]?.redirect_urls);
+}
+
+/** A soft pastel tile (fill + deeper letter of the same hue) that stays the same for a vault. */
+function monogramStyle(id: string): string {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  const hue = h % 360;
+  return `background:hsl(${hue} 80% 93%);color:hsl(${hue} 45% 34%)`;
+}
+
+/** The vault picker: a wide grid so a person in many vaults sees them at a glance. */
+export function consentPage(opts: {
+  app: string;
+  email: string;
+  consentCode: string;
+  clientId: string;
+  vaults: { id: string; name: string; role: string }[];
+  preselect: string;
+  redirectHosts?: string[];
+}): string {
+  const { app, email, consentCode, clientId, vaults, preselect } = opts;
+  const hosts = opts.redirectHosts ?? [];
+  const returnsTo = hosts.length
+    ? `<p class="sub">Returns you to <b>${hosts.map(esc).join("</b>, <b>")}</b>. Allow only if you started this from that site.</p>`
+    : "";
+  const options = vaults
+    .map((w) => {
+      const initial = (w.name.trim().match(/\p{L}|\p{N}/u)?.[0] ?? "?").toUpperCase();
+      return `
+      <label class="ws" data-name="${esc(w.name.toLowerCase())}">
+        <input type="radio" name="organization_id" value="${esc(w.id)}" ${
+          w.id === preselect ? "checked" : ""
+        } required />
+        <span class="ws-mono" style="${monogramStyle(w.id)}">${esc(initial)}</span>
+        <span class="ws-meta"><span class="ws-name" title="${esc(w.name)}">${esc(
+          w.name,
+        )}</span><span class="ws-role">${esc(w.role)}</span></span>
+        <span class="ws-check" aria-hidden="true"></span>
+      </label>`;
+    })
+    .join("");
+
+  // A filter only earns its place once the grid no longer fits at a glance.
+  const search =
+    vaults.length > 8
+      ? `<input type="search" class="ws-search" id="ws-search" placeholder="Search vaults" autocomplete="off" />`
+      : "";
+
+  const body = `
+    <h1><b>${esc(app)}</b> wants access</h1>
+    <p class="sub">Signed in as <b>${esc(email)}</b></p>
+    ${returnsTo}
+    <form method="POST" action="/oauth/consent">
+      <input type="hidden" name="consent_code" value="${esc(consentCode)}" />
+      <input type="hidden" name="client_id" value="${esc(clientId)}" />
+      <div class="ws-head">
+        <label>Choose a vault to connect<span class="count">${vaults.length}</span></label>
+        ${search}
+      </div>
+      <div class="ws-grid" id="ws-grid">
+        ${options}
+        <p class="ws-empty" id="ws-empty" hidden>No vaults match.</p>
+      </div>
+      <div class="consent-foot">
+        <div class="scopes"><ul>
+          <li>Read and search notes you can access</li>
+          <li>Create, edit and organize notes on your behalf</li>
+          <li>Only within your existing sharing permissions</li>
+        </ul></div>
+        <div class="row">
+          <button type="submit" name="decision" value="deny" class="ghost">Deny</button>
+          <button type="submit" name="decision" value="allow" class="primary">Allow access</button>
+        </div>
+      </div>
+    </form>
+    <p class="foot">You can revoke this anytime in ${esc(BRAND_NAME)} vault settings.</p>
+    <script>
+      const checked = document.querySelector('.ws input:checked');
+      if (checked) checked.closest('.ws').scrollIntoView({ block: 'nearest' });
+      const q = document.getElementById('ws-search');
+      if (q) q.addEventListener('input', () => {
+        const term = q.value.trim().toLowerCase();
+        let shown = 0;
+        document.querySelectorAll('#ws-grid .ws').forEach((el) => {
+          const hit = !term || el.dataset.name.includes(term);
+          el.hidden = !hit;
+          if (hit) shown++;
+        });
+        document.getElementById('ws-empty').hidden = shown > 0;
+      });
+    </script>`;
+  return page({ title: "Authorize", body, wide: true });
+}
+
+/** "Open Baalda on your computer to finish connecting": a deep link into the
+ *  desktop, then a poll that re-submits the consent once the desktop is done. */
+export function finishInAppPage(opts: {
+  app: string;
+  consentId: string;
+  consentCode: string;
+  clientId: string;
+  organizationId: string;
+}): string {
+  const link = `${config.deepLinkScheme}://oauth-consent?id=${encodeURIComponent(opts.consentId)}&server=${encodeURIComponent(config.betterAuthUrl)}`;
+  const body = `
+    <h1>Open ${esc(BRAND_NAME)} on your computer to finish connecting</h1>
+    <p class="sub">Your vault's key lives on your devices, so <b>${esc(opts.app)}</b> is connected from the ${esc(
+      BRAND_NAME,
+    )} app. Keep this page open; it continues on its own.</p>
+    <p><a class="btn primary" id="open-app" href="${esc(link)}">Open ${esc(BRAND_NAME)}</a></p>
+    <form method="POST" action="/oauth/consent" id="finish">
+      <input type="hidden" name="consent_code" value="${esc(opts.consentCode)}" />
+      <input type="hidden" name="client_id" value="${esc(opts.clientId)}" />
+      <input type="hidden" name="organization_id" value="${esc(opts.organizationId)}" />
+      <input type="hidden" name="decision" value="allow" />
+    </form>
+    <p class="foot" id="state">Waiting for the ${esc(BRAND_NAME)} app…</p>
+    <script>
+      const id = ${JSON.stringify(opts.consentId).replace(/</g, "\\u003c")};
+      location.href = document.getElementById('open-app').href;
+      const tick = async () => {
+        try {
+          const r = await fetch('/oauth/consent/status?id=' + encodeURIComponent(id), { credentials: 'same-origin' });
+          const s = r.ok ? await r.json() : null;
+          if (s && s.approved) { document.getElementById('finish').submit(); return; }
+          if (r.status === 404) { document.getElementById('state').textContent = 'This request expired. Restart the connection from your app.'; return; }
+        } catch {}
+        setTimeout(tick, 2000);
+      };
+      setTimeout(tick, 2000);
+    </script>`;
+  return page({ title: "Finish in the app", body });
+}
+
 export const oauthConnectRoutes = new Hono();
+
+// ── Desktop-completed consent (W3, rule 2) ──────────────────────────────────
+// The browser page polls this (cookie session); the desktop reads and
+// completes the consent (bearer session + X-Baalda-VK). Same user only.
+oauthConnectRoutes.get("/oauth/consent/status", async (c) => {
+  const session = await getSession(c);
+  if (!session) return c.json({ error: "Authentication required" }, 401);
+  const view = await consentFor(c.req.query("id") ?? "", session.userId);
+  if (!view) return c.json({ error: "Not found" }, 404);
+  // No keyed vault (any more) behind it: the page may continue on its own.
+  if (!view.approved && !(await consentNeedsDesktop(view.organizationId))) return c.json({ approved: true });
+  return c.json({ approved: view.approved });
+});
+
+oauthConnectRoutes.get("/api/oauth/consents/:id", async (c) => {
+  const session = await getSession(c);
+  if (!session) return c.json({ error: "Authentication required" }, 401);
+  const view = await consentFor(c.req.param("id"), session.userId);
+  if (!view) return c.json({ error: "This connection request expired or is not yours", code: "not_found" }, 404);
+  return c.json(view);
+});
+
+oauthConnectRoutes.post("/api/oauth/consents/:id/complete", async (c) => {
+  const session = await getSession(c);
+  if (!session) return c.json({ error: "Authentication required" }, 401);
+  const result = await completeConsent(c.req.param("id"), session.userId, c.req.header(VK_HEADER));
+  if (!result.ok) {
+    return c.json(
+      {
+        error: result.code === "key_required" ? "This needs the vault's key from your device" : "This connection request expired or is not yours",
+        code: result.code,
+      },
+      result.status,
+    );
+  }
+  return c.json({ ok: true });
+});
+
+// ── Force the vault picker on every authorize (issue #211) ──────────────────
+// The mcp plugin issues a code straight away unless prompt=consent, and a
+// client whose user is already signed in in the browser never passes through
+// /oauth/login (where we used to add it). Its token then had no vault binding
+// and every call 401'd once the user belonged to two vaults. Mounted ahead of
+// Better Auth's /api/auth/* handler, so this runs first.
+oauthConnectRoutes.get(AUTHORIZE_PATH, async (c, next) => {
+  const url = new URL(c.req.url);
+  if (url.searchParams.get("prompt") === "consent") return next();
+  url.searchParams.set("prompt", "consent");
+  return c.redirect(`${config.betterAuthUrl}${AUTHORIZE_PATH}?${url.searchParams.toString()}`, 302);
+});
 
 // ── Sign-in page (Better Auth mcp plugin's loginPage) ───────────────────────
 oauthConnectRoutes.get("/oauth/login", async (c) => {
@@ -145,6 +257,12 @@ oauthConnectRoutes.get("/oauth/login", async (c) => {
        </button>`
     : "";
 
+  // Only when this server can actually send the email (issue #99); a link to a
+  // reset flow that never delivers is worse than none.
+  const forgot = emailEnabled()
+    ? `<p class="linkline"><a href="/forgot-password">Forgot password?</a></p>`
+    : "";
+
   const body = `
     <h1>Sign in to ${esc(BRAND_NAME)}</h1>
     <p class="sub">to connect <b>${esc(app)}</b></p>
@@ -154,6 +272,7 @@ oauthConnectRoutes.get("/oauth/login", async (c) => {
       <input id="email" type="email" required autocomplete="username" autofocus />
       <label for="password">Password</label>
       <input id="password" type="password" required autocomplete="current-password" />
+      ${forgot}
       <button type="submit" class="primary">Sign in</button>
     </form>
     ${google}
@@ -247,41 +366,17 @@ oauthConnectRoutes.get("/oauth/consent", async (c) => {
     );
   }
 
-  const preselect = session.activeOrganizationId ?? vaults[0].id;
-  const options = vaults
-    .map(
-      (w) => `
-      <label class="ws">
-        <input type="radio" name="organization_id" value="${esc(w.id)}" ${
-          w.id === preselect ? "checked" : ""
-        } required />
-        <span class="ws-meta"><span class="ws-name">${esc(w.name)}</span><span class="ws-role">${esc(
-          w.role,
-        )}</span></span>
-      </label>`,
-    )
-    .join("");
-
-  const body = `
-    <h1><b>${esc(app)}</b> wants access</h1>
-    <p class="sub">Signed in as <b>${esc(session.email)}</b></p>
-    <form method="POST" action="/oauth/consent">
-      <input type="hidden" name="consent_code" value="${esc(consentCode)}" />
-      <input type="hidden" name="client_id" value="${esc(clientId)}" />
-      <label>Choose a vault to connect</label>
-      ${options}
-      <div class="scopes"><ul>
-        <li>Read and search notes you can access</li>
-        <li>Create, edit and organize notes on your behalf</li>
-        <li>Only within your existing sharing permissions</li>
-      </ul></div>
-      <div class="row">
-        <button type="submit" name="decision" value="deny" class="ghost">Deny</button>
-        <button type="submit" name="decision" value="allow" class="primary">Allow access</button>
-      </div>
-    </form>
-    <p class="foot">You can revoke this anytime in ${esc(BRAND_NAME)} vault settings.</p>`;
-  return c.html(page({ title: "Authorize", body }));
+  return c.html(
+    consentPage({
+      app,
+      email: session.email,
+      consentCode,
+      clientId,
+      vaults,
+      preselect: session.activeOrganizationId ?? vaults[0].id,
+      redirectHosts: await clientRedirectHosts(clientId),
+    }),
+  );
 });
 
 oauthConnectRoutes.post("/oauth/consent", async (c) => {
@@ -314,6 +409,23 @@ oauthConnectRoutes.post("/oauth/consent", async (c) => {
         }),
         400,
       );
+    }
+    // A keyed vault: only the user's desktop can hand over the
+    // vault key (security rule 2). Until it has, show the hand-off page; it
+    // re-submits this same form once the desktop finished.
+    if (await consentNeedsDesktop(organizationId)) {
+      if (!(await readyConsent(session.userId, clientId, organizationId))) {
+        const id = await openConsent(session.userId, clientId, organizationId);
+        return c.html(
+          finishInAppPage({
+            app: await clientName(clientId),
+            consentId: id,
+            consentCode,
+            clientId,
+            organizationId,
+          }),
+        );
+      }
     }
     await setVaultBinding(clientId, session.userId, organizationId);
   }

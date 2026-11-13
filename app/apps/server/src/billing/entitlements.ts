@@ -1,12 +1,14 @@
 import type pg from "pg";
 import { pool as defaultPool } from "../db/pool.js";
 import { config, billingEnabled } from "../config.js";
+import type { BillingInterval } from "./provider.js";
+import { resolveAccountPlan, teamModel, checkInviteSeat } from "./plan.js";
 
 /**
  * Entitlement checks. These read ONLY our own tables (`subscriptions`, `member`,
  * `invitation`) — never the payment provider — so they're cheap and correct on
  * the request path. The `subscriptions` table is the single source of truth,
- * written only by webhook processing.
+ * written only through `billing/store.ts`.
  *
  * Every gate returns "allowed" when billing is disabled (self-host = unlimited).
  */
@@ -26,6 +28,16 @@ export interface Entitlement {
   providerSubscriptionId: string | null;
   /** True when the org has an active (or past_due grace) subscription. */
   active: boolean;
+  /**
+   * Price the provider is actually charging, persisted from its snapshots so
+   * "Subscriptions" can render a real figure without a provider round trip on
+   * the request path. Null on rows written before migration 024, and on any
+   * row the provider never reported a price for.
+   */
+  interval: BillingInterval | null;
+  /** Minor units (cents). */
+  amount: number | null;
+  currency: string | null;
 }
 
 interface SubRow {
@@ -35,16 +47,27 @@ interface SubRow {
   cancel_at_period_end: boolean;
   provider_customer_id: string | null;
   provider_subscription_id: string | null;
+  interval: string | null;
+  amount: number | null;
+  currency: string | null;
 }
 
-/** Read the current entitlement for an org from OUR subscriptions table. */
+/**
+ * Read the current entitlement for an org from OUR subscriptions table.
+ *
+ * A tombstone row (`deleted_at` set, the vault deleted) resolves exactly like a
+ * live one on purpose: the subscription is still real and still being charged,
+ * which is the whole point of keeping the row (#109). Callers that care about
+ * the difference read `deleted_at` through `billing/store.ts` instead.
+ */
 export async function getEntitlement(
   orgId: string,
   db: Queryable = defaultPool,
 ): Promise<Entitlement> {
   const { rows } = await db.query<SubRow>(
     `SELECT plan, status, current_period_end, cancel_at_period_end,
-            provider_customer_id, provider_subscription_id
+            provider_customer_id, provider_subscription_id,
+            interval, amount, currency
        FROM subscriptions WHERE organization_id = $1`,
     [orgId],
   );
@@ -58,6 +81,9 @@ export async function getEntitlement(
       providerCustomerId: null,
       providerSubscriptionId: null,
       active: false,
+      interval: null,
+      amount: null,
+      currency: null,
     };
   }
   const active = (ACTIVE_STATUSES as readonly string[]).includes(row.status);
@@ -71,6 +97,9 @@ export async function getEntitlement(
     providerCustomerId: row.provider_customer_id,
     providerSubscriptionId: row.provider_subscription_id,
     active,
+    interval: normalizeIntervalForApi(row.interval),
+    amount: row.amount === null ? null : Number(row.amount),
+    currency: row.currency,
   };
 }
 
@@ -79,6 +108,11 @@ function normalizeStatusForApi(status: string): Entitlement["status"] {
     return status;
   }
   return "none";
+}
+
+/** Only the two intervals we sell survive to the wire; anything else is null. */
+export function normalizeIntervalForApi(interval: string | null): BillingInterval | null {
+  return interval === "month" || interval === "year" ? interval : null;
 }
 
 /** Does the org have an active (unlimited-members) subscription right now? */
@@ -134,6 +168,85 @@ export async function seatCount(
 }
 
 /**
+ * Attachment-storage ceiling for one vault's org, in bytes — or `null` for "no
+ * limit", which is what self-host and every paid vault get.
+ *
+ * Returns a number rather than an allow/deny the way `canCreateOrganization` /
+ * `canAddMember` do, because the caller needs the figure twice over: once to
+ * decide, and once to put in the 402 body so a client can say how much room is
+ * left. Summing the vault's bytes is the CALLER's job and happens only after
+ * this returns non-null — a query nobody with an unlimited vault should pay
+ * for.
+ */
+export async function storageLimitBytes(
+  orgId: string,
+  db: Queryable = defaultPool,
+): Promise<number | null> {
+  if (teamModel()) return (await resolveAccountPlan(db, { orgId })).limits.storageBytes;
+  return legacyStorageLimitBytes(orgId, db);
+}
+
+/** Vault-model storage cap (today's per-org rule). */
+export async function legacyStorageLimitBytes(
+  orgId: string,
+  db: Queryable = defaultPool,
+): Promise<number | null> {
+  if (!billingEnabled()) return null;
+  if (await orgHasActiveSubscription(orgId, db)) return null;
+  return config.freeMaxStorageMb * 1024 * 1024;
+}
+
+interface AccountEntitlementRow {
+  free_vault_limit: number;
+}
+
+/** Durable benefits granted to accounts that existed at the rollout boundary. */
+async function accountEntitlement(
+  userId: string,
+  db: Queryable,
+): Promise<AccountEntitlementRow | null> {
+  const { rows } = await db.query<AccountEntitlementRow>(
+    `SELECT free_vault_limit
+       FROM account_entitlements
+      WHERE user_id = $1`,
+    [userId],
+  );
+  return rows[0] ?? null;
+}
+
+/** The account-specific free-vault cap, including a persisted legacy grant. */
+export async function freeVaultLimitForUser(
+  userId: string,
+  db: Queryable = defaultPool,
+): Promise<number> {
+  if (!billingEnabled()) return config.freeMaxVaults;
+  return (await accountEntitlement(userId, db))?.free_vault_limit ?? config.freeMaxVaults;
+}
+
+/**
+ * Whether this vault may mirror standalone binary files. Embedded attachments
+ * use the Free note-sync path instead. An active or past-due Pro
+ * subscription unlocks every member. Billing-disabled self-hosts remain
+ * unlimited. Account-level legacy grants affect only the free-vault count.
+ */
+export async function canSyncAttachments(
+  orgId: string,
+  db: Queryable = defaultPool,
+): Promise<boolean> {
+  if (teamModel()) return (await resolveAccountPlan(db, { orgId })).limits.fileSync;
+  return legacyCanSyncAttachments(orgId, db);
+}
+
+/** Vault-model standalone-file sync rule (today's per-org rule). */
+export async function legacyCanSyncAttachments(
+  orgId: string,
+  db: Queryable = defaultPool,
+): Promise<boolean> {
+  if (!billingEnabled()) return true;
+  return orgHasActiveSubscription(orgId, db);
+}
+
+/**
  * Can this user create another vault? Allowed when billing is off, or when
  * they own fewer than the cap in UNSUBSCRIBED vaults.
  */
@@ -141,8 +254,15 @@ export async function canCreateOrganization(
   userId: string,
   db: Queryable = defaultPool,
 ): Promise<{ allowed: boolean; limit: number }> {
-  const limit = config.freeMaxVaults;
+  if (teamModel()) {
+    // Team model: the creator's account (the one they own) gets the new vault.
+    const plan = await resolveAccountPlan(db, { userId });
+    const cap = plan.limits.vaults;
+    return { allowed: cap === null || plan.vaultsAttached < cap, limit: cap ?? plan.vaultsAttached + 1 };
+  }
+  let limit = config.freeMaxVaults;
   if (!billingEnabled()) return { allowed: true, limit };
+  limit = await freeVaultLimitForUser(userId, db);
   const owned = await countOwnedUnsubscribedOrgs(userId, db);
   return { allowed: owned < limit, limit };
 }
@@ -156,6 +276,19 @@ export async function canAddMember(
   orgId: string,
   db: Queryable = defaultPool,
 ): Promise<{ allowed: boolean; limit: number }> {
+  if (teamModel()) {
+    // Compat answer only; the call sites use `checkInviteSeat` / `checkJoinSeat`
+    // directly so they can say which limit (people vs seats) was hit.
+    const refused = await checkInviteSeat(db, orgId, null);
+    if (!refused) return { allowed: true, limit: config.freeMaxMembers };
+    return {
+      allowed: false,
+      limit:
+        refused.code === "seat_limit_reached" ? refused.seats
+        : refused.code === "member_limit_reached" ? refused.limit
+        : config.freeMaxMembers,
+    };
+  }
   const limit = config.freeMaxMembers;
   if (!billingEnabled()) return { allowed: true, limit };
   if (await orgHasActiveSubscription(orgId, db)) return { allowed: true, limit };

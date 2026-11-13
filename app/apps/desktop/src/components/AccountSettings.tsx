@@ -1,21 +1,65 @@
-import { useEffect, useState } from "react";
-import { ACTIVITY_STATUSES, type ActivityStatus } from "../lib/prefs";
-import { checkForUpdate, currentVersion, installUpdate, useUpdateState } from "../lib/updater";
+import { useEffect, useRef, useState } from "react";
+import { DEFAULT_SERVER_URL } from "../lib/api";
+import type { AccountSettingsTab } from "../lib/settingsTabs";
+import { authManager } from "../lib/auth/authManager";
+import { readRecentServers, switchServer } from "../lib/auth/recentServers";
+import { normalizeServerUrl, serverHost } from "../lib/auth/serverChoice";
+import {
+  ACTIVITY_STATUSES,
+  STATUS_MOMENTS,
+  EDITOR_FONTS,
+  type EditorFont,
+  type ActivityStatus,
+  writeServerChoice,
+} from "../lib/prefs";
+import type { PropertiesMode } from "../lib/editor/frontmatter";
+import {
+  checkAndAutoInstall,
+  currentVersion,
+  relaunchForUpdate,
+  useUpdateState,
+} from "../lib/updater";
 import { useStore } from "../store";
-import { Avatar } from "./Identity";
+import { updateView } from "../lib/updateView";
+import appIcon from "../assets/brand/app-icon.png";
+import {
+  CHARACTER_PREFIX,
+  PROFILE_CHARACTER_SEEDS,
+  PROFILE_IMAGE_MAX_CHARS,
+  PROFILE_IMAGE_PX,
+} from "../lib/profileAvatar";
+import { imageFileToSquareDataUrl } from "../lib/squareImage";
+import { InstalledAgentsList } from "./DashboardAgentRunner";
+import { AccountPlanTab } from "./AccountPlanTab";
+import { AccountVaultsTab } from "./AccountVaultsTab";
+import { AiToolsTab } from "./skills/AiToolsTab";
+import { Avatar } from "./Avatar";
+import { serverFailureMessage } from "./serverFailureMessage";
+import { SecurityCodeField } from "./SecurityCodeField";
+import { SettingsModal } from "./SettingsModal";
+import { SettingsCrossLink } from "./SettingsCrossLink";
 import { Switch } from "./Switch";
-import { ThemeToggle } from "./ThemeToggle";
+import { AppearanceRows } from "./AppearanceRows";
+import { MenuSelect } from "./MenuSelect";
+import { useShallow } from "zustand/react/shallow";
+import {
+  appearanceSource,
+  type AppearanceKey,
+  type AppearanceSettings,
+} from "../lib/appearanceSettings";
+import type { EditorMeasure } from "../lib/prefs";
 
 /**
- * Account settings — a dedicated full page (sibling to Vault settings) for
- * everything that follows the *user* rather than any one vault: profile
- * (name/avatar), activity status, appearance, notifications, the server it syncs
- * against, and app updates. Profile fields are server-backed (Better Auth) so
- * they follow the account across devices; status/notifications/theme/server are
- * device-local preferences.
+ * Account settings — a centered modal over the app (sibling to Vault settings,
+ * and sharing its shell in {@link SettingsModal}) for everything that follows
+ * the *user* rather than any one vault: profile (name/avatar), activity status,
+ * appearance, notifications, the server it syncs against, and app updates.
+ * Profile fields are server-backed (Better Auth) so they follow the account
+ * across devices; status/notifications/theme/server are device-local
+ * preferences.
  */
 
-type AccountTab = "profile" | "status" | "appearance" | "notifications" | "connection" | "about";
+type AccountTab = AccountSettingsTab;
 
 const ACCOUNT_TABS: Array<{ id: AccountTab; label: string; icon: React.ReactNode }> = [
   {
@@ -39,6 +83,28 @@ const ACCOUNT_TABS: Array<{ id: AccountTab; label: string; icon: React.ReactNode
     ),
   },
   {
+    id: "plan",
+    label: "Plan & Billing",
+    icon: (
+      <Icon>
+        <rect x="2" y="5" width="20" height="14" rx="2" />
+        <path d="M2 10h20" />
+      </Icon>
+    ),
+  },
+  {
+    id: "vaults",
+    label: "Vaults",
+    icon: (
+      <Icon>
+        <rect x="3" y="3" width="7" height="7" rx="1.5" />
+        <rect x="14" y="3" width="7" height="7" rx="1.5" />
+        <rect x="3" y="14" width="7" height="7" rx="1.5" />
+        <rect x="14" y="14" width="7" height="7" rx="1.5" />
+      </Icon>
+    ),
+  },
+  {
     id: "appearance",
     label: "Appearance",
     icon: (
@@ -55,6 +121,15 @@ const ACCOUNT_TABS: Array<{ id: AccountTab; label: string; icon: React.ReactNode
       <Icon>
         <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
         <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+      </Icon>
+    ),
+  },
+  {
+    id: "ai-tools",
+    label: "AI tools",
+    icon: (
+      <Icon>
+        <path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z" />
       </Icon>
     ),
   },
@@ -81,24 +156,24 @@ const ACCOUNT_TABS: Array<{ id: AccountTab; label: string; icon: React.ReactNode
   },
 ];
 
-export function AccountSettings({ onClose }: { onClose: () => void }) {
+export function AccountSettings({
+  onClose,
+  initialTab,
+}: {
+  onClose: () => void;
+  initialTab?: AccountSettingsTab;
+}) {
   const session = useStore((s) => s.session);
-  const [tab, setTab] = useState<AccountTab>("profile");
+  const [tab, setTab] = useState<AccountTab>(initialTab ?? "profile");
+  const vaultOpen = useStore((s) => s.vault !== null);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
+  // Esc, click-away, focus and the backdrop all live in `SettingsModal`.
   if (!session) return null;
   const activeTab = ACCOUNT_TABS.find((t) => t.id === tab)!;
   const userLabel = session.user.name || session.user.email;
 
   return (
-    <div className="settings-page">
+    <SettingsModal label="Account settings" onClose={onClose}>
       <header className="settings-page-header">
         <div className="settings-title">
           <span className="settings-eyebrow">Account settings</span>
@@ -122,18 +197,30 @@ export function AccountSettings({ onClose }: { onClose: () => void }) {
               <span className="menu-item-label">{t.label}</span>
             </button>
           ))}
+          {vaultOpen && (
+            <SettingsCrossLink
+              label="Vault settings"
+              onOpen={() => useStore.getState().requestSettings("general")}
+            />
+          )}
         </nav>
 
-        <section className="settings-content" aria-label={activeTab.label}>
+        <section key={tab} className="settings-content rd-tab-in" aria-label={activeTab.label}>
           <h2 className="settings-section-title">{activeTab.label}</h2>
           {tab === "profile" ? (
             <ProfileTab />
           ) : tab === "status" ? (
             <StatusTab />
+          ) : tab === "plan" ? (
+            <AccountPlanTab />
+          ) : tab === "vaults" ? (
+            <AccountVaultsTab />
           ) : tab === "appearance" ? (
             <AppearanceTab />
           ) : tab === "notifications" ? (
             <NotificationsTab />
+          ) : tab === "ai-tools" ? (
+            <AiToolsTab />
           ) : tab === "connection" ? (
             <ConnectionTab />
           ) : (
@@ -141,7 +228,7 @@ export function AccountSettings({ onClose }: { onClose: () => void }) {
           )}
         </section>
       </div>
-    </div>
+    </SettingsModal>
   );
 }
 
@@ -149,94 +236,284 @@ function ProfileTab() {
   const session = useStore((s) => s.session);
   const [name, setName] = useState(session?.user.name ?? "");
   const [image, setImage] = useState(session?.user.image ?? "");
-  const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  // While the name field has focus, a session refresh (our own save landing)
+  // must not overwrite what is still being typed.
+  const nameFocused = useRef(false);
 
   useEffect(() => {
-    setName(session?.user.name ?? "");
+    if (!nameFocused.current) setName(session?.user.name ?? "");
+  }, [session?.user.name]);
+  useEffect(() => {
     setImage(session?.user.image ?? "");
-  }, [session?.user.name, session?.user.image]);
+  }, [session?.user.image]);
+
+  // Everything saves as you go — no Save button. Only the changed field is
+  // sent; Better Auth's update-user takes a partial.
+  // The last name sent, so the blur save and the pause save never both go out.
+  const lastSentName = useRef<string | null>(null);
+  const persist = async (patch: { name?: string; image?: string | null }) => {
+    if (patch.name !== undefined) {
+      if (patch.name === lastSentName.current) return;
+      lastSentName.current = patch.name;
+    }
+    setSaving(true);
+    setError(null);
+    setSaved(false);
+    try {
+      await useStore.getState().updateProfile(patch);
+      setSaved(true);
+      window.setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      // A failed name save may be retried with the same text.
+      if (patch.name !== undefined) lastSentName.current = null;
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // The name saves a moment after typing stops (or on blur, below).
+  const savedName = session?.user.name ?? "";
+  const nameDraft = name.trim();
+  useEffect(() => {
+    if (nameDraft === savedName) return;
+    if (!nameDraft) {
+      setError("Name can't be empty.");
+      return;
+    }
+    const timer = window.setTimeout(() => void persist({ name: nameDraft }), 700);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nameDraft, savedName]);
+
+  // A picture pick or upload saves at once.
+  const changeImage = (next: string) => {
+    setImage(next);
+    void persist({ image: next.trim() || null });
+  };
 
   if (!session) return null;
   const trimmedName = name.trim();
   const trimmedImage = image.trim();
-  const dirty =
-    trimmedName !== (session.user.name ?? "") ||
-    trimmedImage !== (session.user.image ?? "");
 
-  const save = async () => {
-    if (!trimmedName) {
-      setError("Name can't be empty.");
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    setSaved(false);
+  // Re-sending the confirmation email: its own tiny state so a failure (this
+  // server has no email; the provider refused) is said next to the button.
+  const [resendBusy, setResendBusy] = useState(false);
+  const [resendState, setResendState] = useState<string | null>(null);
+  const resendConfirmation = async () => {
+    setResendBusy(true);
+    setResendState(null);
     try {
-      await useStore.getState().updateProfile({
-        name: trimmedName,
-        image: trimmedImage || null,
-      });
-      setSaved(true);
-      window.setTimeout(() => setSaved(false), 2500);
+      await useStore.getState().resendVerificationEmail();
+      setResendState("sent");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setResendState(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      setResendBusy(false);
     }
   };
 
   return (
     <div className="account-profile">
-      <div className="profile-hero">
-        <Avatar label={trimmedName || session.user.email} image={trimmedImage || null} />
-        <div className="profile-hero-meta">
-          <strong>{trimmedName || "—"}</strong>
-          <span className="muted">{session.user.email}</span>
+      {/* Settings rows: title + one-line hint on the left, the control on the
+          right, so a section title, a label and a value never read alike. */}
+      <div className="profile-rows">
+        <div className="profile-row">
+          <div className="profile-row-label">
+            <span className="profile-row-title">Photo</span>
+            <span className="profile-row-hint">
+              A picture or a character. Teammates see it in the sidebar and on your cursor.
+            </span>
+          </div>
+          <div className="profile-row-control profile-photo-control">
+            <Avatar
+              label={trimmedName || session.user.email}
+              image={trimmedImage || null}
+              userId={session.user.id}
+            />
+            <ProfilePictureActions image={trimmedImage} onChange={changeImage} onError={setError} />
+          </div>
         </div>
+
+        <div className="profile-row profile-row-top">
+          <div className="profile-row-label">
+            <span className="profile-row-title">Character</span>
+            <span className="profile-row-hint">Pick one instead of a photo.</span>
+          </div>
+          <div className="profile-row-control">
+            <ProfileCharacterGrid
+              label={trimmedName || session.user.email}
+              userId={session.user.id}
+              image={trimmedImage}
+              onChange={changeImage}
+            />
+          </div>
+        </div>
+
+        <div className="profile-row">
+          <label className="profile-row-label" htmlFor="profile-display-name">
+            <span className="profile-row-title">Display name</span>
+            <span className="profile-row-hint">Shown next to your notes and cursor.</span>
+          </label>
+          <div className="profile-row-control">
+            <input
+              id="profile-display-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onFocus={() => {
+                nameFocused.current = true;
+              }}
+              onBlur={() => {
+                nameFocused.current = false;
+                // Leaving the field saves now rather than after the pause.
+                if (nameDraft && nameDraft !== savedName) void persist({ name: nameDraft });
+              }}
+              placeholder="Your name"
+              autoComplete="name"
+            />
+          </div>
+        </div>
+
+        <div className="profile-row profile-row-top">
+          <div className="profile-row-label">
+            <span className="profile-row-title">Email</span>
+            <span className="profile-row-hint">Used to sign in and for invitations.</span>
+          </div>
+          <div className="profile-row-control">
+            <div className="profile-email">
+              <span className="profile-email-value">{session.user.email}</span>
+              {/* Verification state, live: the confirmation link bounces back
+                  into the app (`baalda://verified`), which re-reads the session,
+                  so this flips without a reload. `emailVerified` is absent on
+                  very old servers: say nothing rather than "not confirmed". */}
+              {session.user.emailVerified === true && (
+                <span className="profile-pill ok">Confirmed</span>
+              )}
+              {session.user.emailVerified === false && (
+                <span className="profile-pill warn">Not confirmed</span>
+              )}
+            </div>
+            {session.user.emailVerified === false && (
+              <span className="profile-row-hint profile-email-hint">
+                Check your inbox for the confirmation email.{" "}
+                <button
+                  type="button"
+                  className="linkish"
+                  disabled={resendBusy}
+                  onClick={() => void resendConfirmation()}
+                >
+                  {resendBusy ? "Sending…" : resendState === "sent" ? "Sent ✓" : "Resend it"}
+                </button>
+                {resendState && resendState !== "sent" && (
+                  <span className="update-status error"> {resendState}</span>
+                )}
+              </span>
+            )}
+          </div>
+        </div>
+        <SecurityCodeField />
       </div>
-
-      <label className="field">
-        <span className="field-label">Display name</span>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="Your name"
-          autoComplete="name"
-        />
-      </label>
-
-      <label className="field">
-        <span className="field-label">Avatar image URL</span>
-        <input
-          value={image}
-          onChange={(e) => setImage(e.target.value)}
-          placeholder="https://…/photo.jpg"
-          spellCheck={false}
-        />
-        <span className="field-hint">
-          Paste a link to a photo. Leave blank to use your generated character avatar.
-        </span>
-      </label>
-
-      <label className="field">
-        <span className="field-label">Email</span>
-        <input value={session.user.email} disabled readOnly />
-      </label>
 
       {error && <div className="auth-error">{error}</div>}
 
-      <div className="update-actions">
-        <button className="primary sm" disabled={busy || !dirty} onClick={() => void save()}>
-          {busy && <span className="btn-spinner" aria-hidden="true" />}
-          <span>Save changes</span>
+      <span className="update-status profile-save-status" role="status" aria-live="polite">
+        {saving ? "Saving…" : saved ? "Saved" : ""}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Profile → picture, in the same style as a vault's icon picker: your default
+ * character (seeded by your name), one of the preset characters, or an
+ * uploaded photo. A pick saves straight away.
+ */
+function ProfilePictureActions({
+  image,
+  onChange,
+  onError,
+}: {
+  /** The form's image value: "" = default character. */
+  image: string;
+  onChange: (image: string) => void;
+  onError: (message: string | null) => void;
+}) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const upload = async (file: File) => {
+    try {
+      onError(null);
+      onChange(await imageFileToSquareDataUrl(file, PROFILE_IMAGE_PX, PROFILE_IMAGE_MAX_CHARS));
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  return (
+    <div className="profile-hero-actions">
+      {image && (
+        <button type="button" className="link-btn" onClick={() => onChange("")}>
+          Use default
         </button>
-        {saved && (
-          <span className="update-status" role="status">
-            Saved.
-          </span>
-        )}
+      )}
+      <button type="button" className="secondary sm" onClick={() => fileRef.current?.click()}>
+        Upload image
+      </button>
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        hidden
+        onChange={(e) => {
+          const file = e.currentTarget.files?.[0];
+          e.currentTarget.value = "";
+          if (file) void upload(file);
+        }}
+      />
+    </div>
+  );
+}
+
+function ProfileCharacterGrid({
+  label,
+  userId,
+  image,
+  onChange,
+}: {
+  label: string;
+  userId: string;
+  image: string;
+  onChange: (image: string) => void;
+}) {
+  return (
+    <div className="profile-characters">
+      <div className="profile-character-grid" role="radiogroup" aria-label="Character">
+        <button
+          type="button"
+          className={`profile-character-option${image === "" ? " active" : ""}`}
+          role="radio"
+          aria-checked={image === ""}
+          title="Your default character"
+          onClick={() => onChange("")}
+        >
+          <Avatar label={label} userId={userId} image={null} />
+        </button>
+        {PROFILE_CHARACTER_SEEDS.map((seed) => {
+          const value = CHARACTER_PREFIX + seed;
+          return (
+            <button
+              key={seed}
+              type="button"
+              className={`profile-character-option${image === value ? " active" : ""}`}
+              role="radio"
+              aria-checked={image === value}
+              onClick={() => onChange(value)}
+            >
+              <Avatar label={label} image={value} />
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -244,12 +521,20 @@ function ProfileTab() {
 
 function StatusTab() {
   const activityStatus = useStore((s) => s.activityStatus);
+  // A status moment ("Coffee break") is none of the four options below, which
+  // left every radio unticked with no word about what was actually set.
+  const moment = STATUS_MOMENTS.find((m) => m.id === activityStatus);
 
   return (
     <div className="status-tab">
       <p className="muted">
         Your status shows next to your cursor for teammates working in the same note.
       </p>
+      {moment && (
+        <p className="field-hint">
+          Right now: {moment.label}, set from the account menu. Pick a status below to replace it.
+        </p>
+      )}
       <div className="status-options">
         {ACTIVITY_STATUSES.map((s) => {
           const active = s.id === activityStatus;
@@ -290,11 +575,83 @@ function StatusTab() {
 }
 
 function AppearanceTab() {
+  const editorFont = useStore((s) => s.editorFont);
+  const homeSectionHidden = useStore((s) => s.homeSectionHidden);
+  const overrides = useStore((s) => s.appearanceOverrides);
+  const vaultAppearance = useStore((s) => s.vaultAppearance);
+  const orgId = useStore((s) =>
+    s.vault && s.syncEnabled ? (s.session?.activeOrganizationId ?? null) : null,
+  );
+  const values = useStore(
+    useShallow((s) => ({
+      theme: s.themeMode,
+      autoColors: s.automaticItemColors,
+      contentWidth: s.editorMeasure,
+      textSize: s.editorFontSize,
+      lineNumbers: s.lineNumbers,
+      properties: s.propertiesMode,
+    })),
+  );
+  // A synced vault always has a value for every row (a key it never saved is
+  // the app default), so treat it as present even before its row has loaded.
+  const vault = orgId ? (vaultAppearance[orgId] ?? {}) : null;
+  const set = <K extends AppearanceKey>(key: K, value: AppearanceSettings[K] | undefined) => {
+    const st = useStore.getState();
+    // The legacy setters also keep the old per-key storage current.
+    if (key === "autoColors") st.setAutomaticItemColors(value as boolean);
+    else if (key === "contentWidth") st.setEditorMeasure(value as EditorMeasure);
+    else if (key === "textSize") st.setEditorFontSize(value as number);
+    else if (key === "lineNumbers") st.setLineNumbers(value as boolean);
+    else if (key === "properties") st.setPropertiesMode(value as PropertiesMode);
+    else st.setAppearanceOverride(key, value);
+  };
   return (
+    <>
+    <label className="menu-row toggle-row">
+      <span className="menu-row-label">Show Home section
+        <span className="field-hint">Turning this off unsets your Home and stops it opening at startup on this device.</span>
+      </span>
+      <Switch checked={!homeSectionHidden} ariaLabel="Show Home section"
+        onChange={(show) => useStore.getState().setHomeSectionHidden(!show)} />
+    </label>
+    <AppearanceRows
+      mode="personal"
+      values={values}
+      onChange={set}
+      trailing={(key) => {
+        const source = appearanceSource(key, overrides, vault);
+        if (source === "vault") return <span className="appearance-tag">Vault default</span>;
+        if (source === "personal" && vault) {
+          return (
+            <button
+              type="button"
+              className="link-btn appearance-clear"
+              onClick={(e) => {
+                e.preventDefault();
+                useStore.getState().setAppearanceOverride(key, undefined);
+              }}
+            >
+              Reset to vault default
+            </button>
+          );
+        }
+        return null;
+      }}
+    />
     <div className="menu-row">
-      <span className="menu-row-label">Theme</span>
-      <ThemeToggle />
+      <span className="menu-row-label">
+        Note font
+        <span className="field-hint">The typeface notes are written in, on this device.</span>
+      </span>
+      <MenuSelect<EditorFont>
+        value={editorFont}
+        options={EDITOR_FONTS.map((f) => ({ value: f.id, label: f.label, hint: f.hint }))}
+        onSelect={(f) => useStore.getState().setEditorFont(f)}
+        ariaLabel="Note font"
+        triggerClassName="role-field-trigger"
+      />
     </div>
+    </>
   );
 }
 
@@ -315,74 +672,200 @@ function NotificationsTab() {
   );
 }
 
-function ConnectionTab() {
+export function ConnectionTab() {
   const serverUrl = useStore((s) => s.serverUrl);
+  const addressInput = useRef<HTMLInputElement>(null);
   const [draft, setDraft] = useState(serverUrl);
+  const [recent, setRecent] = useState(readRecentServers);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => setDraft(serverUrl), [serverUrl]);
+  useEffect(() => {
+    setDraft(serverUrl);
+    // Read only: opening the tab must not reorder the history. Recents are
+    // recorded by a switch that actually landed (`switchServer`).
+    setRecent(readRecentServers());
+  }, [serverUrl]);
+
+  /**
+   * Check the address answers BEFORE adopting it. Changing the server is a
+   * de-facto sign-out (the session lives under a per-server keychain key), so a
+   * typo used to swap a working session for a signed-out app and no message at
+   * all — `save` had a `finally` and no `catch`.
+   */
+  // Compare the normalized address, so "https://x.example/" still selects
+  // its recent entry instead of the placeholder.
+  const draftUrl = normalizeServerUrl(draft);
+  const selectedRecent = draftUrl && recent.includes(draftUrl) ? draftUrl : "";
+  const activeUrl = normalizeServerUrl(serverUrl);
 
   const save = async () => {
+    const url = normalizeServerUrl(draft);
+    if (!url) {
+      setError("That doesn't look like a server address. Try https://notes.example.com");
+      return;
+    }
     setBusy(true);
     setSaved(false);
+    setError(null);
     try {
-      await useStore.getState().setServerUrl(draft.trim());
+      await authManager.api.health(url);
+      // Another flow (an invite link's Connect, a sign-in) can take the switch
+      // over; then nothing was saved here, so say nothing. The managed/custom
+      // choice is written only once the switch landed.
+      const switched = await switchServer(url, {
+        switchTo: (next) => useStore.getState().setServerUrl(next),
+        writeChoice: writeServerChoice,
+        defaultUrl: DEFAULT_SERVER_URL,
+        previousUrl: serverUrl,
+      });
+      if (!switched) return;
+      setRecent(readRecentServers());
       setSaved(true);
       window.setTimeout(() => setSaved(false), 2500);
+    } catch (e) {
+      setError(serverFailureMessage(e, url));
     } finally {
       setBusy(false);
     }
   };
 
+  // Redesign: two clear choices. Baalda Cloud is the managed server; anything
+  // else is "your own", which is the only case that needs an address typed.
+  const cloudUrl = normalizeServerUrl(DEFAULT_SERVER_URL);
+  const isCloud = draftUrl === cloudUrl;
+  const pick = (url: string) => {
+    setDraft(url);
+    setSaved(false);
+    setError(null);
+  };
+
   return (
-    <div className="connection-tab">
-      <label className="field">
-        <span className="field-label">Server URL</span>
-        <input
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          placeholder="https://api.baalda.com"
-          spellCheck={false}
-        />
-        <span className="field-hint">
-          The Baalda server this device syncs against. Use the managed service or point at your own.
-        </span>
-      </label>
-      <div className="update-actions">
+    <div className="connection-tab conn-b">
+      <p className="field-hint">Choose where your notes sync. You sign in separately on each server.</p>
+      <div className="conn-options" role="radiogroup" aria-label="Server">
         <button
+          type="button"
+          role="radio"
+          aria-checked={isCloud}
+          className={`conn-option${isCloud ? " is-selected" : ""}`}
+          disabled={busy}
+          onClick={() => pick(DEFAULT_SERVER_URL)}
+        >
+          <span className="conn-radio" aria-hidden="true" />
+          <span className="conn-tile is-cloud" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 18a5 5 0 0 0-1-9.9 7 7 0 0 0-13 3.4A4 4 0 0 0 4 18h13z" /></svg>
+          </span>
+          <b>Baalda Cloud</b>
+          <span className="conn-option-hint">Managed by us. Nothing to set up.</span>
+        </button>
+        <div
+          role="radio"
+          aria-checked={!isCloud}
+          tabIndex={0}
+          className={`conn-option${!isCloud ? " is-selected" : ""}`}
+          onClick={() => {
+            if (isCloud) pick(selectedRecent && selectedRecent !== cloudUrl ? selectedRecent : "");
+            window.setTimeout(() => addressInput.current?.focus(), 0);
+          }}
+          onKeyDown={(e) => {
+            if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) {
+              e.preventDefault();
+              if (isCloud) pick("");
+              addressInput.current?.focus();
+            }
+          }}
+        >
+          <span className="conn-radio" aria-hidden="true" />
+          <span className="conn-tile is-own" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="4" width="18" height="7" rx="2" /><rect x="3" y="13" width="18" height="7" rx="2" /><path d="M7 7.5h.01M7 16.5h.01" /></svg>
+          </span>
+          <b>Your own server</b>
+          <span className="conn-option-hint">Self-hosted Baalda. Your data, your machine.</span>
+        </div>
+      </div>
+      {/* Below the two cards, not inside one: growing a card made both
+          cards resize and jump whenever the choice flipped. */}
+      {!isCloud && (
+        <input
+          ref={addressInput}
+          className="conn-address"
+          value={draft}
+          disabled={busy}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setSaved(false);
+            setError(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void save();
+          }}
+          placeholder="https://notes.example.com"
+          aria-label="Server address"
+          spellCheck={false}
+          autoCapitalize="off"
+        />
+      )}
+      {recent.length > 0 && (
+        <div className="conn-recent">
+          <span className="conn-recent-label">Recent</span>
+          <div className="conn-chips" role="group" aria-label="Recent connections">
+            {recent.map((url) => (
+              <button
+                key={url}
+                type="button"
+                className={`conn-chip${url === draftUrl ? " is-picked" : ""}${url === activeUrl ? " is-active" : ""}`}
+                disabled={busy}
+                aria-pressed={url === draftUrl}
+                title={url === activeUrl ? `${url} (active)` : url}
+                onClick={() => pick(url)}
+              >
+                {serverHost(url)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="conn-foot">
+        <span className="conn-status" role="status">
+          {saved ? "Reconnected." : `Connected to ${serverHost(serverUrl)}`}
+        </span>
+        <button
+          type="button"
           className="primary sm"
-          disabled={busy || draft.trim() === serverUrl}
+          disabled={busy || !draft.trim() || normalizeServerUrl(draft) === serverUrl}
           onClick={() => void save()}
         >
           {busy && <span className="btn-spinner" aria-hidden="true" />}
-          <span>Save &amp; reconnect</span>
+          <span>Connect</span>
         </button>
-        {saved && (
-          <span className="update-status" role="status">
-            Reconnected.
-          </span>
-        )}
       </div>
+      {error && <div className="auth-error">{error}</div>}
     </div>
   );
 }
 
 function AboutTab({ onClose }: { onClose: () => void }) {
   const update = useUpdateState();
+  const serverUrl = useStore((s) => s.serverUrl);
+  const email = useStore((s) => s.session?.user.email ?? "");
   const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
     void currentVersion().then(setVersion);
   }, []);
 
+  // Updates install themselves, so this button only kicks off the same silent
+  // path the launch check and the poll use — there is no Install step to offer.
   const busy =
     update.phase === "checking" ||
+    update.phase === "available" ||
     update.phase === "downloading" ||
-    update.phase === "installing";
+    update.phase === "installing" ||
+    update.phase === "ready";
 
   let statusText: string | null = null;
-  let statusError = false;
   switch (update.phase) {
     case "checking":
       statusText = "Checking for updates…";
@@ -391,69 +874,131 @@ function AboutTab({ onClose }: { onClose: () => void }) {
       statusText = "You're on the latest version.";
       break;
     case "available":
-      statusText = "An update is available.";
+      statusText = `Version ${update.version} found. Starting the download…`;
       break;
     case "downloading":
       statusText =
         update.total > 0
-          ? `Downloading ${update.version} — ${Math.round((update.downloaded / update.total) * 100)}%`
+          ? `Downloading ${update.version}: ${Math.round((update.downloaded / update.total) * 100)}%`
           : `Downloading ${update.version}…`;
       break;
     case "installing":
-      statusText = `Installing ${update.version} — the app will restart…`;
+      statusText = `Installing ${update.version}…`;
+      break;
+    case "ready":
+      statusText = `Version ${update.version} is installed. Restarting shortly.`;
+      break;
+    case "pending":
+      // The server already runs a newer release than the feed can serve yet;
+      // the check retries on its own. Quiet on purpose — nothing is wrong.
+      statusText = "An update is on its way.";
       break;
     case "error":
       statusText = `Couldn't check for updates: ${update.message}`;
-      statusError = true;
+      break;
+    case "failed":
+      statusText = `Couldn't install version ${update.version}${update.message ? `: ${update.message}` : ""}`;
       break;
   }
 
   return (
     <div className="about-tab">
-      <div className="menu-row">
-        <span className="menu-row-label">Current version</span>
-        <span className="mono">{version ?? "…"}</span>
-      </div>
+      {/* One card for every update state, so nothing jumps between steps. */}
+      <UpdateCard
+        view={updateView(update, version)}
+        statusText={statusText}
+        busy={busy}
+        onCheck={() => void checkAndAutoInstall()}
+        onRestart={() => void relaunchForUpdate()}
+      />
 
-      <div className="update-actions">
-        <button
-          className="primary sm update-check-btn"
-          disabled={busy}
-          aria-busy={busy}
-          onClick={() => void checkForUpdate()}
-        >
-          {busy && <span className="btn-spinner" aria-hidden="true" />}
-          <span>Check for updates</span>
-        </button>
-        <span className={`update-status${statusError ? " error" : ""}`} role="status" aria-live="polite">
-          {statusText}
-        </span>
-      </div>
-
-      {update.phase === "available" && (
-        <div className="update-detail">
-          <div className="subhead">Version {update.version} available</div>
-          {update.notes && <div className="muted release-notes">{update.notes}</div>}
-          <button className="primary sm" onClick={() => void installUpdate()}>
-            Install &amp; Restart
-          </button>
+      <div className="profile-rows about-rows">
+        <div className="profile-row profile-row-top">
+          <div className="profile-row-label">
+            <span className="profile-row-title">Installed agents</span>
+            <span className="profile-row-hint">Used to update dashboards. Found when Baalda starts.</span>
+          </div>
+          <div className="profile-row-control">
+            <InstalledAgentsList />
+          </div>
         </div>
-      )}
+        <div className="profile-row">
+          <div className="profile-row-label">
+            <span className="profile-row-title">Server</span>
+            <span className="profile-row-hint">Where your notes sync.</span>
+          </div>
+          <div className="profile-row-control about-inline">
+            <span className="about-value">
+              <span className="about-live-dot" aria-hidden="true" />
+              {serverHost(serverUrl)}
+            </span>
+          </div>
+        </div>
+        <div className="profile-row">
+          <div className="profile-row-label">
+            <span className="profile-row-title">Account</span>
+            <span className="profile-row-hint">Signing out keeps your notes on this computer.</span>
+          </div>
+          <div className="profile-row-control about-inline">
+            <span className="about-value">{email}</span>
+            <button
+              type="button"
+              className="about-signout"
+              onClick={() => {
+                onClose();
+                void useStore.getState().signOut();
+              }}
+            >
+              Sign out
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
-      <div className="menu-sep" />
-      <button
-        className="menu-item danger"
-        onClick={() => {
-          onClose();
-          void useStore.getState().signOut();
-        }}
-      >
-        <Icon>
-          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-          <path d="M16 17l5-5-5-5M21 12H9" />
-        </Icon>
-        <span className="menu-item-label">Sign out</span>
-      </button>
+/** About's update card: mark, version and status, the one action, progress. */
+function UpdateCard({
+  view,
+  statusText,
+  busy,
+  onCheck,
+  onRestart,
+}: {
+  view: ReturnType<typeof updateView>;
+  statusText: string | null;
+  busy: boolean;
+  onCheck: () => void;
+  onRestart: () => void;
+}) {
+  return (
+    <div className={`update-card is-${view.tone}`}>
+      <div className="update-card-row">
+        <img className="update-card-mark is-icon" src={appIcon} alt="" aria-hidden="true" />
+        <div className="update-card-text">
+          <span className="update-card-title">{view.title}</span>
+          <span className="update-card-sub" role="status" aria-live="polite">
+            {view.tone === "ok" || view.tone === "ready" ? <span className="update-card-dot" aria-hidden="true" /> : null}
+            {view.sub || statusText}
+          </span>
+        </div>
+        {view.tone === "busy" && view.percent === null && <span className="btn-spinner update-card-spin" aria-hidden="true" />}
+        {view.action === "restart" ? (
+          <button type="button" className="update-card-btn is-ink" onClick={onRestart}>
+            Restart now
+          </button>
+        ) : view.action ? (
+          <button type="button" className="update-card-btn" disabled={busy} onClick={onCheck}>
+            {view.action === "retry" ? "Try again" : "Check for updates"}
+          </button>
+        ) : null}
+      </div>
+      {view.percent !== null && (
+        <span className="update-card-bar" aria-hidden="true">
+          <b style={{ width: `${view.percent}%` }} />
+        </span>
+      )}
     </div>
   );
 }
@@ -476,3 +1021,4 @@ function Icon({ children }: { children: React.ReactNode }) {
 }
 
 export { AccountSettings as default };
+

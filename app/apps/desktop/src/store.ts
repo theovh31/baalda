@@ -3,61 +3,172 @@
 // and autosave. Phase 2/3 adds auth, vault (org), and sync view-state; the
 // heavy lifting lives in lib/auth, lib/sync — the store just mirrors it for React.
 
+import { setSelfAvatarImage } from "./lib/avatarIdentity";
 import { create } from "zustand";
 import * as ipc from "./lib/ipc";
+import { DOCUMENTS_BLOCKED_TEXT, isDocumentsDenied } from "./lib/vault/folderErrors";
 import { bridgeManager } from "./lib/bridge";
+import { resetVaultKeySessions } from "./lib/vaultKeys/session";
+import {
+  onVaultKeyBlockChange,
+  VAULT_KEY_PAUSE_REASON,
+  vaultKeysEarlyChannel,
+  vaultKeysGate,
+  vaultKeysMembershipEnded,
+  vaultKeysPasswordUnlock,
+  rememberInviteSecret,
+  claimInviteSecret,
+  offerJoinSecret,
+  joinCodeSecret,
+} from "./lib/vaultKeys/runtime";
+import { loadRememberedPassword } from "./lib/rememberedPassword";
+import { allowLaunchUnlock, runLaunchUnlock } from "./lib/vaultKeys/launchUnlock";
+import { clearVaultKeyCache } from "./lib/vaultKeys/store";
 import {
   colorsAdopted,
   markColorsAdopted,
   readItemColors,
   writeItemColors,
 } from "./lib/appearance";
-import { readItemOrder, writeItemOrder, type ItemOrder } from "./lib/ordering";
+import { lockBlocksCaller, lockScopesByPath } from "./lib/locks";
+import { readItemOrder, renameInOrder, writeItemOrder, type ItemOrder } from "./lib/ordering";
 import { loadedFolderPaths, mergeChildren, nodeAt, setChildrenAt } from "./lib/tree/lazyTree";
 import { applyTitlePatch } from "./lib/tree/titles";
 import {
   ApiError,
   type BillingConfig,
   type Invitation,
+  type InvitationPreview,
   type Member,
+  type MyBilling,
   type NoteLastEdited,
   type NoteVersion,
   type OrgBilling,
   type Organization,
   type SessionInfo,
   type Share,
+  type CheckpointSchedule,
   type VaultCheckpoint,
+  type UnsyncResult,
+  type VaultDeleteResult,
   type VaultRevertResult,
   vaultOrgId,
   vaultRootFrozen,
 } from "./lib/api";
 import { authManager } from "./lib/auth/authManager";
+import {
+  effectiveAppearance,
+  APPEARANCE_KEYS,
+  withAppearance,
+  type AppearanceKey,
+  type AppearanceSettings,
+  type VaultAppearanceSettings,
+} from "./lib/appearanceSettings";
+import { readPersonalPins, readPersonalHome, writePersonalPins, writePersonalHome, renamePinnedFolders, togglePinned, effectiveHomeNote, shouldFollowSharedHome, type PinnedItem } from "./lib/pins";
+import { applyEffectiveTheme, type ThemeMode } from "./lib/theme";
 import { syncManager } from "./lib/sync/docSession";
+import { pauseSkillsSync } from "./lib/skills/syncHost";
 import { vaultScopes } from "./lib/sync/vaultScope";
+import { reconcileReport } from "./lib/sync/reconcileReport";
+import { vaultVisibility, type VaultVisibility } from "./lib/sync/vaultVisibility";
+import { resetMembersAccessCaches } from "./lib/membersAccessCaches";
 import type { SyncStatus } from "./lib/sync/syncManager";
 import type { DocSyncState, SyncProgress } from "./lib/sync/vaultScope";
 import type { VaultPeer } from "./lib/sync/vaultSyncEngine";
-import type { VoiceSpeaker } from "./lib/sync/docSession";
+import type { StructureNotice, VoiceSpeaker } from "./lib/sync/docSession";
+import type { SyncPause } from "./lib/sync/syncPause";
+import type { OAuthConsentLink } from "./lib/oauthConsentLink";
 import { MicPermissionError } from "./lib/voice/capture";
+import * as perf from "./lib/perf";
 import { createWithUniqueSlug, slugifyName } from "./lib/orgSlug";
+import { readLocalVaultIcon, resolveVaultIcon, serializeVaultIcon } from "./lib/vaultIcon";
 import {
   type ActivityStatus,
+  type EditorMeasure,
   readActivityStatus,
+  readActivityStatusUntil,
+  readAppearanceOverrides,
+  writeAppearanceOverrides,
+  readAutomaticItemColors,
   readMentionSound,
+  readEditorMeasure,
+  readEditorFontSize,
+  writeEditorFontSize,
+  applyEditorFontSize,
+  readEditorFont,
+  writeEditorFont,
+  applyEditorFont,
+  type EditorFont,
+  readLineNumbers,
+  readHomeSectionHidden,
+  writeHomeSectionHidden,
+  readPropertiesMode,
   readTreeSort,
+  readFolderSorts,
+  writeFolderSorts,
   writeActivityStatus,
+  writeAutomaticItemColors,
   writeMentionSound,
+  writeEditorMeasure,
+  writeLineNumbers,
+  writePropertiesMode,
   writeTreeSort,
 } from "./lib/prefs";
-import type { TreeSort } from "./lib/tree/sort";
+import type { PropertiesMode } from "./lib/editor/frontmatter";
+import { renameInFolderSorts, type FolderSorts, type TreeSort } from "./lib/tree/sort";
+import type { AccountSettingsTab, SettingsTab } from "./lib/settingsTabs";
+import type { BackendStatus } from "./lib/serverFeatures";
 import { seedWelcomeContent, vaultIsEmpty, WELCOME_NOTE_PATH } from "./lib/vault/seed";
 import { planLanding } from "./lib/vault/landing";
-import { planTurnOnSync } from "./lib/vault/turnOnSync";
-import { configOrgId, rediscoverVaultFolder } from "./lib/vault/rediscover";
+import { foreignFolderMessage, planTurnOnSync } from "./lib/vault/turnOnSync";
+import { planUnsyncStamp } from "./lib/vault/unsyncPlan";
+import {
+  checkFailure,
+  chunk,
+  forgetMembership,
+  frameTargetsMe,
+  knownMemberships,
+  markMembershipCheckUnsupported,
+  membershipCheckUnsupported,
+  membershipLostNotice,
+  orgIdsToCheck,
+  rememberMemberships,
+  removalsFromCheck,
+  type MembershipLossReason,
+} from "./lib/vault/membershipLost";
+import { forgetTeamAccessCache } from "./lib/teamAccessCache";
+import { planOpen } from "./lib/sync/openGate";
+import { IPC_CONCURRENCY, runPool } from "./lib/sync/pool";
+import { rediscoverVaultFolder } from "./lib/vault/rediscover";
+import {
+  MISSING_FOLDER_SETTLE_MS,
+  planMissingFolder,
+  reboundToastText,
+} from "./lib/vault/missingFolder";
 import { playJoinChime } from "./lib/celebrate/celebrate";
-import { viewingDocId } from "./lib/presence/viewingDocId";
 import { dismissToast, toast } from "./lib/toast";
+import { classifyLimitError, limitFromError, vaultLimitReason } from "./lib/billing";
+import { isEditorNote } from "./lib/notePath";
+import { isNoteExt } from "./lib/formats";
 import { parseNoteLink } from "./lib/shareLink";
+import { parseInviteDeepLink } from "./lib/inviteLink";
+import type { AccountLinkKind } from "./lib/accountLink";
+import { normalizeServerUrl } from "./lib/auth/serverChoice";
+import { readLastTab, writeLastTab, type RightPanelTab } from "./components/rightPanelTab";
+import { forgetPersisted } from "./components/reviewModel";
+import {
+  neighbourAfterClose,
+  upsertTab,
+  type VirtualTab,
+} from "./components/virtualTabs";
+import {
+  acceptInviteFailureMessage,
+  clearPendingInvite,
+  INVITE_GONE_MESSAGE,
+  peekPendingInvite,
+  queueInvite,
+  takePendingInvite,
+} from "./lib/inviteFlow";
 import {
   clearPendingNoteLink,
   hasPendingNoteLink,
@@ -72,10 +183,23 @@ import {
  *  explanation per note is enough; the retry is automatic. */
 const registerFailureToasted = new Set<string>();
 
+/** One access change the Activity feed lists (session-only). */
+export type AccessEvent =
+  | { kind: "removed"; at: number; vaultId: string | null; docId: string; path: string; self?: boolean }
+  | { kind: "granted"; at: number; vaultId: string | null; count: number; paths?: string[] };
+const ACCESS_EVENTS_MAX = 200;
+
 export interface OpenNote {
   path: string;
   /** doc_id from the index — the stable Yjs document id for this note. */
   id: string | null;
+  /**
+   * The INDEXED title (frontmatter `title:` → first H1 → stem, from Rust
+   * `parse.rs derive_title`), snapshotted at open. Never a display label: the
+   * UI shows the file name through `lib/notePath.ts noteLabel`, which is what
+   * stopped the header, the tab and the sidebar from disagreeing. This field
+   * exists only to hand `registry.registerNote` the server-side registry title.
+   */
   title: string;
 }
 
@@ -94,33 +218,125 @@ export interface PendingVaultFolder {
   /** Why the prompt appeared, when it wasn't a plain "new vault needs a folder"
    *  (e.g. the vault's bound folder exists but failed to open). The folder path
    *  is kept separate so the UI can typeset it on its own line. */
-  reason?: { text: string; path: string | null } | null;
+  reason?: {
+    text: string;
+    path: string | null;
+    /** The vault's folder is GONE (not merely failed to open): the prompt then
+     *  offers Restore here / Locate folder…, like the in-vault banner (#228). */
+    missing?: boolean;
+    /** macOS refused Baalda the Documents folder, so the default vaults root
+     *  couldn't be created: the prompt offers Open System Settings / Try again
+     *  and only a secondary "Choose another folder…". */
+    documentsDenied?: boolean;
+  } | null;
   /** The vault was JUST created, so the folder it lands in may receive
    *  first-run starter content if empty. Never set for existing vaults. */
   seedIfEmpty?: boolean;
+}
+
+/** What `inviteMember` reports back to the Members tab. */
+export interface InviteResult {
+  invitation: Invitation;
+  /** True when the server accepted the email for delivery. */
+  emailed: boolean;
+  /** Why it wasn't emailed, when the server tried and failed. Null when this
+   *  server simply doesn't send email (then the link is the delivery). */
+  emailError: string | null;
 }
 
 interface AppStore {
   vault: ipc.VaultInfo | null;
   tree: ipc.TreeNode | null;
   openNote: OpenNote | null;
-  /** Paths of the files held open as tabs, in the order they were opened. The
-   *  ACTIVE tab is `openNote.path` — this list is only which tabs exist, so the
-   *  two never disagree about what's on screen. Session-only, vault-scoped. */
+  /** Paths of the files held open as tabs, in the order they were opened —
+   *  a tab never moves once it exists, so the strip stays a stable map of where
+   *  things are and only the highlight travels. The ACTIVE tab is
+   *  `openNote.path`; this list is only which tabs exist, so the two never
+   *  disagree about what's on screen. Session-only, vault-scoped. */
   openTabs: string[];
+  /** Non-note tabs (recovery copy, trash preview, review). See
+   *  `components/virtualTabs.ts`. Session-only, vault-scoped. */
+  virtualTabs: VirtualTab[];
+  /** The virtual tab on screen, or null when the note editor is. Opening a note
+   *  clears it; `openNote` is never touched by a virtual tab. */
+  activeVirtualTab: string | null;
+  openVirtualTab: (tab: VirtualTab) => void;
+  activateVirtualTab: (id: string | null) => void;
+  closeVirtualTab: (id: string) => void;
   /** True when the open note's file was deleted out from under us. */
   noteRemoved: boolean;
   /**
-   * Set when the note that was open was deleted by a TEAMMATE (or an AI) and we
-   * applied that locally: the trash-relative path the local copy was moved to, so
-   * the UI can say where it went. Distinct from `noteRemoved`, which means "the
-   * file vanished from under us" (a Finder delete) and offers no recovery hint.
+   * Was that note SYNCED when its file vanished — i.e. is the disk delete being
+   * propagated to the team (see `SyncManager.drainDiskDeletes`)?
+   *
+   * Latched by `setNoteRemoved` rather than read live, because propagating the
+   * delete drops the note's `docIdByPath` entry: a live read would re-word the
+   * banner a couple of seconds after it appeared.
    */
-  noteRemovedByTeammate: string | null;
+  noteRemovedSynced: boolean;
+  /**
+   * Set when the note that was open left because of a TEAMMATE (or an AI) and we
+   * applied that locally. `deleted`: they deleted it, and `trashedTo` is the
+   * trash-relative path the local copy was moved to, so the UI can say where it
+   * went. `revoked`: our access was taken away — the file is removed outright
+   * (no local copy is kept; the server still has it) and `trashedTo` is `null`.
+   * Distinct from `noteRemoved`, which means "the file vanished from under us"
+   * (a Finder delete) and offers no recovery hint.
+   */
+  noteRemovedByTeammate: { reason: "deleted" | "revoked"; trashedTo: string | null } | null;
+  /**
+   * Access changes this session, newest last, for the Activity feed. Fed by the
+   * sync layer's `onNoteRemoved(reason: "revoked")`. Session-only, never persisted,
+   * tagged with the server vault id so the feed shows only the open vault's. Capped at ACCESS_EVENTS_MAX.
+   */
+  accessEvents: AccessEvent[];
+  /**
+   * What the sync layer says about the vault's STRUCTURE while it is open
+   * (#221, `SyncManager.structureNotice`): the vault folder vanished, a live
+   * bulk delete is waiting for an answer, or renames/moves/deletes were made
+   * while the app was closed. Mirrored for the banners; the sync layer owns it.
+   */
+  structureNotice: StructureNotice;
+  /**
+   * A missing vault folder inside the vaults root was recreated automatically
+   * (2026-10-09) — drives the informational "restored it" notice, whose one
+   * action locates the original folder instead.
+   */
+  folderAutoRestored: { orgId: string; name: string; path: string } | null;
+  dismissFolderAutoRestored: () => void;
+  /** The notice's "Locate the original instead…": bind a folder the user picks. */
+  locateOriginalVaultFolder: () => Promise<void>;
+  /**
+   * Mirror the sync layer's notice. The moment the vault folder goes missing
+   * (#228) the open tabs close: every one of them names a file that is gone.
+   */
+  applyStructureNotice: (notice: StructureNotice) => void;
+  /** Release the held bulk delete so the pull restores the notes ("Restore now", Dismiss or fade). */
+  releaseBulkDelete: (how: "restore" | "dismiss") => Promise<void>;
+  /** Hide the closed-app change notice for this open. */
+  dismissClosedAppChanges: () => void;
   /** Follow an inbound rename: re-point the open note (and its descendants). */
   followNoteRename: (from: string, to: string) => void;
+  /**
+   * Rename/move a note's file and carry everything that hangs off the path
+   * with it: server registry (doc_id preserved), sidebar order, open tabs and
+   * the open note. Picks a free name (`Name 1`, `Name 2`, …) when `newPath` is
+   * taken. Resolves to the path actually used, or null if none was free.
+   */
+  renameNoteFile: (oldPath: string, newPath: string) => Promise<string | null>;
+  /**
+   * The same rename WITHOUT the dedup loop: the caller's name is used or the
+   * call throws. That is the right shape for a name a person just typed — the
+   * inline title reports "a note called X already exists" and keeps focus,
+   * where silently landing them on `X 1` would be a lie. `renameNoteFile` is
+   * this plus the dedup, so there is one rename implementation, not two.
+   */
+  renameNoteFileExact: (oldPath: string, newPath: string) => Promise<boolean>;
   backlinks: ipc.Backlink[];
   titles: ipc.NoteTitle[];
+  /** Every `#tag` in the vault, most-used first — the editor's `#` completion
+   *  source. Refreshed alongside `titles`, from the same index. */
+  tags: ipc.TagCount[];
 
   // ---- Auth / vault / sync ----
   authStatus: AuthStatus;
@@ -128,13 +344,44 @@ interface AppStore {
   serverUrl: string;
   authError: string | null;
   /**
-   * A flow needs the sign-in dialog on screen NOW (currently only "note-link":
-   * a shared link arrived while signed out, and the link is queued to open
-   * right after the sign-in succeeds). App.tsx mounts AuthDialog off this in
-   * both root branches; dismissing the dialog clears the queued link too.
+   * A flow needs the sign-in dialog on screen NOW. Three of them:
+   *   - "note-link": a shared link arrived while signed out, and the link is
+   *     queued to open right after the sign-in succeeds;
+   *   - "server-link": a `baalda://connect` invite arrived, offering a server
+   *     to point this device at (see `pendingServerLink`);
+   *   - "invite": a team invitation arrived while signed out, and the dialog
+   *     says which vault and which address it is for (see `invitePrompt`);
+   *   - "sign-in": a password was just reset in the browser (`baalda://signin`),
+   *     this device's session died with it, and the card opens ready for the
+   *     new password.
+   * App.tsx mounts AuthDialog off this in both root branches; dismissing the
+   * dialog clears the queued link / offered server / queued invite too.
    */
-  authPrompt: "note-link" | null;
-  setAuthPrompt: (prompt: "note-link" | null) => void;
+  authPrompt: "note-link" | "server-link" | "invite" | "sign-in" | null;
+  setAuthPrompt: (prompt: "note-link" | "server-link" | "invite" | "sign-in" | null) => void;
+  /**
+   * The invitation the sign-in dialog is currently about, when one arrived
+   * while signed out.
+   *
+   * Store state (unlike the queued invite in `inviteFlow`) because this is
+   * exactly what the dialog RENDERS: the vault name, who invited them, and the
+   * address the invitation was sent to — without which the card is an
+   * unexplained password prompt raised by a link click.
+   */
+  invitePrompt: InvitationPreview | null;
+  clearInvitePrompt: () => void;
+  /**
+   * A server URL an invite link is offering, awaiting the user's explicit yes.
+   *
+   * Parked here rather than applied on arrival because a deep link is untrusted
+   * input and this particular value decides where a password gets posted — so
+   * nothing calls `setServerUrl` until someone clicks Connect.
+   */
+  pendingServerLink: string | null;
+  /** Park an inbound connect link and raise the auth dialog on its confirm step. */
+  promptServerLink: (serverUrl: string) => void;
+  /** Drop the offer (declined, or already adopted) without closing the dialog. */
+  clearServerLink: () => void;
   /**
    * A sign-in has landed but we're still resolving which vault to open (and
    * possibly creating it, its folder, and its starter notes — a few seconds).
@@ -144,30 +391,73 @@ interface AppStore {
    */
   landingVault: boolean;
   /**
+   * A brand-new account (sign-up) landed with no vault at all. The welcome
+   * screen reads this to open its "Name your vault" step at once, instead of
+   * leaving the person to find "New vault", and clears it when it does.
+   */
+  newVaultPrompt: boolean;
+  clearNewVaultPrompt: () => void;
+  /** `turnOnSyncNow` is running, so every "Turn on sync" button can say so. */
+  turningOnSync: boolean;
+  /**
    * A vault switch is in flight, with the vault we're heading TO. Set before the
    * first await of `setActiveOrganization` and cleared when it settles, so the
    * chrome can rename itself to the destination immediately instead of showing
    * the outgoing vault until the folder finally swaps.
    */
-  switchingVault: { orgId: string; name: string } | null;
+  /** A vault switch in flight: who we're going to, for the chrome to name at
+   *  once. `orgId` is null for a switch to a plain local folder. */
+  switchingVault: { orgId: string | null; name: string } | null;
   /**
    * The note path currently being opened, if the open hasn't landed yet. Opening
    * a note in a synced vault registers it server-side first (`openNoteByPath`),
    * so a click can sit for a moment with nothing on screen acknowledging it.
    */
   openingNotePath: string | null;
+  /**
+   * Is the OPEN FOLDER stamped for a synced vault, per its own
+   * `.context/config.json`? Filled in by a cheap `peekVaultStamp` fired during
+   * the boot (never awaited), and null until that lands or after a vault swap.
+   *
+   * Read by the open gate (`lib/sync/openGate`): the boot paints before sync has
+   * primed, so a note clicked in that window needs to know whether waiting for
+   * a doc-id map is worth it — see `planOpen`.
+   */
+  openFolderIsSynced: boolean | null;
   organizations: Organization[];
   members: Member[];
   pendingInvitations: Invitation[];
+  /**
+   * The open folder is stamped for a vault the SERVER says no longer exists —
+   * its owner made it local only (or deleted it). Set only by
+   * `checkUnsyncedVaultStamp`, and only on a 404: a folder we merely can't reach
+   * stays silent. Drives `VaultUnsyncedBanner`, which is the one way out of the
+   * `blocked-foreign` dead end (the stamp names an org that can never come back,
+   * so "Turn on sync" would refuse this folder forever).
+   */
+  vaultUnsynced: { organizationId: string; path: string } | null;
   userInvitations: Invitation[];
   syncEnabled: boolean;
   syncStatus: SyncStatus;
+  /** Vault channel connectivity, independent of the open note’s permissions. */
+  vaultSyncStatus: SyncStatus;
+  /** What the last registry pull said about this user's view of the vault
+   *  (readable count, hidden content, root create). Mirror of
+   *  `lib/sync/vaultVisibility`; drives `lib/emptyVaultState`. */
+  vaultVisibility: VaultVisibility | null;
   /** When the current doc last flushed all changes to the server — drives
    *  "Synced · just now". Bumped on every server ack, not just initial sync. */
   lastSyncedAt: number | null;
   /** True while the open note has local edits not yet acked by the server
    *  (drives the "Saving…" badge state). */
   syncPending: boolean;
+  /** The server's shrink burst brake is pausing OUR writes in this vault
+   *  (#252): "Sync paused" on the pill, Health and a banner. Null otherwise. */
+  syncPause: SyncPause | null;
+  /** The `since` of the pause whose banner was dismissed (the pill and Health
+   *  keep saying it until it lifts). */
+  syncPauseDismissed: number | null;
+  dismissSyncPause: () => void;
   /**
    * Counted progress of the current vault's sync run; null when none is running.
    * Belongs to ONE vault — dropped on every vault switch (see
@@ -176,11 +466,45 @@ interface AppStore {
    */
   syncProgress: SyncProgress | null;
   /**
+   * Identity of the most recent bulk run that ENDED in failure — bumped once per
+   * fresh transition into the `error` phase, never while a run is moving.
+   *
+   * What makes the note-limit banner dismissible per failure rather than per
+   * app launch: the banner remembers the token it was dismissed for, so the next
+   * failing run is a different number and raises it again. Vault-scoped like
+   * `syncProgress` (a failure in the vault you left is not news here).
+   */
+  failedRunToken: number;
+  /**
+   * The vault channel has reached `synced` — its `ready` arrived — at least once
+   * since this vault was opened. Sticky across reconnects (a later drop does not
+   * un-say what the server already answered); reset on every vault switch.
+   *
+   * The pivot of the one "synced" rule (`TreeSyncInput.serverSettled`): after
+   * `ready`, a mapped note with no reported transition was not named by the
+   * server and is not in the run, so it counts as synced.
+   */
+  vaultReadySeen: boolean;
+  /**
    * Per-doc sync state for the sidebar badge, keyed by **docId, never by path**
    * (paths change on rename and collide across vaults). Dropped on every vault
    * switch alongside `syncProgress`.
    */
   docSyncState: Record<string, DocSyncState>;
+  /**
+   * Per-FILE sync state for the sidebar badge, keyed by **vault-relative path**.
+   *
+   * The counterpart of `docSyncState` for everything that syncs as a blob
+   * rather than as a CRDT note — a `.pdf`, a `.docx`, an `.mp4`. Keyed by path
+   * and not by docId on purpose: a blob's identity is its bytes, and its
+   * server `files` row can be refused outright, so a path is the only key both
+   * sides always have. Published whole by the attachment mirror
+   * (`AttachmentSync.onFileStates`), so a deleted file simply stops appearing.
+   * Dropped on every vault switch alongside `docSyncState`.
+   */
+  fileSyncState: Record<string, DocSyncState>;
+  /** True only after this vault's server explicitly refuses attachment sync. */
+  attachmentSyncBlocked: boolean;
   /**
    * Vault-relative note path → that note's **server docId**, mirroring the
    * registry's map for the open vault (empty when sync is off).
@@ -204,6 +528,18 @@ interface AppStore {
    */
   denies: Share[];
   /**
+   * `edit` rows that LIFT the whole-vault Read-only posture for this user — an
+   * item shared with the team, or a personal grant — in the synced vault.
+   *
+   * A third bucket rather than a flag on `locks`, because every consumer of
+   * `locks` treats its rows as locks: the row menu's Unlock, the bulk unlock
+   * and the Access panel's lock map would all read an `edit` row as a padlock
+   * to remove. They are grants, they only ever arrive under a Read-only
+   * posture, and the one thing that wants them is the tree badge — which uses
+   * them to subtract a lifted subtree from the vault-wide seed.
+   */
+  lifts: Share[];
+  /**
    * Who last edited each note's CONTENT, keyed by **docId** (never by path, and
    * dropped on every vault switch — two vaults both have a `Welcome.md`).
    * Refreshed by the registry pull; empty when sync is off.
@@ -218,6 +554,9 @@ interface AppStore {
   /** The active vault's checkpoints, newest first. `null` = unknown (not synced,
    *  or not fetched yet). */
   checkpoints: VaultCheckpoint[] | null;
+  /** The active vault's checkpoint cadence; `null` = unknown or an older
+   *  server (daily automatic checkpoints, unlimited manual ones). */
+  checkpointSchedule: CheckpointSchedule | null;
   /** Live "who's viewing what" roster (teammates only) — drives the sidebar
    *  presence dots on notes/folders. Empty when sync is off or disconnected. */
   vaultPresence: VaultPeer[];
@@ -249,15 +588,57 @@ interface AppStore {
   billingConfig: BillingConfig | null;
   /** The active vault's subscription state + seat usage; null when unknown. */
   orgBilling: OrgBilling | null;
+  /** Every vault's plan plus the subscriptions left behind by deleted vaults —
+   *  what the Billing tab's Subscriptions list renders. This can't be derived
+   *  from `organizations` + `orgBilling`: role is only known for the active
+   *  org, and `orgBilling` covers one vault at a time (#109). */
+  myBilling: MyBilling | null;
 
   // ---- Account-level preferences (follow the app, not any vault) ----
   /** The user's chosen activity status; broadcast to teammates via presence. */
   activityStatus: ActivityStatus;
   /** Whether the mention chime plays when someone pings you. */
   mentionSound: boolean;
+  /** Add stable personal colours to items without an explicit vault colour. */
+  automaticItemColors: boolean;
+  /** How the editor draws YAML frontmatter: a Properties panel, nothing, or
+   *  plain source. Device-local (Settings → Appearance), not per-vault. */
+  propertiesMode: PropertiesMode;
+  /** How wide the editor's prose column runs: a measure in `ch`, or "full" for
+   *  the whole pane. Device-local (Settings → Appearance). */
+  editorMeasure: EditorMeasure;
+  /** Note editor text size in px (Settings → Appearance). Device-local. */
+  editorFontSize: number;
+  /** Personal, device-local note font (lib/prefs.ts EDITOR_FONTS). */
+  editorFont: EditorFont;
+  /** Show the editor's line-number gutter. Off by default. */
+  lineNumbers: boolean;
+  homeSectionHidden: boolean;
+  setHomeSectionHidden: (hidden: boolean) => void;
+  /** This device's personal appearance OVERRIDES (absent key = inherit the
+   *  open vault's default). The five editor/colour fields above and
+   *  `themeMode` are the EFFECTIVE values derived from these, the open
+   *  vault's `vaultAppearance` and the app defaults (`lib/appearance.ts`). */
+  appearanceOverrides: AppearanceSettings;
+  /** Vault appearance defaults by org id, fetched on vault open and patched
+   *  live by the vault channel's `appearance-changed` frame. */
+  vaultAppearance: Record<string, VaultAppearanceSettings>;
+  personalPins: PinnedItem[];
+  personalHomeDocId: string | null;
+  homePickerOpen: boolean;
+  homeLandingPending: boolean;
+  homeNavigationPath: string | null;
+  homeActivation: { vaultPath: string; path: string; revision: number; toggleSidebar?: boolean } | null;
+  togglePin: (path: string, isDir: boolean, scope?: "personal" | "vault") => Promise<void>;
+  setHome: (path: string | null, scope?: "personal" | "vault") => Promise<void>;
+  openHome: (pickerIfMissing?: boolean, fullscreen?: boolean) => Promise<boolean>;
+  /** The effective theme mode currently painted. */
+  themeMode: ThemeMode;
   /** How the sidebar arranges everything the user hasn't arranged by hand.
    *  Layered UNDER `itemOrder`, never replacing it — see `lib/tree/sort`. */
   treeSort: TreeSort;
+  /** Per-folder overrides of `treeSort` for the open vault (device-local). */
+  folderSorts: FolderSorts;
   /** Set briefly when a teammate joins the vault, to drive the celebration
    *  banner + confetti. `at` changes each time so a repeat join re-triggers it. */
   memberJoined: { name: string; at: number } | null;
@@ -272,6 +653,9 @@ interface AppStore {
   setRootFrozen: (frozen: boolean) => Promise<void>;
   setItemOrder: (order: ItemOrder) => void;
   setTreeSort: (sort: TreeSort) => void;
+  /** Sort one folder's subtree its own way; `null` goes back to the vault sort. */
+  setFolderSort: (folderPath: string, sort: TreeSort | null) => void;
+  setAutomaticItemColors: (enabled: boolean) => void;
   /**
    * Re-list the sidebar. With `folders`, ONLY those folder listings are re-read
    * (the watcher batch said nothing else changed); without it, the root and
@@ -281,6 +665,7 @@ interface AppStore {
   /** Lazily load one folder's immediate children into the sidebar tree. */
   loadChildren: (path: string) => Promise<void>;
   refreshTitles: () => Promise<void>;
+  refreshTags: () => Promise<void>;
   /**
    * Bring `titles` current for just the notes a watcher batch named: re-read
    * those rows (one `getNoteMeta` each) and drop the removed ones, instead of
@@ -292,15 +677,116 @@ interface AppStore {
   /** Open the root Welcome note if it exists and nothing else is open. */
   openWelcomeIfPresent: () => Promise<void>;
 
-  openNoteByPath: (path: string) => Promise<void>;
+  openNoteByPath: (path: string, source?: "home") => Promise<void>;
+  /**
+   * Create a note at `dir` with an explicit name, open it, and reveal it in the
+   * sidebar. The one path every caller shares — the ⌘N handler used to invent
+   * `Untitled ${Date.now()}` while the sidebar's New-note button used
+   * `Untitled`, `Untitled 1`, … Returns the created path, or null when the root
+   * freeze latch refused it. Throws what `ipc.createNote` throws (a taken name
+   * included) so `createNoteIn` can walk to the next candidate.
+   */
+  createNoteAt: (dir: string, name: string) => Promise<string | null>;
+  /**
+   * `createNoteAt` with the sidebar's `Untitled` / `Untitled N` search, plus
+   * the cursor waiting in the new note's inline title. New notes are created
+   * EMPTY (Rust `create_note`), and their name IS their title, so that is
+   * where naming happens.
+   */
+  createNoteIn: (dir: string) => Promise<string | null>;
+  /**
+   * "Show me this path in the sidebar." Bumped by `openNoteByPath` and by
+   * `createNoteIn`; consumed by an effect in `FileTree`, which is the only place
+   * that holds the arborist handle (lazy children must be listed in ancestor
+   * order before the row exists). `token` makes a repeat request for the SAME
+   * path re-fire — a reveal is an event, not a state.
+   */
+  revealRequest: { path: string; edit: boolean; token: number } | null;
+  requestReveal: (path: string, opts?: { edit?: boolean }) => void;
+  /**
+   * "Open Vault Settings on this page." Set by anything that wants to hand the
+   * user off to a settings tab — the sync banner and the sync pill both point at
+   * Health — and consumed by an effect in `AccountMenu`, which is the only place
+   * that owns the settings dialog. `token` makes a repeat request for the SAME
+   * tab re-fire, exactly like `revealRequest`: opening settings is an event, not
+   * a state.
+   */
+  settingsRequest: { tab: SettingsTab; section?: string; token: number } | null;
+  /** `section` scrolls to (and briefly highlights) `[data-settings-section]` in that tab. */
+  requestSettings: (tab: SettingsTab, section?: string) => void;
+  /** Bumped to ask the open Settings dialog to close (an action in it opened
+   *  something in the editor area behind it). */
+  settingsDismissToken: number;
+  dismissSettings: () => void;
+  /** Open Account Settings on a particular page (for links such as the
+   * sidebar colour explanation). Owned and consumed by `AccountMenu`. */
+  accountSettingsRequest: { tab: AccountSettingsTab; token: number } | null;
+  requestAccountSettings: (tab: AccountSettingsTab) => void;
+  /**
+   * Which full-screen settings dialog is showing. The two are mutually
+   * exclusive: `requestSettings` and `requestAccountSettings` set this in the
+   * same update as their request, so opening one always closes the other and
+   * every cross-link swaps instead of stacking. Rendered by `AccountMenu`.
+   */
+  settingsDialog: "vault" | "account" | null;
+  /** Close a settings dialog; with `which`, only if that one is showing. */
+  closeSettingsDialog: (which?: "vault" | "account") => void;
+  /**
+   * Open the Upgrade (plan comparison) dialog from any screen. `reason` is one
+   * muted line under its heading. Consumed by `UpgradeDialogHost` (main.tsx).
+   */
+  upgradeDialogRequest: { reason?: string; orgId?: string; token: number } | null;
+  requestUpgradeDialog: (opts?: { reason?: string; orgId?: string }) => void;
+  clearUpgradeDialogRequest: () => void;
+  /**
+   * A `baalda://oauth-consent` hand-off: claude.ai / ChatGPT asking to connect
+   * to a keyed vault (W3). Parked until the person confirms in
+   * `OAuthConsentHost` (main.tsx); a deep link never presents a key on its own.
+   */
+  oauthConsentLink: OAuthConsentLink | null;
+  promptOAuthConsent: (link: OAuthConsentLink) => void;
+  clearOAuthConsent: () => void;
+  /**
+   * Whether the connected server lacks features this app needs (UI mirror
+   * only; `lib/serverFeatures.ts`). Null = unknown or not checked yet, which
+   * shows nothing. Written by `BackendBehindNotice`'s health poll.
+   */
+  backendStatus: BackendStatus | null;
+  setBackendStatus: (status: BackendStatus | null) => void;
+  /**
+   * "The next time this note's editor mounts, put the cursor in its inline
+   * title." Set by `createNoteIn`, consumed once by `InlineTitle` on mount.
+   *
+   * A new note is created EMPTY and its name IS its title, so the naming
+   * affordance is the title at the top of the note — not the sidebar's rename
+   * box, which is where it lived until the title existed. A flag rather than a
+   * direct call because the widget mounts several awaits after the create
+   * (bridge open → sync open → `new EditorView`).
+   */
+  pendingTitleFocus: string | null;
+  setPendingTitleFocus: (path: string | null) => void;
+  /** The path the sidebar just revealed, for a one-shot highlight pulse.
+   *  Cleared by a timer in the FileTree; read per-row as a BOOLEAN so a pulse on
+   *  one row does not re-render the other 6,000. */
+  revealedPath: string | null;
+  setRevealedPath: (path: string | null) => void;
   /**
    * Follow a `baalda://note/<orgId>/<docId>` link: switch to that vault if
    * needed, then open the note. Never grants anything — the recipient's own
    * membership and ACL decide whether the note is there to open.
    */
   openNoteLink: (url: string) => Promise<void>;
+  /**
+   * Follow a `baalda://invite/<id>?server=<url>` link: confirm the server if it
+   * names a different one, look the invitation up, then accept it (signed in)
+   * or raise the sign-in dialog for it (signed out). Grants nothing on its own
+   * — the server re-checks the invitation on accept.
+   */
+  openInviteLink: (url: string) => Promise<void>;
   refreshBacklinks: () => Promise<void>;
-  setNoteRemoved: (removed: boolean) => void;
+  /** `synced` overrides the latch below with a value sampled earlier (the
+   *  deferred open-note removal check samples it when the file vanished). */
+  setNoteRemoved: (removed: boolean, synced?: boolean) => void;
   closeNote: () => void;
   /** Close one tab. Closing the active one activates its right-hand neighbour
    *  (left-hand when it was last); closing the only tab clears the editor. */
@@ -318,24 +804,59 @@ interface AppStore {
   closeAllTabs: () => void;
 
   // Auth actions
-  initAuth: () => Promise<void>;
+  /** `session`: an `authManager.init()` already in flight (launch starts it
+   *  beside the update gate so the keychain read + session round trip overlap
+   *  it); omitted, the restore starts its own. */
+  initAuth: (opts?: { session?: Promise<SessionInfo | null> }) => Promise<void>;
   signIn: (email: string, password: string) => Promise<void>;
   signInWithGoogle: () => Promise<void>;
   signUp: (name: string, email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
+  /**
+   * The server has told us our session is gone, mid-run — a 30-day session that
+   * lapsed while the app stayed open, or a revocation from another device. Not a
+   * user action, so it is deliberately NOT `signOut`: the vault stays open, the
+   * editor keeps working, and the #145 banner explains that edits are staying on
+   * this device. Called by the sync layer's session guard, which has already
+   * re-checked the session with the server.
+   */
+  handleSessionExpired: () => void;
   /**
    * Run the post-sign-in landing on demand, for a flow that deliberately
    * suppressed it and then fell through (abandoning "join a team" after the
    * sign-up it required). Same rules as signing in.
    */
   landAfterAuth: () => Promise<void>;
-  setServerUrl: (url: string) => Promise<void>;
+  /**
+   * Switch (or reconnect) to `url`. Resolves `true` once this switch landed,
+   * `false` when another auth flow took over meanwhile (an invite link's
+   * Connect, a sign-in) and cancelled it; throws when it failed, after putting
+   * the previous server back.
+   */
+  setServerUrl: (url: string) => Promise<boolean>;
 
   // Account profile & preferences
   /** Update display name / avatar (server-backed; refreshes the session). */
   updateProfile: (input: { name?: string; image?: string | null }) => Promise<void>;
-  setActivityStatus: (status: ActivityStatus) => void;
+  setActivityStatus: (status: ActivityStatus, until?: number | null) => void;
+  activityStatusUntil: number | null;
   setMentionSound: (enabled: boolean) => void;
+  setPropertiesMode: (mode: PropertiesMode) => void;
+  setEditorMeasure: (measure: EditorMeasure) => void;
+  setEditorFontSize: (px: number) => void;
+  setEditorFont: (font: EditorFont) => void;
+  setLineNumbers: (on: boolean) => void;
+  /** Set (value) or clear back to "inherit" (undefined) one personal override. */
+  setAppearanceOverride: <K extends AppearanceKey>(key: K, value: AppearanceSettings[K] | undefined) => void;
+  /** Recompute the effective appearance and paint it (theme, editor font token). */
+  applyAppearance: () => void;
+  /** Fetch an org's appearance defaults into `vaultAppearance`. Never throws. */
+  loadVaultAppearance: (orgId: string) => Promise<void>;
+  /** Owner/admin: patch an org's look defaults — applied optimistically.
+   *  Rolls back to the previous object if the server refuses. */
+  saveVaultAppearance: (orgId: string, settings: VaultAppearanceSettings) => Promise<void>;
+  /** A live `appearance-changed` frame (or any server answer) for an org. */
+  receiveVaultAppearance: (orgId: string, settings: VaultAppearanceSettings) => void;
   /** Open the mic and start broadcasting to the vault (button pressed). */
   startBroadcast: () => Promise<void>;
   /** Stop broadcasting and release the mic (button released). */
@@ -348,29 +869,118 @@ interface AppStore {
   dismissMemberJoined: () => void;
 
   // Vault actions
-  refreshVault: () => Promise<void>;
+  /**
+   * Re-read the vault list, the member roster and both invitation lists.
+   *
+   * `rosterInBackground` resolves as soon as `organizations` is published and
+   * lets the three roster/invitation GETs finish detached. The launch path uses
+   * it because the landing's only dependency here is the vault list — see
+   * `planLanding`'s membership test — and awaiting the rest put three more
+   * round trips in front of every app start.
+   */
+  refreshVault: (opts?: { rosterInBackground?: boolean }) => Promise<void>;
   createOrganization: (name: string) => Promise<void>;
   /** Promote the currently-open local folder into a synced vault, adopting
    *  the files already in it (no new empty folder). This is "Turn on sync". */
   turnOnSyncForCurrentVault: (name?: string) => Promise<void>;
+  /**
+   * One-click "Turn on sync" for the open local vault: `turnOnSyncForCurrentVault`
+   * plus the feedback the buttons need (a plan limit opens the upgrade dialog,
+   * anything else is an error toast). Resolves true once the vault syncs.
+   */
+  turnOnSyncNow: (name?: string) => Promise<boolean>;
   /** `seedIfEmpty` marks a switch into a vault the user JUST created, the only
    *  case where an empty vault should receive first-run starter content. */
   setActiveOrganization: (
     organizationId: string,
     opts?: { seedIfEmpty?: boolean },
   ) => Promise<void>;
-  inviteMember: (email: string, role: "member" | "admin") => Promise<void>;
+  /** Invite an email to the active vault, then ask the server to email it.
+   *  RETURNS the invitation AND whether the email actually went out: a server
+   *  that can't send, or a provider that refused, leaves the link as the only
+   *  way the invitation ever reaches the person — so the UI must know. */
+  /** Invite into the active vault, or into `organizationId` when given (the
+   *  Activity feed's Resend names the vault the notice belongs to). */
+  inviteMember: (email: string, role: "member" | "admin", organizationId?: string) => Promise<InviteResult>;
+  /** Re-send the sign-up confirmation email to the signed-in address. */
+  resendVerificationEmail: () => Promise<void>;
+  /**
+   * A `baalda://verified` / `baalda://signin` hand-off arrived from one of the
+   * server's account pages: re-read the session so the app reflects what just
+   * happened in the browser (address confirmed / sessions revoked by a reset)
+   * without a reload.
+   */
+  handleAccountLink: (kind: AccountLinkKind) => Promise<void>;
+  /**
+   * A `baalda://billing/upgraded?org=…` hand-off arrived from the checkout
+   * success page: the server has confirmed the payment, so re-read billing and
+   * say so. `orgId` is the vault that was upgraded, when the page knew it.
+   */
+  handleBillingLink: (orgId: string | null) => Promise<void>;
   /** Remove a member from the active vault (owner/admin), then refresh. */
   removeMember: (userId: string) => Promise<void>;
   /** Change a member's role in the active vault (owner/admin), then refresh. */
   updateMemberRole: (userId: string, role: "member" | "admin") => Promise<void>;
   acceptInvitation: (invitationId: string) => Promise<void>;
+  /** Re-read only the signed-in user's own pending invitations (live arrival,
+   *  window focus, the account menu opening). Cheap: one GET. */
+  refreshUserInvitations: () => Promise<void>;
+  /** Drop one invitation that was answered or cancelled elsewhere. */
+  dropUserInvitation: (invitationId: string) => void;
   joinVault: (code: string) => Promise<void>;
   /** Detach a vault from THIS device (forget its folder, stop syncing it).
    *  Server data and membership are untouched — it can be re-opened later. */
   removeVaultLocally: (organizationId: string) => Promise<void>;
-  /** Permanently delete a vault everywhere (owner only), then detach it. */
-  deleteRemoteVault: (organizationId: string) => Promise<void>;
+  /** Leave a vault you don't own: end the membership on the server, then take
+   *  the vault off THIS device for good — switcher, recents, and its folder
+   *  (moved to the OS Trash, never deleted outright). Owners get the server's
+   *  409 and are pointed at Delete instead. */
+  leaveVault: (organizationId: string) => Promise<void>;
+  /**
+   * Membership of a vault this account does not own ended (removed, or left):
+   * stop syncing it, close it if open, PERMANENTLY delete its folder here and
+   * forget it. Only on a positive server signal; a vault the account still
+   * lists (owners always are) is never touched.
+   */
+  handleMembershipLost: (
+    organizationId: string,
+    reason: MembershipLossReason,
+    /** The folder, when the caller captured it before the binding was forgotten. */
+    knownPath?: string | null,
+  ) => Promise<void>;
+  /** Launch check: ask the server about known vaults no longer listed. */
+  checkLostMemberships: () => Promise<void>;
+  /** The one-line notice after a membership-loss removal (null = none). */
+  membershipLost: { text: string; at: number } | null;
+  dismissMembershipLost: () => void;
+  /** Permanently delete a vault everywhere (owner only), then detach it.
+   *  Hands back the server's report so the caller can say what became of the
+   *  vault's subscription — deleting a Team vault stops it at the END of the
+   *  period rather than instantly, and that date is the whole message (#111). */
+  deleteRemoteVault: (organizationId: string) => Promise<VaultDeleteResult>;
+  /**
+   * Make a synced vault LOCAL ONLY (owner only): the server destroys everything
+   * it holds for the vault, and this device keeps every `.md` file, attachment
+   * and `.context/index.sqlite` row exactly where they are — including the CRDT
+   * log, so a later re-sync reuses the same doc ids and the history survives.
+   *
+   * Server first: a refusal (403, 409 `name_mismatch`, 502
+   * `subscription_cancel_failed`, offline) must leave this device untouched.
+   */
+  unsyncVault: (organizationId: string, confirmName: string) => Promise<UnsyncResult>;
+  /**
+   * Ask the server whether the open folder's stamp names a vault that still
+   * exists, and raise (or clear) `vaultUnsynced` accordingly. Cheap: a folder
+   * with no stamp, or one stamped for a vault we're a member of, never hits the
+   * network.
+   */
+  checkUnsyncedVaultStamp: () => Promise<void>;
+  /** Banner action: accept that the vault is gone and keep this folder as a
+   *  plain local vault. Clears the stamp and the binding; touches no file. */
+  keepUnsyncedVaultLocal: () => Promise<void>;
+  /** Banner action: clear the dead stamp and sync this folder up as a NEW
+   *  vault, reusing the doc ids in the local index so history survives. */
+  resyncUnsyncedVault: () => Promise<void>;
 
   /** Open a plain local folder as the current (unsynced) vault — leaving any
    *  synced vault's sync context behind. Used by the switcher's local rows
@@ -385,16 +995,22 @@ interface AppStore {
   deleteLocalVault: (path: string) => Promise<void>;
   /** Detach from the open local folder and drop to the empty/welcome state. */
   closeLocalVault: () => void;
+  /** Bumped whenever a vault delete changes this device's recents, so every
+   *  recents list (welcome screen, Vaults tab) re-reads after the folder is
+   *  gone instead of keeping a row read while it still existed. */
+  recentsVersion: number;
 
   // Resolving a vault's local folder (when none is bound yet)
-  /** Bind `path` to `orgId`, open it, and enable sync. */
-  /** Open `path` as `orgId`'s folder and bind them. `create` gates the mkdir —
+  /** Open `path` as `orgId`'s folder, bind them, paint the tree, and start sync
+   *  in the background (never awaited — see the body). `create` gates the mkdir —
    *  only paths that deliberately mint a NEW folder pass true; reopening a
-   *  remembered binding must not resurrect a folder the user moved away. */
+   *  remembered binding must not resurrect a folder the user moved away.
+   *  `deferSync` leaves sync to the caller, for the one path that has to
+   *  activate the org AFTER opening the folder (`setActiveOrganization`). */
   applyVaultFolder: (
     orgId: string,
     path: string,
-    opts?: { create?: boolean; seedIfEmpty?: boolean },
+    opts?: { create?: boolean; seedIfEmpty?: boolean; deferSync?: boolean },
   ) => Promise<void>;
   /**
    * Adopt a vault Rust has ALREADY opened (the native-picker commands open as
@@ -414,6 +1030,29 @@ interface AppStore {
   startEmptyVault: () => Promise<void>;
   /** Abandon the pending switch; revert to the previous vault if any. */
   cancelVaultFolder: () => Promise<void>;
+  /**
+   * The vault's folder is missing (#228) — the banner, the Settings → Vaults
+   * row and the Set-up prompt all recover through these two, so there is ONE
+   * recovery path. "Restore here" recreates the folder at its old path and
+   * syncs everything down (a synced vault only); "Locate folder…" binds the
+   * folder the user picks. Both clear the missing state by reopening the vault.
+   */
+  restoreVaultFolder: () => Promise<void>;
+  locateVaultFolder: () => Promise<void>;
+  /**
+   * The live "root vanished" path: when the open synced vault's folder sat
+   * inside the vaults root, rebind a renamed copy or recreate it without
+   * asking (`lib/vault/missingFolder.ts`). Leaves the banner up otherwise.
+   */
+  autoRecoverMissingRoot: () => Promise<void>;
+  /**
+   * Reset local copy (#228): permanently delete this device's folder of the
+   * open synced vault, then run Restore here. Sync stops first; the deliberate
+   * absence never raises the folder-missing banner.
+   */
+  resetLocalVaultCopy: () => Promise<void>;
+  /** Notes with changes the server has not confirmed — the reset warning. */
+  unsyncedNotePaths: () => string[];
 
   // Locks (RBAC deny overlay)
   refreshLocks: () => Promise<void>;
@@ -428,6 +1067,17 @@ interface AppStore {
   /** Open the history panel for a note and load its versions. */
   openVersionPanel: (docId: string) => Promise<void>;
   closeVersionPanel: () => void;
+  /** The right-side panel (Sync / Versions / What's new), or null when closed.
+   *  The Versions tab drives `versionPanelDocId` (App.tsx keeps it on the open
+   *  note); every other tab, and closing, clears it and its preview. */
+  rightPanel: { tab: RightPanelTab } | null;
+  /** Open on `tab`, or the last tab used on this device. */
+  openRightPanel: (tab?: RightPanelTab) => void;
+  closeRightPanel: () => void;
+  setRightPanelTab: (tab: RightPanelTab) => void;
+  /** The header's Version history button: open the panel on Versions, switch
+   *  to it from Activity, or close the panel when Versions is already showing. */
+  toggleVersionsPanel: () => void;
   /** Load one version's markdown for the read-only editor overlay. */
   previewVersion: (versionId: number) => Promise<void>;
   clearVersionPreview: () => void;
@@ -445,6 +1095,8 @@ interface AppStore {
   refreshBillingConfig: () => Promise<void>;
   /** Refresh the active vault's subscription state + seats. */
   refreshOrgBilling: () => Promise<void>;
+  /** Refresh every vault's plan + any subscription from a deleted vault. */
+  refreshMyBilling: () => Promise<void>;
 
   // Sync
   setSyncStatus: (status: SyncStatus) => void;
@@ -454,11 +1106,25 @@ interface AppStore {
   setSyncProgress: (progress: SyncProgress | null) => void;
   /** Merge per-doc sync states in. Keys are docIds; `null` drops an entry. */
   patchDocSyncState: (patch: Record<string, DocSyncState | null>) => void;
+  /** Replace the per-file sync map (keys are paths; `{}` = nothing to draw). */
+  setFileSyncState: (states: Record<string, DocSyncState>) => void;
+  setAttachmentSyncBlocked: (blocked: boolean) => void;
   /** Replace the path→docId index (the registry mirror; `{}` = nothing synced). */
   setDocIdByPath: (map: Record<string, string>) => void;
-  /** `seedIfEmpty` flows to the registry reconcile — true only when enabling
-   *  sync for a vault the user just created (see `setActiveOrganization`). */
-  enableSyncForVault: (opts?: { seedIfEmpty?: boolean }) => Promise<void>;
+  /**
+   * `seedIfEmpty` flows to the registry reconcile — true only when enabling
+   * sync for a vault the user just created (see `setActiveOrganization`).
+   *
+   * `background: true` returns as soon as sync has PRIMED (this device's doc-id
+   * map is adopted, so mapped notes open safely) and runs the reconcile and its
+   * tail detached. The launch and the vault switch pass it; "Turn on sync" must
+   * not — it reads `syncEnabled` the moment this resolves, and a brand-new vault
+   * has no config to prime from.
+   */
+  enableSyncForVault: (opts?: {
+    seedIfEmpty?: boolean;
+    background?: boolean;
+  }) => Promise<void>;
 }
 
 // Slug derivation for local folder naming reuses the org slug rules.
@@ -565,7 +1231,7 @@ async function findExistingVaultFolder(orgId: string): Promise<string | null> {
   const candidates = await Promise.all(
     paths.map(async (path) => ({
       path,
-      config: await ipc.peekVaultConfig(path).catch(() => null),
+      stamp: await ipc.peekVaultStamp(path).catch(() => null),
     })),
   );
   // The vault's collection ids, so folders whose config predates the
@@ -595,8 +1261,106 @@ async function findExistingVaultFolder(orgId: string): Promise<string | null> {
  * binding, and what unmasks a folder that belongs to a different account.
  */
 async function peekStampedOrgId(path: string): Promise<string | null> {
-  const raw = await ipc.peekVaultConfig(path).catch(() => null);
-  return configOrgId(raw);
+  const stamp = await ipc.peekVaultStamp(path).catch(() => null);
+  return stamp?.organizationId ?? null;
+}
+
+/** The collection id `path`'s stamp names for `orgId` (else null). */
+async function stampedVaultIdFor(path: string | null, orgId: string): Promise<string | null> {
+  if (!path) return null;
+  const stamp = await ipc.peekVaultStamp(path).catch(() => null);
+  return stamp?.organizationId === orgId ? (stamp.serverVaultId ?? null) : null;
+}
+
+/**
+ * Membership of `orgId` ended or the vault is gone, per a definitive server
+ * answer the CALLER already has: forget this device's key for it (never the
+ * account key). Never throws; local files are untouched here.
+ */
+async function forgetVaultKeysForOrg(
+  userId: string | null | undefined,
+  orgId: string,
+  vaultIdHint: string | null,
+): Promise<void> {
+  if (!userId) return;
+  await vaultKeysMembershipEnded({ userId, orgId, vaultIdHint }).catch((e: unknown) =>
+    console.warn("[vault-keys] could not forget the vault key", e instanceof Error ? e.message : e),
+  );
+}
+
+/**
+ * Wipe the open folder's sync identity out of `.context/config.json`.
+ *
+ * **This one call is the whole "make local only" feature.** Skip it and
+ * `peekVaultStamp` keeps naming a vault that no longer exists, so
+ * `planTurnOnSync` answers `blocked-foreign` (`lib/vault/turnOnSync.ts`) and the
+ * folder can never sync again — the documented dead end this feature exists to
+ * remove.
+ *
+ * It deliberately does NOT go through `Registry.writeConfig`, which refuses a
+ * config with no `serverVaultId` and would silently keep the old file. What
+ * lands is a tombstone — `unsyncedAt` / `unsyncedFrom` — and nothing else:
+ * `organizationId`, `serverVaultId`, `docs`, `folders`, `files`, `pushed`,
+ * `baseline`, `authored` and `bootstrap` are all gone, which is what makes the
+ * folder read as completely unbound. (`VaultSyncConfig` drops unknown keys, so
+ * the two that remain are inert everywhere except a support transcript.)
+ *
+ * Retried once. If it still fails the server copy is already gone, so throwing
+ * would only report a failure for work that DID happen; the launch-time
+ * `/status` probe and its banner are the recovery net for that folder.
+ */
+/**
+ * Vaults this session has PROVED no longer exist on the server — either we
+ * unsynced them ourselves, or `/api/orgs/:id/status` answered 404 for them.
+ *
+ * Read by `turnOnSyncForCurrentVault` as `planTurnOnSync`'s `stampedOrgGone`:
+ * the refusal it lifts is there to stop us adopting a folder that belongs to
+ * someone else, and a vault that does not exist belongs to nobody. Only ever
+ * filled from a definite server answer — never from a failed request — because
+ * the cost of being wrong is uploading a teammate's whole folder into our own
+ * account. It survives a failed stamp clear, which is exactly the case where the
+ * refusal would otherwise strand the folder.
+ */
+const vaultsConfirmedGone = new Set<string>();
+
+/**
+ * Why the most recent `enableSyncForVault` call refused, when the reason is
+ * one a caller should report rather than guess at. Set by the stamp guard
+ * (folder stamped for a different vault) and cleared at the start of every
+ * call, so `turnOnSyncForCurrentVault` can tell "this folder belongs to
+ * another vault" apart from a genuine connection failure.
+ */
+let lastSyncRefusal: { kind: "stamp-mismatch"; stampedOrgId: string } | null = null;
+
+async function clearVaultStamp(vault: ipc.VaultInfo, orgId: string): Promise<boolean> {
+  const tombstone = JSON.stringify({
+    unsyncedAt: new Date().toISOString(),
+    unsyncedFrom: orgId,
+  });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await ipc.setVaultConfig(tombstone, vault.epoch);
+      return true;
+    } catch (e) {
+      if (attempt === 1) {
+        console.warn("[vault] couldn't clear the sync stamp after unsync", vault.path, e);
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Forget every device-local pointer at a deleted vault folder: any vault bound
+ * to it in `context.orgVaults` and a last-opened pointer at such a vault, so
+ * nothing tries to reopen a path that went to the Trash.
+ */
+export function forgetVaultPath(path: string): void {
+  for (const [orgId, p] of Object.entries(readOrgVaults())) {
+    if (p !== path) continue;
+    forgetOrgVault(orgId);
+    forgetLastVault(orgId);
+  }
 }
 
 /** Drop a vault's remembered local folder (used when removing/deleting it). */
@@ -683,12 +1447,50 @@ export function requestJoinWithCode(on: boolean): void {
   joiningWithCode = on;
 }
 
+// "Turn on sync" pressed while signed out: it raises sign-in first, and the
+// sign-in/sign-up flow finishes the job once the account is loaded (the open
+// local folder stays put through the landing, so it is the one that syncs).
+let turnOnSyncAfterAuth = false;
+export function requestTurnOnSyncAfterAuth(on: boolean): void {
+  turnOnSyncAfterAuth = on;
+}
+async function consumeTurnOnSyncAfterAuth(get: () => AppStore): Promise<void> {
+  if (!turnOnSyncAfterAuth) return;
+  turnOnSyncAfterAuth = false;
+  if (get().vault && !get().syncEnabled) await get().turnOnSyncNow();
+}
+
 // The vault the user was last actually working in (folder + org resolved
 // together). The server session carries an `activeOrganizationId`, but it can be
 // null (fresh session, 2+ orgs) and it doesn't know which *folder* to open — so
 // we persist the last opened vault locally and reopen it on launch instead
 // of dumping the user on the picker every time.
 const LAST_VAULT_KEY = "context.lastVault";
+
+// A local watcher can report a move as separate removal/addition batches.
+// Remember only recently missing identities so tabs can follow the same file
+// when the index reports its new path. Synced moves remain registry-owned.
+const recentLocalNotePaths = new Map<string, { path: string; at: number }>();
+let recentLocalNoteEpoch: number | undefined;
+function followLocalIndexedMoves(next: ipc.NoteTitle[]): void {
+  const store = useStore.getState();
+  const epoch = store.vault?.epoch;
+  if (epoch !== recentLocalNoteEpoch || store.syncEnabled) recentLocalNotePaths.clear();
+  recentLocalNoteEpoch = epoch;
+  if (epoch === undefined || store.syncEnabled) return;
+  const now = Date.now();
+  for (const [id, remembered] of recentLocalNotePaths) if (now - remembered.at > 30_000) recentLocalNotePaths.delete(id);
+  const previous = new Map(store.titles.map((note) => [note.id, note.path]));
+  if (store.openNote?.id) previous.set(store.openNote.id, store.openNote.path);
+  const present = new Set(next.map((note) => note.id));
+  for (const [id, path] of previous) if (!present.has(id) && !recentLocalNotePaths.has(id)) recentLocalNotePaths.set(id, { path, at: now });
+  for (const note of next) {
+    const from = previous.get(note.id) ?? recentLocalNotePaths.get(note.id)?.path;
+    if (from && from !== note.path) useStore.getState().followNoteRename(from, note.path);
+    recentLocalNotePaths.delete(note.id);
+  }
+  while (recentLocalNotePaths.size > 2000) recentLocalNotePaths.delete(recentLocalNotePaths.keys().next().value!);
+}
 
 export function readLastVault(): string | null {
   try {
@@ -730,6 +1532,74 @@ function forgetLastVault(orgId?: string): void {
  * destination rather than a dead end, and the app never invents a vault the
  * user didn't ask for.
  */
+/**
+ * Which vault a folder recovery (#228) is for. The Set-up prompt wins when it
+ * is up — it names the vault being set up — otherwise it is the open vault
+ * whose folder the sync layer found missing. `orgId` is null for a local-only
+ * vault (nothing to restore from; only Locate folder… applies). `path` is the
+ * folder to recreate for Restore here, null when there never was one.
+ */
+interface FolderRecoveryTarget {
+  orgId: string | null;
+  orgName: string;
+  path: string | null;
+  seedIfEmpty?: boolean;
+  stillCurrent: () => boolean;
+}
+
+/**
+ * Decide, after a short settle, what a missing vault folder needs
+ * (`planMissingFolder`). The wait lets a Finder rename land so its new folder
+ * shows up in the stamp scan; the existence re-check catches a rename-back.
+ * Answers `present` when the folder came back by itself.
+ */
+async function planForMissingFolder(
+  orgId: string | null,
+  path: string,
+): Promise<ReturnType<typeof planMissingFolder> | { kind: "present" }> {
+  await new Promise((r) => setTimeout(r, MISSING_FOLDER_SETTLE_MS));
+  if (await ipc.folderExists(path).catch(() => false)) return { kind: "present" };
+  let root: string | null = null;
+  try {
+    root = await ipc.getVaultsRoot();
+    // A missing (or unreadable) root is not ours to recreate into: ask.
+    if (!(await ipc.folderExists(root).catch(() => false))) root = null;
+  } catch {
+    root = null;
+  }
+  let found: string | null = null;
+  if (orgId) {
+    try {
+      found = await findExistingVaultFolder(orgId);
+    } catch (e) {
+      console.warn("[vault] folder rediscovery failed", e);
+    }
+  }
+  return planMissingFolder({ path, root, stampMatches: found, canSync: !!orgId });
+}
+
+function folderRecoveryTarget(get: () => AppStore): FolderRecoveryTarget | null {
+  const pending = get().pendingVaultFolder;
+  if (pending) {
+    return {
+      orgId: pending.orgId,
+      orgName: pending.orgName,
+      path: pending.reason?.missing ? (pending.reason.path ?? null) : null,
+      seedIfEmpty: pending.seedIfEmpty,
+      stillCurrent: () => get().pendingVaultFolder?.orgId === pending.orgId,
+    };
+  }
+  const v = get().vault;
+  if (!v || !get().structureNotice.rootMissing) return null;
+  const orgId = get().syncEnabled ? (get().session?.activeOrganizationId ?? null) : null;
+  return {
+    orgId,
+    orgName: v.name,
+    path: v.path,
+    stillCurrent: () => get().vault?.epoch === v.epoch,
+  };
+}
+
 async function landInLastVault(get: () => AppStore): Promise<void> {
   const openPath = get().vault?.path ?? null;
   const action = planLanding({
@@ -749,12 +1619,19 @@ async function landInLastVault(get: () => AppStore): Promise<void> {
   // Only the two actions that end with a vault on screen raise the flag, and
   // only while they run: `stay-local`/`nothing` change nothing, so claiming to
   // be "opening your vault" there would hang a spinner forever.
-  if (action.kind === "stay-local" || action.kind === "nothing") return;
+  if (action.kind === "stay-local" || action.kind === "nothing") {
+    // Nothing is going to turn sync on for this folder — release the open gate,
+    // or the first click after launch would wait for a prime that never comes.
+    resolveSyncGate();
+    return;
+  }
   useStore.setState({ landingVault: true });
   try {
     switch (action.kind) {
       case "enable-sync":
-        await get().enableSyncForVault();
+        // Returns at the PRIME, not at the reconcile: this is the launch path,
+        // and the reconcile is minutes of work on a large vault.
+        await get().enableSyncForVault({ background: true });
         return;
       case "switch":
         await get().setActiveOrganization(action.orgId);
@@ -775,13 +1652,85 @@ async function consumeQueuedNoteLink(get: () => AppStore): Promise<void> {
   if (url) await get().openNoteLink(url);
 }
 
+/**
+ * Accept the team invitation that was parked while sign-in (or a server switch)
+ * happened. A no-op when nothing is queued.
+ *
+ * The invitation's vault is where the user LANDS — `acceptInvitation` switches
+ * into it, binds its folder and turns sync on — so every caller skips the plain
+ * `landInLastVault` while an invite is queued. If acceptance fails (the classic
+ * case: signed in as the wrong address) the caller falls back to the ordinary
+ * landing, because being stranded on the welcome screen with an error is worse
+ * than being in some vault with an error.
+ */
+async function consumeQueuedInvite(
+  get: () => AppStore,
+  set: (partial: Partial<AppStore>) => void,
+): Promise<boolean> {
+  const invite = takePendingInvite();
+  if (!invite) return false;
+  // The preview may already be in the store (the signed-out prompt fetched it);
+  // re-reading it is only for the failure message's "sent to" address, so a
+  // failed fetch degrades the copy rather than the flow.
+  let inviteEmail = get().invitePrompt?.email ?? null;
+  if (!inviteEmail) {
+    try {
+      inviteEmail = (await authManager.api.previewInvitation(invite.invitationId)).email;
+    } catch {
+      /* copy-only */
+    }
+  }
+  try {
+    await get().acceptInvitation(invite.invitationId);
+    return true;
+  } catch (e) {
+    set({ invitePrompt: null });
+    toast(
+      acceptInviteFailureMessage(e, {
+        inviteEmail,
+        sessionEmail: get().session?.user.email ?? null,
+      }),
+      // `error` is already sticky in `toast` — an accept failure the user
+      // blinked past is one they report as "the link did nothing".
+      "error",
+    );
+    return false;
+  }
+}
+
 /** A link is queued but there's no session: put the sign-in dialog up and say
  *  why (shared by initAuth's signed-out and error endings). */
 function promptSignInForQueuedLink(
   set: (partial: Partial<AppStore>) => void,
 ): void {
   set({ authPrompt: "note-link" });
-  toast("Sign in to open this shared note — it will open right after you sign in", "neutral");
+  toast("Sign in to open this shared note. It will open right after you sign in", "neutral");
+}
+
+/**
+ * The invite equivalent: an invitation is queued and there is no session, so
+ * put the sign-in dialog up WITH the invitation's details.
+ *
+ * The preview is re-fetched rather than assumed, because this path is reached
+ * from `initAuth` — where the link LAUNCHED the app and nothing has looked the
+ * invitation up yet. A preview we can't read means an invitation the user
+ * can't use, so the queue is dropped and the reason said out loud instead of
+ * raising a card about nothing.
+ */
+async function promptSignInForQueuedInvite(
+  set: (partial: Partial<AppStore>) => void,
+): Promise<void> {
+  const invite = peekPendingInvite();
+  if (!invite) return;
+  try {
+    const preview = await authManager.api.previewInvitation(invite.invitationId);
+    if (preview.status !== "pending") throw new Error(INVITE_GONE_MESSAGE);
+    set({ invitePrompt: preview, authPrompt: "invite" });
+  } catch {
+    clearPendingInvite();
+    set({ invitePrompt: null });
+    toast(INVITE_GONE_MESSAGE, "error");
+  }
 }
 
 /** Auto-dismiss timer for the member-joined celebration (module-scoped so a
@@ -796,6 +1745,99 @@ let activeBroadcast: { stop: () => Promise<void> } | null = null;
  *  longer matches has been superseded by a newer switch and drops its remaining
  *  work rather than racing it to bind a folder / enable sync. */
 let orgSwitchGen = 0;
+/** A slower overlay response must not undo a newer permission refresh. */
+let locksRefreshGen = 0;
+
+/**
+ * Bumped by every flow that establishes or drops a session. `initAuth` now runs
+ * DETACHED from the launch (the tree paints without waiting for it), so the user
+ * can sign out, sign in as someone else or switch servers while the session
+ * restore is still in flight — and a restore landing on top of that is a session
+ * the user did not ask for. Each of those flows claims the generation before its
+ * own awaits, and everything `initAuth` (plus the three refreshers it calls)
+ * writes is gated on the generation it captured.
+ */
+let authInitGen = 0;
+
+/** How long a click will wait for sync to prime before opening anyway. The
+ *  prime is local-only (one config read), so this is a belt, not a budget: a bug
+ *  must never wedge the user's first click. */
+/**
+ * Above this many changed notes in one watcher batch, the sidebar's title map is
+ * refreshed with ONE `list_note_titles` instead of one `get_note_meta` per path.
+ *
+ * 200: a per-path patch is cheaper than reading the whole vault's titles for the
+ * handful of files an edit or a small move touches, and ruinous for the
+ * thousands an import does — each `get_note_meta` takes the Rust index mutex,
+ * and the importer's own indexing is holding it.
+ */
+const PATCH_TITLES_MAX = 200;
+
+const SYNC_GATE_MS = 3000;
+
+/**
+ * Resolves when sync has primed for the open vault — or when we learn it never
+ * will (signed out, a genuinely local folder, an enable that was refused).
+ * Re-armed on every vault open, because the answer belongs to one folder.
+ *
+ * This exists because the boot no longer waits: the sidebar is clickable before
+ * the doc-id map is loaded, and opening a MAPPED note without it seeds the doc
+ * from disk before pulling (see `lib/sync/openGate`).
+ */
+let syncReadyGate = newSyncGate();
+
+function newSyncGate(): { promise: Promise<void>; resolve: () => void } {
+  let resolve = () => {};
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** A different folder is opening: nothing is known about ITS sync yet. */
+function armSyncGate(): void {
+  syncReadyGate = newSyncGate();
+}
+
+/** Sync primed — or we now know it isn't coming. Either way, stop waiting. */
+function resolveSyncGate(): void {
+  syncReadyGate.resolve();
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/**
+ * Answer "does THIS folder sync?" for the open gate in `openNoteByPath`. A
+ * never-stamped folder has no mapped notes to fork, so its gate opens at once;
+ * a stamped one keeps waiting for the prime that `enableSyncForVault` resolves.
+ * Without this answer the gate stayed armed with `openFolderIsSynced: null`
+ * after every vault switch or creation, and each note open in a local-only
+ * folder sat out the full SYNC_GATE_MS belt ("opened … before sync primed").
+ *
+ * Fire-and-forget; every path that swaps the open folder calls it (`setVault`
+ * on a switch, `adoptOpenedVault` for the picker/create flows).
+ */
+function probeFolderSync(
+  get: () => AppStore,
+  set: (partial: Partial<AppStore>) => void,
+  path: string,
+): void {
+  void ipc
+    .peekVaultStamp(path)
+    .then((stamp) => {
+      if (get().vault?.path !== path) return; // moved on again
+      // A surer path may already have answered (`openVaultInRoot` knows its
+      // folder syncs; the launch probe in App.tsx peeks too). Never override an
+      // answer, and never release a gate someone else is holding.
+      if (get().openFolderIsSynced !== null) return;
+      const synced = stamp?.organizationId != null;
+      set({ openFolderIsSynced: synced });
+      if (!synced) resolveSyncGate();
+    })
+    .catch(() => {
+      /* unreadable: stays null, so the gate keeps waiting for the prime */
+    });
+}
+
 
 /**
  * Tear down networked sync for the vault we're leaving. Call this BEFORE any
@@ -804,6 +1846,42 @@ let orgSwitchGen = 0;
  * opened. `disable()` aborts the vault scope, clears every timer it owns, and
  * resets the registry's in-memory maps + serverVaultId.
  */
+/**
+ * `setServerUrl` could not adopt the new address (the config/keychain write
+ * failed, or the new server's session check threw). Put the client back on the
+ * previous server and re-hydrate it, so the user is not left signed in with no
+ * vault and empty vault lists until a reload.
+ */
+async function recoverFromFailedServerSwitch(
+  get: () => AppStore,
+  set: (partial: Partial<AppStore>) => void,
+  previousUrl: string,
+  wasSyncing: boolean,
+): Promise<void> {
+  let session = get().session;
+  if (normalizeServerUrl(authManager.getServerUrl()) !== normalizeServerUrl(previousUrl)) {
+    // The client moved before failing: point it back at the old server.
+    try {
+      session = await authManager.setServerUrl(previousUrl);
+    } catch (err) {
+      console.warn("[auth] could not restore the previous server", err);
+      session = null;
+    }
+  }
+  set({
+    serverUrl: authManager.getServerUrl(),
+    session,
+    authStatus: session ? "signed-in" : "signed-out",
+  });
+  if (!session) return;
+  try {
+    await get().refreshVault();
+    if (wasSyncing) await get().enableSyncForVault();
+  } catch (err) {
+    console.warn("[auth] could not re-hydrate the previous server", err);
+  }
+}
+
 function leaveVaultSync(): void {
   syncManager.disable();
 }
@@ -825,6 +1903,8 @@ function leaveVaultSync(): void {
  */
 function enterVaultScope(info: ipc.VaultInfo, orgId: string | null): void {
   vaultScopes.ensure({ orgId, vaultPath: info.path, vaultEpoch: info.epoch });
+  // Reconcile entries are per vault; re-read them for the one now open.
+  reconcileReport.vaultChanged();
 }
 
 /**
@@ -836,6 +1916,47 @@ function enterVaultScope(info: ipc.VaultInfo, orgId: string | null): void {
  */
 function sameVault(get: () => AppStore, epoch: number | null | undefined): boolean {
   return (get().vault?.epoch ?? null) === (epoch ?? null);
+}
+
+/**
+ * Refuse a create at the vault root while the freeze latch is on, and say why.
+ * Client-side purely so the user gets a sentence instead of a failed write — the
+ * server enforces the same latch and is the authority. (A note written past it
+ * would be permanently unsyncable: the server refuses to register it.)
+ */
+function rootCreateBlocked(get: () => AppStore, dir: string): boolean {
+  if (dir !== "" || !get().rootFrozen) return false;
+  toast(
+    "This vault's root is frozen. Create this inside a folder instead.",
+    "error",
+  );
+  return true;
+}
+
+/**
+ * Everything a freshly created note needs after its file exists: the tree and
+ * title list catch up, the note opens, and its row is revealed — with the
+ * cursor waiting in the note's inline title when the name was auto-picked,
+ * since a new note is EMPTY and its name is the first thing to type.
+ *
+ * Kept out of `createNoteAt` so `createNoteIn`'s name search can retry the
+ * *create* alone: if a failure in here counted as "name taken", the retry would
+ * leave a second `Untitled` behind.
+ */
+async function finishNoteCreate(
+  get: () => AppStore,
+  path: string,
+  opts?: { edit?: boolean },
+): Promise<string> {
+  await get().refreshTree();
+  await get().refreshTitles();
+  await get().openNoteByPath(path);
+  // The new note's name is typed into its INLINE TITLE, not the sidebar's
+  // rename box: a note created empty shows its filename at the top of itself,
+  // and that is where the cursor belongs. `openNoteByPath` already revealed the
+  // row; it just does not go into edit mode any more.
+  if (opts?.edit) get().setPendingTitleFocus(path);
+  return path;
 }
 
 /**
@@ -887,33 +2008,230 @@ function vaultScopedSyncReset() {
   return {
     syncEnabled: false,
     syncStatus: "offline" as SyncStatus,
+    vaultSyncStatus: "offline" as SyncStatus,
     syncPending: false,
+    syncPause: null,
     syncProgress: null,
+    failedRunToken: 0,
+    vaultReadySeen: false,
     docSyncState: {} as Record<string, DocSyncState>,
+    fileSyncState: {} as Record<string, DocSyncState>,
+    attachmentSyncBlocked: false,
     docIdByPath: {} as Record<string, string>,
     locks: [] as Share[],
     denies: [] as Share[],
+    lifts: [] as Share[],
     noteLastEdited: {} as Record<string, NoteLastEdited>,
     versionPanelDocId: null,
     noteVersions: null,
     versionPreview: null,
     checkpoints: null,
+    checkpointSchedule: null,
     // A latch belongs to the vault it was read from; a local vault has none.
     rootFrozen: false,
     // Tabs are paths, and paths only mean something inside the vault that
     // minted them — every vault leave/switch spreads this reset.
+    openNote: null,
+    openingNotePath: null,
     openTabs: [] as string[],
+    virtualTabs: [] as VirtualTab[],
+    activeVirtualTab: null as string | null,
+    // A folder's own stamp says nothing about the next folder.
+    openFolderIsSynced: null as boolean | null,
+    // Same rule: the "this vault was made local only" verdict belongs to ONE
+    // folder, and leaving it up over the next one would accuse a healthy vault.
+    vaultUnsynced: null as { organizationId: string; path: string } | null,
   } satisfies Partial<AppStore>;
 }
+
+/**
+ * This device's half of "make local only", shared by the owner's own unsync and
+ * by the banner that meets the SAME fact on another device.
+ *
+ * Order is load-bearing and matches the design doc:
+ *
+ *   3. stop the sync layer (`disable()` → `teardown()` already stops the vault
+ *      channel, every per-doc provider, the uploader/bootstrap/batch-pusher, the
+ *      attachment mirror and presence, and resets the registry — there is no new
+ *      teardown code here);
+ *   4. clear the stamp — BEFORE forgetting the localStorage binding, so a crash
+ *      between the two leaves the more recoverable of the two states;
+ *   5. forget the bindings, but never `removeVaultLocally`: that switches away
+ *      to another vault, and the whole point is that we stay in this folder;
+ *   6. re-read session + vault list so the dead vault disappears from the app;
+ *   7. flip to Local in one `set()`, and open the sync gate the way a plain
+ *      local folder does (nothing is coming to prime it);
+ *   9. repaint.
+ *
+ * Nothing here touches the disk. No `ipc.deleteVault`, no recents removal:
+ * `.md` files, `attachments/`, `.context/index.sqlite` (CRDT log included),
+ * `.context/trash/`, `.context/types.json` and the account's keychain entry all
+ * survive untouched — which is what makes a later re-sync reuse the same doc ids.
+ *
+ * `folderPath` is where that vault lives on this device. When it is NOT the
+ * folder that is open right now, only the account-level bookkeeping runs: the
+ * stamp lives in the OPEN vault's `.context/`, so writing it would tombstone the
+ * wrong folder, and disabling sync would stop the vault the user is actually in.
+ * That folder heals itself the next time it is opened, via
+ * `checkUnsyncedVaultStamp`.
+ */
+async function unsyncLocalTeardown(
+  get: () => AppStore,
+  set: (partial: Partial<AppStore>) => void,
+  organizationId: string,
+  folderPath: string | null,
+): Promise<void> {
+  const vault = get().vault;
+  const isOpenFolder = vault != null && folderPath != null && vault.path === folderPath;
+  // Read BEFORE the stamp is cleared below. Every caller holds a definitive
+  // answer (the server confirmed the unsync, or `vault_not_found`).
+  const keyHint = await stampedVaultIdFor(folderPath, organizationId);
+
+  if (isOpenFolder) {
+    leaveVaultSync();
+    await clearVaultStamp(vault, organizationId);
+  }
+  await forgetVaultKeysForOrg(get().session?.user.id, organizationId, keyHint);
+  forgetOrgVault(organizationId);
+  forgetLastVault(organizationId);
+  forgetTeamAccessCache(get().serverUrl, organizationId);
+
+  // The server unpinned the vault from our session (and the org is gone from
+  // the account), so pick both up rather than keep asking about a dead vault.
+  const refreshed = await authManager.currentSession().catch(() => null);
+  if (refreshed) set({ session: refreshed });
+  await get()
+    .refreshVault()
+    .catch((e: unknown) => console.warn("[vault] refresh after unsync failed", e));
+
+  if (!isOpenFolder) return;
+
+  set({
+    ...vaultScopedSyncReset(),
+    // Not `null`: `vaultScopedSyncReset` means "ask again", and here we KNOW
+    // the answer — this folder does not sync, and nothing will make it.
+    openFolderIsSynced: false,
+    members: [],
+    pendingInvitations: [],
+    orgBilling: null,
+    vaultUnsynced: null,
+  });
+  // A local folder's open gate opens at once: there is no prime coming to
+  // release it, and every note open would otherwise sit out the full belt.
+  armSyncGate();
+  resolveSyncGate();
+
+  await get().refreshTree();
+  await get().refreshTitles();
+}
+
+/** Clears a timed status ("Out for a smoke · 30 min") when its time is up. */
+let statusClearTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleStatusClear(until: number | null): void {
+  if (statusClearTimer) clearTimeout(statusClearTimer);
+  statusClearTimer = null;
+  if (until === null) return;
+  const wait = Math.max(0, until - Date.now());
+  // setTimeout caps near 24.8 days; a status never runs that long.
+  statusClearTimer = setTimeout(() => {
+    if (useStore.getState().activityStatusUntil === until) useStore.getState().setActivityStatus("online", null);
+  }, Math.min(wait, 2_000_000_000));
+}
+
+// The note font is device-local; publish it before the first editor paints.
+applyEditorFont(readEditorFont());
+
+// W3: the first sync pass of a vault waits for a known vault-key state.
+syncManager.setVaultKeyGate?.(vaultKeysGate);
+syncManager.setEarlyVaultChannelCheck?.(vaultKeysEarlyChannel);
 
 export const useStore = create<AppStore>((set, get) => ({
   vault: null,
   tree: null,
-  openNote: null,
+  openVirtualTab: (tab) =>
+    set((s) => ({ virtualTabs: upsertTab(s.virtualTabs, tab), activeVirtualTab: tab.id, homeActivation: null })),
+  activateVirtualTab: (id) => set({ activeVirtualTab: id, homeActivation: null }),
+  closeVirtualTab: (id) =>
+    set((s) => {
+      const next = s.virtualTabs.filter((t) => t.id !== id);
+      if (next.length === s.virtualTabs.length) return {};
+      // Closing the one on screen falls back to a neighbour, then the note.
+      const active =
+        s.activeVirtualTab === id ? neighbourAfterClose(s.virtualTabs, id) : s.activeVirtualTab;
+      return { virtualTabs: next, activeVirtualTab: active };
+    }),
   noteRemoved: false,
+  noteRemovedSynced: false,
   noteRemovedByTeammate: null,
+  accessEvents: [],
+  structureNotice: { rootMissing: false, pendingDelete: null, closedAppChanges: false },
+  applyStructureNotice: (notice) => {
+    const wasMissing = get().structureNotice.rootMissing;
+    set({ structureNotice: notice });
+    if (notice.rootMissing && !wasMissing) {
+      get().closeAllTabs();
+      void get()
+        .autoRecoverMissingRoot()
+        .catch((e) => console.warn("[vault] auto-recovery of the missing folder failed", e));
+    }
+  },
+  folderAutoRestored: null,
+  dismissFolderAutoRestored: () => set({ folderAutoRestored: null }),
+  locateOriginalVaultFolder: async () => {
+    const restored = get().folderAutoRestored;
+    if (!restored) return;
+    const picked = await ipc.pickFolder();
+    if (!picked) return; // cancelled: keep the notice and the restored folder
+    // A switch while the picker was open: this vault is no longer the open one.
+    if (get().folderAutoRestored?.orgId !== restored.orgId) return;
+    // The same bind "Locate folder…" makes, through the same folder refusals.
+    // The recreated folder stays on disk: it already holds a synced copy.
+    await get().applyVaultFolder(restored.orgId, picked);
+    set({ folderAutoRestored: null });
+  },
+
+  releaseBulkDelete: async (how) => {
+    await syncManager.releaseDeleteDecision(how);
+  },
+  dismissClosedAppChanges: () => syncManager.dismissClosedChangesNotice(),
+  revealRequest: null,
+  settingsRequest: null,
+  rightPanel: null,
+  openRightPanel: (tab) => {
+    const t = tab ?? readLastTab();
+    writeLastTab(t);
+    set({
+      rightPanel: { tab: t },
+      ...(t === "versions" ? {} : { versionPanelDocId: null, noteVersions: null, versionPreview: null }),
+    });
+  },
+  closeRightPanel: () =>
+    set({ rightPanel: null, versionPanelDocId: null, noteVersions: null, versionPreview: null }),
+  setRightPanelTab: (tab) => get().openRightPanel(tab),
+  toggleVersionsPanel: () => {
+    if (get().rightPanel?.tab === "versions") get().closeRightPanel();
+    else get().openRightPanel("versions");
+  },
+  settingsDismissToken: 0,
+  dismissSettings: () =>
+    set((s) => ({
+      settingsDismissToken: s.settingsDismissToken + 1,
+      settingsDialog: s.settingsDialog === "vault" ? null : s.settingsDialog,
+    })),
+  accountSettingsRequest: null,
+  settingsDialog: null,
+  closeSettingsDialog: (which) =>
+    set((s) => (which && s.settingsDialog !== which ? {} : { settingsDialog: null })),
+  upgradeDialogRequest: null,
+  oauthConsentLink: null,
+  promptOAuthConsent: (link) => set({ oauthConsentLink: link }),
+  clearOAuthConsent: () => set({ oauthConsentLink: null }),
+  backendStatus: null,
+  setBackendStatus: (backendStatus) => set({ backendStatus }),
+  revealedPath: null,
   backlinks: [],
   titles: [],
+  tags: [],
 
   authStatus: "unknown",
   session: null,
@@ -921,15 +2239,28 @@ export const useStore = create<AppStore>((set, get) => ({
   authError: null,
   authPrompt: null,
   setAuthPrompt: (prompt) => set({ authPrompt: prompt }),
+  pendingServerLink: null,
+  promptServerLink: (serverUrl) =>
+    set({ pendingServerLink: serverUrl, authPrompt: "server-link" }),
+  clearServerLink: () => set({ pendingServerLink: null }),
+  invitePrompt: null,
+  clearInvitePrompt: () => {
+    clearPendingInvite();
+    set({ invitePrompt: null });
+  },
   landingVault: false,
+  newVaultPrompt: false,
+  clearNewVaultPrompt: () => set({ newVaultPrompt: false }),
+  turningOnSync: false,
   switchingVault: null,
-  openingNotePath: null,
   organizations: [],
   members: [],
   pendingInvitations: [],
   userInvitations: [],
+  vaultVisibility: null,
   ...vaultScopedSyncReset(),
   lastSyncedAt: null,
+  syncPauseDismissed: null,
   vaultPresence: [],
   voiceSpeakers: [],
   broadcasting: false,
@@ -940,20 +2271,148 @@ export const useStore = create<AppStore>((set, get) => ({
   rootFrozen: false,
   billingConfig: null,
   orgBilling: null,
+  myBilling: null,
   activityStatus: readActivityStatus(),
+  activityStatusUntil: readActivityStatusUntil(),
   mentionSound: readMentionSound(),
+  automaticItemColors: readAutomaticItemColors(null),
+  propertiesMode: readPropertiesMode(),
+  editorMeasure: readEditorMeasure(),
+  editorFontSize: readEditorFontSize(),
+  editorFont: readEditorFont(),
+  lineNumbers: readLineNumbers(),
+  homeSectionHidden: readHomeSectionHidden(),
+  setHomeSectionHidden: (hidden) => {
+    writeHomeSectionHidden(hidden);
+    const state = get();
+    if (hidden && state.vault) writePersonalHome(state.vault.path, null);
+    set({ homeSectionHidden: hidden,
+      ...(hidden ? { personalHomeDocId: null, homePickerOpen: false,
+        homeLandingPending: false, homeNavigationPath: null, homeActivation: null,
+        ...(state.homeNavigationPath && state.openingNotePath === state.homeNavigationPath
+          ? { openingNotePath: null } : {}),
+      } : {}),
+    });
+  },
+  appearanceOverrides: readAppearanceOverrides(null),
+  vaultAppearance: {},
+  themeMode: "system",
+  pendingTitleFocus: null,
   treeSort: readTreeSort(),
+  folderSorts: {},
   memberJoined: null,
+
+  personalPins: [],
+  personalHomeDocId: null,
+  homePickerOpen: false,
+  homeLandingPending: false,
+  homeNavigationPath: null,
+  homeActivation: null,
+  togglePin: async (path, isDir, scope = "personal") => {
+    const vault = get().vault;
+    if (!vault) return;
+    const epoch = vault.epoch;
+    let docId = isDir ? null : get().titles.find((t) => t.path === path)?.id ?? (await ipc.getNoteMeta(path))?.id;
+    if (!sameVault(get, epoch) || (!isDir && !docId)) return;
+    if (scope === "vault" && !isDir) {
+      const mapping = await syncManager.registry.registerNote(path, null, docId!);
+      if (!sameVault(get, epoch)) return;
+      if (!mapping) throw new Error("This note has not synced yet. Try again when connected.");
+      docId = mapping.docId;
+    }
+    if (scope === "vault" && isDir) {
+      const folderId = await syncManager.registry.registerFolder(path, path.split("/").pop()!);
+      if (!sameVault(get, epoch)) return;
+      if (!folderId) throw new Error("This folder has not synced yet. Try again when connected.");
+    }
+    const item: PinnedItem = isDir ? { kind: "folder", path } : { kind: "note", docId: docId! };
+    if (scope === "personal") {
+      const next = togglePinned(get().personalPins, item);
+      writePersonalPins(vault.path, next);
+      set({ personalPins: next });
+    } else {
+      const orgId = get().syncEnabled ? get().session?.activeOrganizationId : null;
+      if (!orgId) throw new Error("A synced vault is required");
+      const res = await authManager.api.toggleVaultPin(orgId, item);
+      get().receiveVaultAppearance(orgId, res.settings);
+    }
+  },
+  setHome: async (path, scope = "personal") => {
+    const vault = get().vault;
+    if (!vault) return;
+    const epoch = vault.epoch;
+    let docId = path ? get().titles.find((t) => t.path === path)?.id ?? (await ipc.getNoteMeta(path))?.id : null;
+    if (!sameVault(get, epoch) || (path && !docId)) return;
+    if (scope === "vault" && path) {
+      const mapping = await syncManager.registry.registerNote(path, null, docId!);
+      if (!sameVault(get, epoch)) return;
+      if (!mapping) throw new Error("This note has not synced yet. Try again when connected.");
+      docId = mapping.docId;
+      await syncManager.prepareSharedHome(docId, path, epoch);
+      if (!sameVault(get, epoch)) return;
+    }
+    if (scope === "personal") {
+      writePersonalHome(vault.path, docId ?? null);
+      set({ personalHomeDocId: docId ?? null, homeActivation: null });
+    } else {
+      const orgId = get().syncEnabled ? get().session?.activeOrganizationId : null;
+      if (!orgId) throw new Error("A synced vault is required");
+      const res = await authManager.api.patchVaultAppearance(orgId, { homeDocId: docId ?? null });
+      if (sameVault(get, epoch) && path) {
+        // Choosing the vault Home explicitly also means using it on this device.
+        writePersonalHome(vault.path, null);
+        set({ personalHomeDocId: null });
+      }
+      get().receiveVaultAppearance(orgId, res.settings);
+    }
+    if (path && sameVault(get, epoch)) get().setHomeSectionHidden(false);
+  },
+  openHome: async (pickerIfMissing = true, fullscreen = false) => {
+    if (get().homeSectionHidden) return false;
+    const target = effectiveHomeNote(get());
+    if (target) {
+      const vault = get().vault;
+      const revision = (get().homeActivation?.revision ?? 0) + 1;
+      set({ homePickerOpen: false });
+      await get().openNoteByPath(target.path, "home");
+      // Full width is an explicit sidebar Home action, never ordinary navigation.
+      // Failed/superseded opens must not change the layout of another note.
+      if (fullscreen && !get().homeSectionHidden && vault && get().vault?.path === vault.path && get().vault?.epoch === vault.epoch &&
+          get().openNote?.path === target.path && !get().activeVirtualTab && !get().openingNotePath) {
+        set({ homeActivation: { vaultPath: vault.path, path: target.path,
+          revision } });
+      }
+      return true;
+    }
+    if (pickerIfMissing) set({ homePickerOpen: true });
+    return false;
+  },
 
   setVault: (v) => {
     // Also fires from Rust's `vault-opened` event, which is the only signal some
     // opens produce — so this is where a local vault gets its scope.
     if (v) enterVaultScope(v, get().session?.activeOrganizationId ?? null);
+    // A DIFFERENT folder: whatever we knew about sync belonged to the last one.
+    // Only on an actual change — this fires repeatedly for the same vault, and
+    // re-arming the gate then would make a click wait for a prime that has
+    // already happened.
+    const switched = v?.path !== get().vault?.path;
+    if (switched) armSyncGate();
+    // The last vault's "nothing shared with you" answer is not this one's.
+    if (switched) vaultVisibility.publish(null);
     set({
       vault: v,
+      personalPins: readPersonalPins(v?.path),
+      personalHomeDocId: readPersonalHome(v?.path, get().homeSectionHidden),
+      homePickerOpen: false,
+      ...(switched ? { homeLandingPending: true, homeActivation: null, homeNavigationPath: null } : {}),
       itemColors: readItemColors(v?.path),
       itemOrder: readItemOrder(v?.path),
+      folderSorts: readFolderSorts(v?.path),
+      ...(switched ? { openFolderIsSynced: null } : {}),
     });
+    // Answer "does THIS folder sync?" for the open gate (see `probeFolderSync`).
+    if (switched && v) probeFolderSync(get, set, v.path);
   },
 
   setItemColor: (path, colorId) => {
@@ -1013,6 +2472,21 @@ export const useStore = create<AppStore>((set, get) => ({
     // vault — it's a device preference.
     writeTreeSort(sort);
     set({ treeSort: sort });
+  },
+
+  setFolderSort: (folderPath, sort) => {
+    const vault = get().vault;
+    if (!vault || !folderPath) return;
+    const next = { ...get().folderSorts };
+    if (sort) next[folderPath] = sort;
+    else delete next[folderPath];
+    writeFolderSorts(vault.path, next);
+    set({ folderSorts: next });
+  },
+
+  setAutomaticItemColors: (enabled) => {
+    writeAutomaticItemColors(get().session?.user.id, enabled);
+    get().setAppearanceOverride("autoColors", enabled);
   },
 
   refreshTree: async (folders) => {
@@ -1134,17 +2608,56 @@ export const useStore = create<AppStore>((set, get) => ({
       throw e;
     }
     if (!sameVault(get, epoch)) return;
+    followLocalIndexedMoves(titles);
     set({ titles });
+    if (shouldFollowSharedHome(get())) void get().openHome(false).catch((e) => console.warn("[home] update failed", e));
+    if (get().homeLandingPending && !get().openNote && !get().openingNotePath && !get().activeVirtualTab) void get().openHome(false).catch((e) => console.warn("[home] landing failed", e));
+    // Tags ride along with titles: both are index-derived completion sources
+    // refreshed at the same moments (vault open, note create, structural
+    // batches), and neither is worth its own trigger. Fire-and-forget so a
+    // tag-query hiccup can never fail a title refresh.
+    void get().refreshTags();
+  },
+
+  refreshTags: async () => {
+    const epoch = get().vault?.epoch;
+    let tags: ipc.TagCount[];
+    try {
+      tags = await ipc.listTags(epoch);
+    } catch (e) {
+      if (ipc.isVaultMismatch(e)) return; // the vault moved on (see refreshTree)
+      throw e;
+    }
+    if (!sameVault(get, epoch)) return;
+    set({ tags });
   },
 
   patchTitles: async (changes) => {
     const epoch = get().vault?.epoch;
-    const md = changes.filter((c) => c.path.toLowerCase().endsWith(".md"));
+    // The whole note family, not just `.md`: `index.rs` indexes all seven
+    // extensions, so a renamed `.txt` whose title never reached this patch
+    // would leave a stale row in the sidebar's title map until the next full
+    // refresh.
+    const md = changes.filter((c) => isNoteExt(c.path));
     if (md.length === 0) return;
+    // A big batch asks ONCE instead of per file. `get_note_meta` takes the Rust
+    // index mutex on every call, and a flat import of thousands of `.md` arrives
+    // here as one debounce flush — which used to fire that many concurrent
+    // invokes, all contending for the same lock the watcher's own 128-file index
+    // chunks are holding. `list_note_titles` is one call, one lock acquire, and
+    // above this many paths it is also less data than the patch would have been.
+    if (md.length > PATCH_TITLES_MAX) {
+      await get().refreshTitles();
+      return;
+    }
     const removed: string[] = [];
     const updates: ipc.NoteTitle[] = [];
-    await Promise.all(
-      md.map(async (c) => {
+    // Bounded, not an unbounded `Promise.all`: below the threshold above this is
+    // still up to 200 lock acquisitions, and eight in flight keeps the bridge
+    // busy without starving the indexer that is writing those same rows.
+    await runPool(
+      md,
+      async (c) => {
         if (c.kind === "removed") {
           removed.push(c.path);
           return;
@@ -1158,10 +2671,12 @@ export const useStore = create<AppStore>((set, get) => ({
           // Leave that row alone; the next full refresh (a structural batch or a
           // vault open) reconciles it.
         }
-      }),
+      },
+      { concurrency: IPC_CONCURRENCY, shouldStop: () => !sameVault(get, epoch) },
     );
     if (!sameVault(get, epoch)) return;
     const next = applyTitlePatch(get().titles, updates, removed);
+    followLocalIndexedMoves(next);
     if (next !== get().titles) set({ titles: next });
   },
 
@@ -1189,33 +2704,73 @@ export const useStore = create<AppStore>((set, get) => ({
     // Land a freshly signed-in user on the Welcome note — but never yank them
     // away from a note they already have open.
     if (get().openNote) return;
+    const epoch = get().vault?.epoch;
+    const orgId = get().syncEnabled ? get().session?.activeOrganizationId : null;
+    if (orgId) await get().loadVaultAppearance(orgId);
+    if (!sameVault(get, epoch) || get().openNote || get().openingNotePath) return;
+    if (await get().openHome(false)) return;
+    set({ homeLandingPending: false });
     const hasWelcome = get().titles.some((t) => t.path === WELCOME_NOTE_PATH);
     if (hasWelcome) await get().openNoteByPath(WELCOME_NOTE_PATH);
   },
 
-  openNoteByPath: async (path) => {
+  openNoteByPath: async (path, source) => {
     const epoch = get().vault?.epoch;
+    const stillOpening = () => sameVault(get, epoch) && get().openingNotePath === path;
+    // A note opened from anywhere takes the editor area back from a virtual tab.
+    if (get().activeVirtualTab) set({ activeVirtualTab: null });
     // Name the note being opened before the first await. In a synced vault this
     // function makes a network call (`registerNote`) before `openNote` is set,
     // so the row stays unselected and the editor keeps showing the previous note
     // for the whole round trip — a click that visibly does nothing. The sidebar
     // row and the editor both watch this and acknowledge the click at once.
-    set({ openingNotePath: path });
+    set({ openingNotePath: path, homeLandingPending: false, homeActivation: null,
+      homeNavigationPath: source === "home" ? path : null,
+      ...(source === "home" ? { revealRequest: null } : {}),
+    });
     try {
+      // The boot paints before sync primes, so this click can land while the
+      // registry holds no doc-id map. Opening a MAPPED note then means opening
+      // it with no provider and seeding its CRDT from the file — the
+      // pull-before-seed reversal that forks a doc (see `openGate`). The click
+      // is already acknowledged above, so this wait is invisible; the timeout is
+      // a belt (the prime is one local config read, not a round trip).
+      if (
+        planOpen({
+          syncReady: syncManager.isSyncable(),
+          folderIsSynced: get().openFolderIsSynced,
+          authStatus: get().authStatus,
+        }).action === "wait"
+      ) {
+        await Promise.race([syncReadyGate.promise, sleep(SYNC_GATE_MS)]);
+        if (!stillOpening()) return;
+        if (!syncManager.isSyncable() && get().authStatus !== "signed-out") {
+          // The belt fired. Never expected: the prime is one local file read,
+          // and every refusal path releases the gate explicitly. Say so, because
+          // the open below is the one that can take the local-only branch.
+          console.warn(
+            `[sync] opened "${path}" before sync primed (waited ${SYNC_GATE_MS}ms)`,
+          );
+        }
+      }
       const meta = await ipc.getNoteMeta(path);
-      if (!sameVault(get, epoch)) return; // vault switched mid-open — drop it
+      if (!stillOpening()) return; // vault switched mid-open — drop it
       const title = meta?.title ?? path.split("/").pop() ?? path;
       // Ensure the note is registered server-side BEFORE the editor opens it, so
       // its doc_id is known and the sync provider connects on first open.
-      // Only markdown notes sync — HTML pages are local files rendered in-app.
-      if (get().syncEnabled && path.toLowerCase().endsWith(".md")) {
+      // The editor family only (md/markdown/mdx/txt). `.html` and `.canvas` are
+      // note-family too and `flattenTree` already registers them on the server;
+      // they just do not open through the bridge (see `isEditorNote`), so this
+      // open-time registration — whose whole job is to have a doc_id before the
+      // provider connects — has nothing to do for them.
+      if (get().syncEnabled && isEditorNote(path)) {
         try {
           // Pass the local index doc_id so the server adopts the SAME id — the
           // editor's bridge and the sync provider must key the note identically.
           await syncManager.registry.registerNote(path, title, meta?.id);
         } catch (e) {
           console.warn("[sync] registerNote failed", e);
-          if (!sameVault(get, epoch)) return;
+          if (!stillOpening()) return;
           // The note opens regardless (local-first: the text is safe on disk),
           // but it opens UNREGISTERED — no docId, so no provider connects and
           // nothing it says reaches the server. Two things keep that from being
@@ -1223,42 +2778,116 @@ export const useStore = create<AppStore>((set, get) => ({
           // the sidebar counts unmapped notes as unsynced), and the same
           // debounced registry pull a teammate's change triggers is armed here,
           // which registers the note and uploads its content when it runs.
-          syncManager.handleRegistryChanged();
+          syncManager.handleRegistryChanged("register-failed");
           // Say so once per note. Skipped while the vault channel itself is down:
           // the connection indicator already reads "Retrying…", and a toast per
           // opened note while offline would only bury it.
           if (get().syncStatus === "synced" && !registerFailureToasted.has(path)) {
             registerFailureToasted.add(path);
             toast(
-              `"${title}" couldn't be registered for sync — ${
+              `"${title}" couldn't be registered for sync: ${
                 e instanceof Error ? e.message : String(e)
               }. It's saved on this device and will be retried.`,
               "error",
             );
           }
         }
-        if (!sameVault(get, epoch)) return;
+        if (!stillOpening()) return;
       }
       set((s) => ({
         openNote: { path, id: meta?.id ?? null, title },
         noteRemoved: false,
-        // Every open gets (or keeps) a tab; switching tabs re-runs this path,
-        // so membership is checked rather than blindly appended.
+        noteRemovedSynced: false,
+        // Every open gets (or keeps) a tab, in place: switching tabs re-runs
+        // this path, so membership is checked rather than blindly appended, and
+        // an existing tab is never moved — the highlight travels, the tabs don't.
         openTabs: s.openTabs.includes(path) ? s.openTabs : [...s.openTabs, path],
       }));
+      // Home owns its shortcut; do not expand or scroll to the source file.
+      if (source !== "home") get().requestReveal(path);
       // Tell teammates which note we're now viewing (drives their sidebar dots).
-      // The announced id must be the SERVER doc_id — see `viewingDocId`, which
-      // exists to hold that reasoning and a regression test for it.
-      syncManager.setViewing(
-        viewingDocId(meta?.id, syncManager.registry.getMapping(path)?.docId),
-      );
+      // The announced id must be the SERVER doc_id — see `viewingDocId`. We hand
+      // over the PATH rather than a resolved id: opening a note while the
+      // post-join reconcile is still running finds no mapping yet, and a value
+      // resolved here would be replayed, unchanged, for the whole session (#125).
+      // The sync layer re-resolves on every announce and again when the map moves.
+      syncManager.setViewing(path, meta?.id ?? null);
       await get().refreshBacklinks();
     } finally {
       // Only the newest open clears it: two quick clicks would otherwise have the
       // first one's completion cancel the second one's indicator.
-      if (get().openingNotePath === path) set({ openingNotePath: null });
+      if (stillOpening()) set({ openingNotePath: null });
     }
   },
+
+  createNoteAt: async (dir, name) => {
+    if (rootCreateBlocked(get, dir)) return null;
+    return finishNoteCreate(get, await ipc.createNote(dir, name));
+  },
+
+  createNoteIn: async (dir) => {
+    if (rootCreateBlocked(get, dir)) return null;
+    for (let i = 0; i < 50; i++) {
+      const candidate = i === 0 ? "Untitled" : `Untitled ${i}`;
+      let path: string;
+      try {
+        path = await ipc.createNote(dir, candidate);
+      } catch {
+        continue; // name taken → try the next one
+      }
+      return finishNoteCreate(get, path, { edit: true });
+    }
+    return null;
+  },
+
+  setPendingTitleFocus: (path) => set({ pendingTitleFocus: path }),
+
+  requestReveal: (path, opts) => {
+    set((s) => ({
+      revealRequest: {
+        path,
+        edit: opts?.edit ?? false,
+        token: (s.revealRequest?.token ?? 0) + 1,
+      },
+    }));
+  },
+
+  requestSettings: (tab, section) => {
+    // The vault list lives in Account Settings → Vaults (2026-10-07). Signed
+    // out there is no account page, so Vault Settings keeps it for local folders.
+    if (tab === "vaults" && get().session) {
+      get().requestAccountSettings("vaults");
+      return;
+    }
+    set((s) => ({
+      settingsRequest: { tab, section, token: (s.settingsRequest?.token ?? 0) + 1 },
+      settingsDialog: "vault",
+    }));
+  },
+
+  requestAccountSettings: (tab) => {
+    set((s) => ({
+      accountSettingsRequest: {
+        tab,
+        token: (s.accountSettingsRequest?.token ?? 0) + 1,
+      },
+      settingsDialog: "account",
+    }));
+  },
+
+  requestUpgradeDialog: (opts) => {
+    set((s) => ({
+      upgradeDialogRequest: {
+        reason: opts?.reason,
+        orgId: opts?.orgId,
+        token: (s.upgradeDialogRequest?.token ?? 0) + 1,
+      },
+    }));
+  },
+
+  clearUpgradeDialogRequest: () => set({ upgradeDialogRequest: null }),
+
+  setRevealedPath: (path) => set({ revealedPath: path }),
 
   openNoteLink: async (url) => {
     const target = parseNoteLink(url);
@@ -1275,7 +2904,7 @@ export const useStore = create<AppStore>((set, get) => ({
         // Actually signed out: put the sign-in dialog up. "unknown" stays
         // silent — initAuth resolves it either way and consumes the queue.
         set({ authPrompt: "note-link" });
-        toast("Sign in to open this shared note — it will open right after you sign in", "neutral");
+        toast("Sign in to open this shared note. It will open right after you sign in", "neutral");
       }
       return;
     }
@@ -1304,7 +2933,7 @@ export const useStore = create<AppStore>((set, get) => ({
       // consumes it, and dismissing the prompt drops it.
       queueNoteLink(url);
       toast(
-        `Choose a folder for “${pendingFolder.orgName}” — the shared note will open once it's set`,
+        `Choose a folder for “${pendingFolder.orgName}”. The shared note will open once it's set`,
         "neutral",
       );
       return;
@@ -1317,7 +2946,7 @@ export const useStore = create<AppStore>((set, get) => ({
     const progressTimer = setTimeout(() => {
       const name =
         get().organizations.find((o) => o.id === target.orgId)?.name ?? "the vault";
-      progressToastId = toast(`Opening shared note — syncing “${name}”…`, "neutral");
+      progressToastId = toast(`Opening shared note. Syncing “${name}”…`, "neutral");
     }, 1_000);
     const path = await waitForDocPath(target.docId, {
       isBusy: () => {
@@ -1343,6 +2972,78 @@ export const useStore = create<AppStore>((set, get) => ({
     await get().openNoteByPath(path);
   },
 
+  openInviteLink: async (url) => {
+    const link = parseInviteDeepLink(url);
+    if (!link) return;
+    // B5: the invite secret rides in memory until the vault opens.
+    rememberInviteSecret(link.invitationId, link.secret);
+
+    // 1. Wrong server? Park the invite and ask. A deep link must never repoint
+    // this device on its own — that value decides where a password gets posted
+    // (the same rule `promptServerLink` exists for). `setServerUrl` picks the
+    // invite back up when the user clicks Connect.
+    const sameServer =
+      link.server == null ||
+      normalizeServerUrl(link.server) === normalizeServerUrl(get().serverUrl);
+    if (!sameServer) {
+      queueInvite(link);
+      get().promptServerLink(link.server!);
+      return;
+    }
+
+    // 2. What is this invitation? Public route, so this works signed out — and
+    // it is what lets the sign-in card name the vault instead of appearing for
+    // no stated reason.
+    let preview: InvitationPreview;
+    try {
+      preview = await authManager.api.previewInvitation(link.invitationId);
+    } catch {
+      // 404 (unknown id) and any other failure alike: an invitation we cannot
+      // read is one the user cannot use, and an unknown id must stay
+      // indistinguishable from a consumed one.
+      toast(INVITE_GONE_MESSAGE, "error");
+      return;
+    }
+    // 3. Accepted, declined, revoked or expired: the same sentence as an
+    // unknown id, because to the person holding the link they are one situation
+    // — and distinguishing them would leak whether an id was ever real.
+    if (preview.status !== "pending") {
+      toast(INVITE_GONE_MESSAGE, "error");
+      return;
+    }
+
+    const authStatus = get().authStatus;
+    if (authStatus === "signed-in") {
+      // 4. Accept now. `acceptInvitation` switches into the vault, binds its
+      // folder and celebrates — accepting an invitation IS asking to work there.
+      try {
+        await get().acceptInvitation(link.invitationId);
+      } catch (e) {
+        toast(
+          acceptInviteFailureMessage(e, {
+            inviteEmail: preview.email,
+            sessionEmail: get().session?.user.email ?? null,
+          }),
+          "error",
+        );
+      }
+      return;
+    }
+
+    queueInvite(link);
+    if (authStatus === "signed-out") {
+      // 5. Raise the dialog, carrying the preview so the card can say who
+      // invited them, to what, and at which address.
+      set({ invitePrompt: preview, authPrompt: "invite" });
+      return;
+    }
+    // 6. "unknown" — the click LAUNCHED the app and `initAuth` is still
+    // restoring the session. Stay silent: initAuth consumes the queue on the
+    // signed-in path and raises the prompt on the signed-out one, and guessing
+    // here would either flash a sign-in card at someone who has a session or
+    // accept against a session that doesn't exist yet.
+  },
+
   refreshBacklinks: async () => {
     const note = get().openNote;
     if (!note?.id) {
@@ -1357,7 +3058,17 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  setNoteRemoved: (removed) => set({ noteRemoved: removed }),
+  setNoteRemoved: (removed, synced) =>
+    set((s) => ({
+      noteRemoved: removed,
+      // Latched here: the sync layer drops the note's mapping when it propagates
+      // the disk delete, so `noteRemovedSynced` has to be sampled at the moment
+      // the file vanished rather than read off the map later — which is why a
+      // deferred caller passes the value it sampled then.
+      noteRemovedSynced: removed
+        ? (synced ?? !!s.docIdByPath[s.openNote?.path ?? ""])
+        : false,
+    })),
 
   /**
    * A teammate moved the note we have open; the file has already moved on disk.
@@ -1368,6 +3079,53 @@ export const useStore = create<AppStore>((set, get) => ({
    * content is intact. Cursor position and undo history are lost; for a move
    * someone else initiated that's an acceptable trade for not forking the note.
    */
+  renameNoteFile: async (oldPath, newPath) => {
+    const epoch = get().vault?.epoch;
+    const m = /^(.*?)(\.[^./]+)?$/.exec(newPath);
+    const base = m?.[1] ?? newPath;
+    const ext = m?.[2] ?? "";
+    let target = newPath;
+    for (let i = 1; i <= 20 && (await ipc.noteExists(target, epoch)); i++) {
+      target = `${base} ${i}${ext}`;
+    }
+    if (await ipc.noteExists(target, epoch)) return null;
+    const ok = await get().renameNoteFileExact(oldPath, target);
+    return ok ? target : null;
+  },
+
+  renameNoteFileExact: async (oldPath, newPath) => {
+    if (oldPath === newPath) return true;
+    const epoch = get().vault?.epoch;
+    // Epoch-pinned: this spans awaits, so a vault switch mid-rename must be
+    // refused by Rust rather than applied to the other vault.
+    await ipc.renamePath(oldPath, newPath, epoch);
+    // Re-point the open note (and tabs, order, sorts) the moment the disk move
+    // lands, BEFORE the server PATCH. The watcher reports the old path as
+    // `removed` ~150ms later; with the PATCH still in flight the open note sat
+    // on a path that no longer existed and flashed "was removed". A PATCH
+    // failure only warns and keeps the disk rename, so the order is free.
+    get().setItemOrder(renameInOrder(get().itemOrder, oldPath, newPath));
+    {
+      const sorts = renameInFolderSorts(get().folderSorts, oldPath, newPath);
+      const vault = get().vault;
+      if (sorts !== get().folderSorts && vault) {
+        writeFolderSorts(vault.path, sorts);
+        set({ folderSorts: sorts });
+      }
+    }
+    get().followNoteRename(oldPath, newPath);
+    // The registry rename is what keeps `doc_id` stable across the move.
+    // Skipping it forks the note into a second server-side note at the new path.
+    try {
+      await syncManager.registry.renamePath(oldPath, newPath);
+    } catch (e) {
+      console.warn("[sync] renamePath failed", oldPath, e);
+    }
+    await get().refreshTree();
+    await get().refreshTitles();
+    return true;
+  },
+
   followNoteRename: (from, to) => {
     // Background tabs follow the move too, open note or not — a stale tab path
     // would reopen a file that no longer exists.
@@ -1384,7 +3142,13 @@ export const useStore = create<AppStore>((set, get) => ({
 
   closeNote: () => {
     syncManager.setViewing(null);
-    set({ openNote: null, backlinks: [], noteRemoved: false, noteRemovedByTeammate: null });
+    set({
+      openNote: null,
+      backlinks: [],
+      noteRemoved: false,
+      noteRemovedSynced: false,
+      noteRemovedByTeammate: null,
+    });
   },
 
   closeTab: (path) => {
@@ -1408,6 +3172,17 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   remapTabs: (from, to) => {
+    const vault = get().vault;
+    const pins = renamePinnedFolders(get().personalPins, from, to);
+    const orgId = get().syncEnabled ? get().session?.activeOrganizationId : null;
+    if (orgId) {
+      const appearance = get().vaultAppearance[orgId];
+      if (appearance?.pinnedItems) get().receiveVaultAppearance(orgId, { ...appearance, pinnedItems: renamePinnedFolders(appearance.pinnedItems, from, to) });
+    }
+    if (vault && pins.some((p, i) => p !== get().personalPins[i])) {
+      writePersonalPins(vault.path, pins);
+      set({ personalPins: pins });
+    }
     const tabs = get().openTabs;
     const mapped = tabs.map((p) =>
       p === from ? to : p.startsWith(from + "/") ? to + p.slice(from.length) : p,
@@ -1448,8 +3223,36 @@ export const useStore = create<AppStore>((set, get) => ({
 
   // ---- Auth ----
 
-  initAuth: async () => {
+  initAuth: async (opts) => {
     syncManager.setStatusListener((status) => get().setSyncStatus(status));
+    // The closed-app edits pass (#284) skips padlocked notes, read from the same
+    // lock view the editor and sidebar use, fetched fresh (a throw = push nothing).
+    syncManager.setReadOnlyPathCheck?.(async () => {
+      const vaultId = syncManager.registry.vaultId;
+      if (!vaultId) throw new Error("no vault");
+      const overlay = await authManager.api.listVaultLocks(vaultId);
+      const locks = overlay
+        .filter((s) => s.permission === "locked" || s.permission === "readonly")
+        .map((s) => (s.permission === "readonly" ? { ...s, permission: "locked" as const } : s));
+      const lifts = overlay.filter((s) => s.permission === "edit");
+      const state = get();
+      const map = lockScopesByPath(state.tree, locks, state.session?.user.id, lifts);
+      return (relPath) => lockBlocksCaller(map, relPath);
+    });
+    syncManager.setSyncPauseListener((pause) => set({ syncPause: pause }));
+    syncManager.setVaultStatusListener((status) => {
+      set(status === "synced"
+        ? { vaultSyncStatus: status, vaultReadySeen: true }
+        : { vaultSyncStatus: status === "idle" ? "offline" : status });
+      // Home/pins can change while disconnected without any file changing.
+      const orgId = get().syncEnabled ? get().session?.activeOrganizationId : null;
+      if (status === "synced" && orgId) void get().loadVaultAppearance(orgId);
+    });
+    // The server refused our session at token mint and a fresh session check
+    // agreed it is gone (`sync/sessionGuard.ts`). Fires at most once per
+    // session — this is what makes an expiry mid-run visible NOW instead of at
+    // the next launch (#145).
+    syncManager.setSessionRejectedListener(() => get().handleSessionExpired());
     syncManager.setActivityListeners({
       onPending: (pending) => get().setSyncPending(pending),
       onFlushed: () => get().markSynced(),
@@ -1462,6 +3265,8 @@ export const useStore = create<AppStore>((set, get) => ({
       // The root-freeze latch rides the same signal the server already sends
       // when it changes, so a teammate flipping it reaches this app live.
       void get().refreshVaultSettings();
+      const orgId = get().syncEnabled ? get().session?.activeOrganizationId : null;
+      if (orgId) void get().loadVaultAppearance(orgId);
     });
     // A teammate changed shares (lock/unlock, grant/revoke). Fresh lock
     // knowledge is what lets the editor open a just-locked note read-only from
@@ -1475,18 +3280,48 @@ export const useStore = create<AppStore>((set, get) => ({
     // CodeMirror bound to a destroyed Y.Doc throws on the next keystroke.
     syncManager.setInboundListeners({
       onNotePathChanged: (_docId, from, to) => get().followNoteRename(from, to),
-      onNoteRemoved: (_docId, path, trashedTo) => {
+      // Notes that became readable since the previous pull (a grant).
+      onAccessGranted: ({ count, paths }) => {
+        const ev: AccessEvent = {
+          kind: "granted",
+          at: Date.now(),
+          vaultId: syncManager.registry.vaultId ?? null,
+          count,
+          paths,
+        };
+        set({ accessEvents: [...get().accessEvents, ev].slice(-ACCESS_EVENTS_MAX) });
+      },
+      onNoteRemoved: (docId, path, trashedTo, reason) => {
+        if (reason === "revoked") {
+          const ev: AccessEvent = {
+            kind: "removed",
+            at: Date.now(),
+            vaultId: syncManager.registry.vaultId ?? null,
+            docId,
+            path,
+            ...(syncManager.registry.isSelfRevocation(docId, path) ? { self: true } : {}),
+          };
+          set({ accessEvents: [...get().accessEvents, ev].slice(-ACCESS_EVENTS_MAX) });
+        }
         get().pruneTabs([path]);
         const open = get().openNote;
         if (open && (open.path === path || open.path.startsWith(path + "/"))) {
           get().closeNote();
-          set({ noteRemovedByTeammate: trashedTo });
+          set({ noteRemovedByTeammate: { reason, trashedTo } });
         }
       },
     });
     // A teammate joined the vault — refresh the roster live (no reload) and
     // celebrate. Fires for everyone already connected; the joiner celebrates
     // locally in joinVault/acceptInvitation (they connect after the push).
+    // This user lost membership of the vault (removed, or left on another
+    // device). Only our own userId counts; the action re-checks the org list.
+    syncManager.setMemberRemovedListener((change) => {
+      if (!frameTargetsMe(change.userId, get().session?.user.id)) return;
+      void get()
+        .handleMembershipLost(change.orgId, change.reason)
+        .catch((e: unknown) => console.warn("[vault] membership-lost cleanup failed", e));
+    });
     syncManager.setMemberJoinedListener((name) => {
       void get().refreshVault();
       // Re-announce so the newcomer sees who is already here. Their own first
@@ -1494,6 +3329,33 @@ export const useStore = create<AppStore>((set, get) => ({
       // round was missed, and the roster has no other way to converge.
       syncManager.announcePresence();
       get().celebrateMemberJoined(name);
+    });
+    // The open vault was renamed or got a new icon on another device (#306):
+    // patch it in place; with nothing usable in the frame, re-list.
+    // Vault appearance defaults changed on another device: same live path as
+    // the vault's name/icon (#306), keyed by the frame's org.
+    syncManager.setAppearanceChangedListener((change) => {
+      const orgId = change.orgId ?? get().session?.activeOrganizationId ?? null;
+      if (orgId) get().receiveVaultAppearance(orgId, change.settings);
+    });
+    syncManager.setOrgChangedListener((change) => {
+      const orgId = get().session?.activeOrganizationId ?? null;
+      const hasFields = change.name !== undefined || change.logo !== undefined;
+      if (!orgId || !hasFields || !get().organizations.some((o) => o.id === orgId)) {
+        void get().refreshVault();
+        return;
+      }
+      set({
+        organizations: get().organizations.map((o) =>
+          o.id === orgId
+            ? {
+                ...o,
+                ...(change.name !== undefined ? { name: change.name } : {}),
+                ...(change.logo !== undefined ? { logo: change.logo } : {}),
+              }
+            : o,
+        ),
+      });
     });
     // Live sidebar presence — the vault channel tells us which teammate is
     // viewing which note; mirror the roster into the store for FileTree.
@@ -1506,6 +3368,17 @@ export const useStore = create<AppStore>((set, get) => ({
     // run costs ~10 store writes per second rather than one per note.
     syncManager.setSyncProgressListener((progress) => get().setSyncProgress(progress));
     syncManager.setDocStateListener((patch) => get().patchDocSyncState(patch));
+    // The same signal for files: the attachment mirror speaks once per pass and
+    // once per upload, which is orders of magnitude quieter than the note run.
+    syncManager.setFileStateListener((states) => get().setFileSyncState(states));
+    // Optional chaining keeps narrow test/legacy manager shims compatible;
+    // the production manager always exposes this listener.
+    syncManager.setAttachmentEntitlementListener?.((blocked) =>
+      get().setAttachmentSyncBlocked(blocked),
+    );
+    // The vault folder moved, a bulk delete is waiting, or the closed-app notice
+    // (#221). Optional for the same narrow-shim reason as the line above.
+    syncManager.setStructureNoticeListener?.((notice) => get().applyStructureNotice(notice));
     // The path→docId index the sidebar needs to attach a docId-keyed sync state
     // to a path-keyed row. Coalesced by SyncManager on the same ~10/second budget.
     syncManager.setRegistryMapListener((map) => get().setDocIdByPath(map));
@@ -1516,46 +3389,110 @@ export const useStore = create<AppStore>((set, get) => ({
     // Folder/note colors, from the same pull — a vault-wide fact, so the whole
     // team sees the arrangement one person set up.
     syncManager.setColorListener((colors) => get().applyVaultColors(colors));
+    // This whole restore is detached from the launch, so every `set()` past an
+    // await is gated: a sign-out (or a sign-in as someone else) that happens
+    // while we are still restoring OWNS the resulting state, and this call must
+    // drop its remaining work rather than re-land the old session on top.
+    let gen = ++authInitGen;
+    const superseded = () => authInitGen !== gen;
     try {
-      const session = await authManager.init();
+      const session = await (opts?.session ?? authManager.init());
+      perf.mark("auth-resolved");
+      if (superseded()) return;
       set({ serverUrl: authManager.getServerUrl() });
       if (session) {
         set({ session, authStatus: "signed-in", authError: null });
-        await get().refreshVault();
-        await get().refreshBillingConfig();
-        await landInLastVault(get);
-        await get().refreshOrgBilling();
+        // Seamless keys F at launch: a remembered password refreshes the
+        // account key's password wrap (or unlocks it). Background; never blocks.
+        void launchPasswordUnlock(authManager.getServerUrl(), session.user.id, session.user.email);
+        // Independent of each other: the vault roster + invitations, and the
+        // billing feature flag. Serial, these were two round trips in front of
+        // the landing for no reason.
+        // The landing needs the vault LIST and nothing else from these two: the
+        // member roster, both invitation lists and the billing flag are panel
+        // data that no part of getting a vault on screen reads. Awaiting them
+        // here is what put four round trips between sign-in and the first byte
+        // of sync. `refreshVault` resolves once `organizations` is set.
+        await Promise.all([
+          get().refreshVault({ rosterInBackground: true }),
+          get().refreshBillingConfig(),
+        ]);
+        if (superseded()) return;
+        // An invitation link may have LAUNCHED the app too, and the vault it
+        // names is where the user must land — so the ordinary landing is
+        // skipped while one is queued (landing elsewhere first would bind a
+        // folder and reconcile a vault nobody asked for, then do it again).
+        // A FAILED accept falls back to it rather than stranding the user.
+        const joined = peekPendingInvite() != null && (await consumeQueuedInvite(get, set));
+        // `acceptInvitation` claims the generation itself (it re-reads the
+        // session and switches the active vault). That claim is OURS — this
+        // restore is what delegated to it — so adopt it instead of reading our
+        // own delegate as a supersession and abandoning the rest of the boot.
+        gen = authInitGen;
+        // Seat usage + plan feed the billing panel only — nothing about getting
+        // a vault on screen waits for them. (It reads `billingConfig`, so it has
+        // to follow the pair above.)
+        void get().refreshOrgBilling();
+        if (!joined) await landInLastVault(get);
+        if (superseded()) return;
         // A share link may have LAUNCHED the app: its deep-link replay raced
         // this restore while authStatus was still "unknown" and got queued.
         await consumeQueuedNoteLink(get);
       } else {
+        if (superseded()) return;
         set({ session: null, authStatus: "signed-out" });
-        if (hasPendingNoteLink()) promptSignInForQueuedLink(set);
+        // Signed out: no note will ever get a provider, so nothing is waiting
+        // for (see the open gate in `openNoteByPath`).
+        resolveSyncGate();
+        if (peekPendingInvite()) await promptSignInForQueuedInvite(set);
+        else if (hasPendingNoteLink()) promptSignInForQueuedLink(set);
       }
     } catch (e) {
+      if (superseded()) return;
       set({ authStatus: "signed-out", authError: errMsg(e) });
-      if (hasPendingNoteLink()) promptSignInForQueuedLink(set);
+      resolveSyncGate();
+      if (peekPendingInvite()) await promptSignInForQueuedInvite(set);
+      else if (hasPendingNoteLink()) promptSignInForQueuedLink(set);
     }
   },
 
   signIn: async (email, password) => {
     set({ authError: null });
+    // This flow owns the session from here: a detached `initAuth` still
+    // restoring the previous one must not land its state on top of ours.
+    ++authInitGen;
     try {
       await authManager.signIn({ email, password });
       const session = await authManager.currentSession();
+      // Seamless keys F: the password unlocks this account's key before any
+      // vault opens (so a new computer needs no approval). Bounded; any
+      // failure falls back to one-click approval and never blocks sign-in.
+      if (session) {
+        // A good manual password: launch-time unlock may run again.
+        allowLaunchUnlock(authManager.getServerUrl(), session.user.id);
+        await passwordUnlockBounded(session.user.id, password);
+      }
       set({ session, authStatus: session ? "signed-in" : "signed-out" });
       if (session) {
         await get().refreshVault();
         await get().refreshBillingConfig();
-        // Open the vault they last used, rather than making them pick one — and
-        // if the account has none yet, make one. Signing in never dead-ends back
-        // on the welcome screen.
-        await landInLastVault(get);
+        // An invitation waiting on this sign-in owns the landing: its vault is
+        // the one the user is joining. Only a failed accept falls through to
+        // the ordinary landing (below), so an email mismatch still leaves them
+        // somewhere usable with the reason on screen.
+        const joined = peekPendingInvite() != null && (await consumeQueuedInvite(get, set));
+        if (!joined) {
+          // Open the vault they last used, rather than making them pick one — and
+          // if the account has none yet, make one. Signing in never dead-ends back
+          // on the welcome screen.
+          await landInLastVault(get);
+        }
         await get().refreshOrgBilling();
-        await get().openWelcomeIfPresent();
+        if (!joined) await get().openWelcomeIfPresent();
         // A shared link queued while signed out supersedes Welcome — the
         // landing already switched into its vault via requestOpenVault.
         await consumeQueuedNoteLink(get);
+        if (!joined) await consumeTurnOnSyncAfterAuth(get);
       }
     } catch (e) {
       set({ authError: errMsg(e) });
@@ -1565,6 +3502,9 @@ export const useStore = create<AppStore>((set, get) => ({
 
   signInWithGoogle: async () => {
     set({ authError: null });
+    // This flow owns the session from here: a detached `initAuth` still
+    // restoring the previous one must not land its state on top of ours.
+    ++authInitGen;
     // Errors (incl. the loopback timeout on an abandoned flow) propagate to the
     // caller, which decides whether to surface them — a cancelled/superseded flow
     // must NOT flash a late error. See AuthDialog.googleSignIn.
@@ -1574,32 +3514,72 @@ export const useStore = create<AppStore>((set, get) => ({
     if (session) {
       await get().refreshVault();
       await get().refreshBillingConfig();
-      // Same as email sign-in: land in a vault, creating the first one if the
-      // account has none.
-      await landInLastVault(get);
+      // Same as email sign-in: a queued invitation owns the landing, otherwise
+      // land in a vault, creating the first one if the account has none.
+      const joined = peekPendingInvite() != null && (await consumeQueuedInvite(get, set));
+      if (!joined) await landInLastVault(get);
       await get().refreshOrgBilling();
-      await get().openWelcomeIfPresent();
+      if (!joined) await get().openWelcomeIfPresent();
       await consumeQueuedNoteLink(get);
+      if (!joined) await consumeTurnOnSyncAfterAuth(get);
     }
   },
 
   signUp: async (name, email, password) => {
     set({ authError: null });
+    // This flow owns the session from here: a detached `initAuth` still
+    // restoring the previous one must not land its state on top of ours.
+    ++authInitGen;
     try {
       await authManager.signUp({ name, email, password });
       const session = await authManager.currentSession();
+      // As on sign-in: a brand-new account has no account key yet, so this
+      // holds the unlock key and the first key run writes the password wrap.
+      // Without it a new solo owner's first vault waited unencrypted (the
+      // conversion safety rule saw no way back) until a later sign-in.
+      if (session) {
+        allowLaunchUnlock(authManager.getServerUrl(), session.user.id);
+        await passwordUnlockBounded(session.user.id, password);
+      }
       set({ session, authStatus: session ? "signed-in" : "signed-out" });
       if (session) {
         await get().refreshVault();
         await get().refreshBillingConfig();
-        // A brand-new account has nothing to restore, so this is what actually
-        // creates their first vault and opens it. Sign-up used to skip landing
-        // entirely, which is why signing up from the welcome screen returned you
-        // to the welcome screen.
-        await landInLastVault(get);
+        // The commonest invite case by far: the invitee had no account, so they
+        // sign UP from the invite card. Accepting is the landing — and it also
+        // stops `landInLastVault` from inventing a private "My Vault" first,
+        // which is what made joining a team look like starting alone.
+        const joined = peekPendingInvite() != null && (await consumeQueuedInvite(get, set));
+        if (!joined) {
+          // A brand-new account has nothing to restore, so this is what actually
+          // creates their first vault and opens it. Sign-up used to skip landing
+          // entirely, which is why signing up from the welcome screen returned you
+          // to the welcome screen.
+          await landInLastVault(get);
+        }
         await get().refreshOrgBilling();
-        await get().openWelcomeIfPresent();
+        if (!joined) await get().openWelcomeIfPresent();
         await consumeQueuedNoteLink(get);
+        if (!joined) await consumeTurnOnSyncAfterAuth(get);
+        // A brand-new account with nothing open lands on the welcome screen
+        // (the landing never invents a vault). Push it straight to naming its
+        // first one; a join-with-code sign-up is waiting for its code instead.
+        if (!joined && !joiningWithCode && !get().vault && get().organizations.length === 0) {
+          set({ newVaultPrompt: true });
+        }
+        // The dialog closes the instant the session lands, so this is the only
+        // place the person hears that a confirmation email went out. Raised
+        // AFTER landing, because <Toasts /> only mounts once a vault is open —
+        // raised earlier it would tick down unseen. Only when the server can
+        // send email at all; otherwise nothing was sent and there is nothing to
+        // say.
+        const methods = await authManager.api.getAuthMethods();
+        if (methods.passwordReset && session.user.emailVerified === false) {
+          toast(
+            `Account created. We sent a confirmation email to ${session.user.email}. Click its link to confirm your address.`,
+            "neutral",
+          );
+        }
       }
     } catch (e) {
       set({ authError: errMsg(e) });
@@ -1608,6 +3588,9 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   signOut: async () => {
+    // This flow owns the session from here: a detached `initAuth` still
+    // restoring the previous one must not land its state on top of ours.
+    ++authInitGen;
     // Flush any debounced local write first so tearing down the view can't drop
     // an in-flight edit (the .md files stay on disk regardless of the account).
     try {
@@ -1619,12 +3602,23 @@ export const useStore = create<AppStore>((set, get) => ({
     // reconcile/pull with a token that is about to be revoked.
     leaveVaultSync();
     await authManager.signOut();
+    // Vault keys belong to the account: drop every in-memory copy.
+    resetVaultKeySessions();
+    clearVaultKeyCache();
     // A queued shared link belongs to the account that clicked it.
     clearPendingNoteLink();
+    // Ditto a queued invitation and the card describing it: an invitation is
+    // addressed to ONE email, so carrying it across a sign-out would offer it
+    // to whoever signs in next — and get a recipient-mismatch error for it.
+    clearPendingInvite();
     set({
       session: null,
       authStatus: "signed-out",
       authPrompt: null,
+      invitePrompt: null,
+      // Ditto an unanswered connect offer: it belongs to the flow that raised
+      // it, not to whoever signs in next.
+      pendingServerLink: null,
       landingVault: false,
       organizations: [],
       members: [],
@@ -1634,6 +3628,7 @@ export const useStore = create<AppStore>((set, get) => ({
       pendingVaultFolder: null,
       billingConfig: null,
       orgBilling: null,
+      myBilling: null,
       // Close the open vault so the app returns to the VaultPicker "home" screen
       // (choose / reopen a vault) instead of leaving the old vault's files
       // on screen after sign-out.
@@ -1642,14 +3637,39 @@ export const useStore = create<AppStore>((set, get) => ({
       openNote: null,
       backlinks: [],
       noteRemoved: false,
+      noteRemovedSynced: false,
       itemColors: readItemColors(undefined),
       itemOrder: readItemOrder(undefined),
+      folderSorts: {},
     });
     // Welcome is now the state a reload should restore (same rule as
     // closeLocalVault) — don't let the launch reopen undo the sign-out landing.
     void ipc.clearLastVault().catch(() => {
   /* best-effort — worst case the next launch reopens the vault */
 });
+  },
+
+  handleSessionExpired: () => {
+    // Nothing to drop: already signed out, or a sign-out landed first.
+    if (get().authStatus !== "signed-in" && !get().session) return;
+    // This flow owns the session from here: a detached `initAuth` still
+    // restoring the previous one must not land it back on top of ours.
+    ++authInitGen;
+    // Stop minting. Every provider (the open note's, the uploader's, the vault
+    // channel's) would otherwise keep retrying a token the server will refuse
+    // for as long as the app stays open — the loop guard the guard's own latch
+    // cannot supply, because it only silences the REPORT.
+    leaveVaultSync();
+    console.warn("[auth] server refused the session — signing out locally");
+    // Exactly the fields `initAuth`'s signed-out branch sets, plus the sync flag
+    // `leaveVaultSync` just made false in fact. Emphatically NOT
+    // `vaultScopedSyncReset()` and not `signOut`'s list: those close the vault
+    // and clear `openFolderIsSynced`, which is the very input the banner needs
+    // to say "this synced vault is not syncing". The user keeps their notes on
+    // screen and signs back in from the banner.
+    set({ session: null, authStatus: "signed-out", syncEnabled: false });
+    // No note will ever get a provider now, so nothing may wait on one.
+    resolveSyncGate();
   },
 
   landAfterAuth: async () => {
@@ -1662,20 +3682,79 @@ export const useStore = create<AppStore>((set, get) => ({
 
   setServerUrl: async (url) => {
     set({ authError: null });
-    const session = await authManager.setServerUrl(url);
-    set({
-      serverUrl: authManager.getServerUrl(),
-      session,
-      authStatus: session ? "signed-in" : "signed-out",
-    });
-    if (session) {
-      await get().refreshVault();
-      await get().refreshBillingConfig();
-      await get().refreshOrgBilling();
-      await get().enableSyncForVault();
-    } else {
-      syncManager.disable();
-      set({ syncEnabled: false, billingConfig: null, orgBilling: null });
+    // This flow owns the session from here: a detached `initAuth` still
+    // restoring the previous one must not land its state on top of ours.
+    const gen = ++authInitGen;
+    const previousUrl = get().serverUrl;
+    const switching = normalizeServerUrl(url) !== normalizeServerUrl(previousUrl);
+    // Team skills sync reads the shared API client, which moves to the new
+    // server below before App's effect can stop it: hold it first, or a run
+    // would plan the new server's manifest against the old server's markers.
+    // A switch that lands restarts it for the new server; otherwise resume.
+    const resumeSkills = pauseSkillsSync();
+    let landed = false;
+    try {
+      // Persist pending edits before closing the old vault. A failed flush aborts
+      // the switch so the editor still owns the unsaved buffer.
+      await bridgeManager.currentBridge()?.flushEgest();
+      if (authInitGen !== gen) return false;
+      const wasSyncing = get().syncEnabled;
+      // Stop syncing with the old server before the address changes. The folder
+      // itself stays open until the new address is adopted, so a switch that
+      // fails (the address could not be saved) falls back to it intact.
+      leaveVaultSync();
+      set({ syncEnabled: false });
+      // Vault keys are per server: drop every in-memory copy before switching.
+      resetVaultKeySessions();
+      clearVaultKeyCache();
+      let session: SessionInfo | null;
+      try {
+        // Clears the old bearer before exposing the new base URL.
+        session = await authManager.setServerUrl(url);
+      } catch (e) {
+        if (authInitGen === gen) await recoverFromFailedServerSwitch(get, set, previousUrl, wasSyncing);
+        throw e;
+      }
+      if (switching) {
+        // The client now talks to the new server: the old folder and its
+        // vault/billing state belong to the previous one, even if another flow
+        // has taken over the session meanwhile.
+        get().closeLocalVault();
+        set({
+          organizations: [], members: [], pendingInvitations: [], userInvitations: [],
+          billingConfig: null, orgBilling: null, myBilling: null,
+        });
+      }
+      if (authInitGen !== gen) return false;
+      set({
+        serverUrl: authManager.getServerUrl(),
+        session,
+        authStatus: session ? "signed-in" : "signed-out",
+      });
+      if (session) {
+        await get().refreshVault();
+        await get().refreshBillingConfig();
+        await get().refreshOrgBilling();
+        // The previous folder belongs to the old server. The vault picker opens
+        // a destination vault explicitly instead of reconciling that folder here.
+        if (!switching) await get().enableSyncForVault();
+        // An invitation link that named THIS server parked itself here waiting
+        // for the user's Connect click (`openInviteLink` step 2). The click has
+        // landed, so pick it back up — otherwise confirming the server silently
+        // drops the invitation that asked for it.
+        if (peekPendingInvite()) await consumeQueuedInvite(get, set);
+      } else {
+        syncManager.disable();
+        set({ syncEnabled: false, billingConfig: null, orgBilling: null, myBilling: null });
+        // Same invitation, no session on the new server: raise the sign-in card
+        // for it rather than leaving the queue to be discovered by the next
+        // unrelated sign-in.
+        if (peekPendingInvite()) await promptSignInForQueuedInvite(set);
+      }
+      landed = true;
+      return true;
+    } finally {
+      if (!(landed && switching)) resumeSkills();
     }
   },
 
@@ -1687,9 +3766,10 @@ export const useStore = create<AppStore>((set, get) => ({
     set({ session });
   },
 
-  setActivityStatus: (status) => {
-    writeActivityStatus(status);
-    set({ activityStatus: status });
+  setActivityStatus: (status, until = null) => {
+    writeActivityStatus(status, until);
+    set({ activityStatus: status, activityStatusUntil: until });
+    scheduleStatusClear(until);
     // Re-broadcast immediately on any live note presence.
     syncManager.setPresenceStatus(status);
   },
@@ -1697,6 +3777,120 @@ export const useStore = create<AppStore>((set, get) => ({
   setMentionSound: (enabled) => {
     writeMentionSound(enabled);
     set({ mentionSound: enabled });
+  },
+
+  // The personal setters now record an OVERRIDE; the effective field follows
+  // through applyAppearance. The legacy per-key writes stay so an older build
+  // opened on this device still sees the choice.
+  setPropertiesMode: (mode) => {
+    writePropertiesMode(mode);
+    get().setAppearanceOverride("properties", mode);
+  },
+
+  setEditorMeasure: (measure) => {
+    writeEditorMeasure(measure);
+    get().setAppearanceOverride("contentWidth", measure);
+  },
+  setEditorFontSize: (px) => {
+    writeEditorFontSize(px);
+    get().setAppearanceOverride("textSize", px);
+  },
+  setEditorFont: (font) => {
+    writeEditorFont(font);
+    applyEditorFont(font);
+    set({ editorFont: font });
+  },
+
+  setLineNumbers: (on) => {
+    writeLineNumbers(on);
+    get().setAppearanceOverride("lineNumbers", on);
+  },
+
+  setAppearanceOverride: (key, value) => {
+    const next = withAppearance(get().appearanceOverrides, key, value);
+    writeAppearanceOverrides(next);
+    set({ appearanceOverrides: next });
+    get().applyAppearance();
+  },
+
+  applyAppearance: () => {
+    const st = get();
+    // Only the OPEN vault's defaults apply: a theme set by a vault you left
+    // must not follow you into a local vault or a different team.
+    const orgId = st.vault && st.syncEnabled ? (st.session?.activeOrganizationId ?? null) : null;
+    const eff = effectiveAppearance(st.appearanceOverrides, orgId ? st.vaultAppearance[orgId] : null);
+    applyEditorFontSize(eff.textSize);
+    applyEffectiveTheme(eff.theme);
+    const patch = {
+      themeMode: eff.theme,
+      automaticItemColors: eff.autoColors,
+      editorMeasure: eff.contentWidth,
+      editorFontSize: eff.textSize,
+      lineNumbers: eff.lineNumbers,
+      propertiesMode: eff.properties,
+    };
+    if (
+      (Object.keys(patch) as Array<keyof typeof patch>).some((k) => st[k] !== patch[k])
+    ) {
+      set(patch);
+    }
+  },
+
+  loadVaultAppearance: async (orgId) => {
+    const before = get().vaultAppearance[orgId];
+    try {
+      const res = await authManager.api.getVaultAppearance(orgId);
+      // A live frame or local save arriving during this GET owns the cache.
+      if (get().vaultAppearance[orgId] === before) get().receiveVaultAppearance(orgId, res.settings);
+    } catch {
+      // Older server (404) or offline: the vault simply sets nothing we know of.
+    }
+  },
+
+  saveVaultAppearance: async (orgId, settings) => {
+    const prev = get().vaultAppearance[orgId] ?? {};
+    const look = Object.fromEntries(APPEARANCE_KEYS.filter((key) => settings[key] !== undefined).map((key) => [key, settings[key]])) as AppearanceSettings;
+    settings = { ...prev, ...look };
+    get().receiveVaultAppearance(orgId, settings);
+    try {
+      const res = await authManager.api.patchVaultAppearance(orgId, look);
+      // A later local save may have landed meanwhile; only adopt the answer
+      // if nothing newer replaced what we sent.
+      if (APPEARANCE_KEYS.every((key) => get().vaultAppearance[orgId]?.[key] === settings[key])) {
+        get().receiveVaultAppearance(orgId, res.settings);
+      }
+    } catch (e) {
+      const current = get().vaultAppearance[orgId] ?? {};
+      if (APPEARANCE_KEYS.every((key) => current[key] === settings[key])) {
+        get().receiveVaultAppearance(orgId, { ...current, ...Object.fromEntries(APPEARANCE_KEYS.map((key) => [key, prev[key]])) });
+      }
+      throw e;
+    }
+  },
+
+  receiveVaultAppearance: (orgId, settings) => {
+    const previous = get().vaultAppearance[orgId];
+    const navigationChanged = previous?.homeDocId !== settings.homeDocId ||
+      JSON.stringify(previous?.pinnedItems ?? []) !== JSON.stringify(settings.pinnedItems ?? []);
+    set({ vaultAppearance: { ...get().vaultAppearance, [orgId]: settings },
+      ...(get().vaultAppearance[orgId]?.homeDocId !== settings.homeDocId ? { homeActivation: null } : {}) });
+    get().applyAppearance();
+    if (get().syncEnabled && get().session?.activeOrganizationId === orgId) {
+      // The preference frame may beat the referenced file's materialization.
+      // Refresh its normal registry/index path; keep the saved reference until
+      // readable content arrives instead of requiring a restart to find it.
+      const ids = new Set(get().titles.map((note) => note.id));
+      const missingHome = settings.homeDocId && !ids.has(settings.homeDocId);
+      const missingPin = settings.pinnedItems?.some((pin) => pin.kind === "note"
+        ? !ids.has(pin.docId) : !get().tree || !nodeAt(get().tree!, pin.path));
+      if (navigationChanged && (missingHome || missingPin)) {
+        syncManager.handleRegistryChanged("shared-navigation");
+        void get().refreshTitles().catch((e) => console.warn("[home] index refresh failed", e));
+        void get().refreshTree().catch((e) => console.warn("[home] tree refresh failed", e));
+      }
+      if (shouldFollowSharedHome(get())) void get().openHome(false).catch((e) => console.warn("[home] update failed", e));
+    }
+    if (get().homeLandingPending && !get().openNote && !get().openingNotePath && !get().activeVirtualTab) void get().openHome(false).catch((e) => console.warn("[home] landing failed", e));
   },
 
   startBroadcast: async () => {
@@ -1755,37 +3949,67 @@ export const useStore = create<AppStore>((set, get) => ({
 
   // ---- Vault ----
 
-  refreshVault: async () => {
+  refreshVault: async (opts) => {
     const { api } = authManager;
+    // The session generation this refresh describes: called from `initAuth`
+    // (detached, so a sign-out can land under it) as well as from live
+    // listeners, where it is simply the current one.
+    const gen = authInitGen;
     try {
       const organizations = await api.listOrganizations();
       const session = get().session;
       let activeOrgId = session?.activeOrganizationId ?? null;
       // Auto-activate the sole org so vault creation + sync work out of the box.
+      // Genuinely serial (activate, then re-read the session that names it), and
+      // it only runs on a device's FIRST sign-in — never on a relaunch.
       if (!activeOrgId && organizations.length === 1) {
         await api.setActiveOrganization(organizations[0].id);
         activeOrgId = organizations[0].id;
         const refreshed = await authManager.currentSession();
+        if (authInitGen !== gen) return;
         if (refreshed) set({ session: refreshed });
       }
-      let members: Member[] = [];
-      let pendingInvitations: Invitation[] = [];
-      if (activeOrgId) {
-        members = await api.listMembers(activeOrgId).catch(() => []);
-        pendingInvitations = await api
-          .listInvitations(activeOrgId)
-          .then((invs) => invs.filter((i) => i.status === "pending"))
-          .catch(() => []);
-      }
-      const userInvitations = await api
-        .listUserInvitations()
-        .then((invs) => invs.filter((i) => i.status === "pending"))
-        .catch(() => []);
-      set({ organizations, members, pendingInvitations, userInvitations });
+      if (authInitGen !== gen) return;
+      // Publish the vault list the MOMENT we have it, ahead of the roster below.
+      // This is the only part of this call the landing waits on, and holding it
+      // back until three more GETs returned is what put them in front of every
+      // launch. Everything after this point is panel data.
+      set({ organizations });
       // Cache the vault list locally so the signed-out welcome screen can
       // still offer them (kept across sign-out; refreshed here while signed in).
       writeKnownVaults(organizations.map((o) => ({ id: o.id, name: o.name })));
+      // Three independent GETs. Run serially they were three round trips in the
+      // launch chain; none of them depends on another's answer.
+      const roster = (async () => {
+        const [members, pendingInvitations, userInvitations] = await Promise.all([
+          activeOrgId
+            ? api.listMembers(activeOrgId).catch(() => [] as Member[])
+            : Promise.resolve([] as Member[]),
+          activeOrgId
+            ? api
+                .listInvitations(activeOrgId)
+                .then((invs) => invs.filter((i) => i.status === "pending"))
+                .catch(() => [] as Invitation[])
+            : Promise.resolve([] as Invitation[]),
+          api
+            .listUserInvitations()
+            .then((invs) => invs.filter((i) => i.status === "pending"))
+            .catch(() => [] as Invitation[]),
+        ]);
+        if (authInitGen !== gen) return;
+        set({ members, pendingInvitations, userInvitations });
+      })();
+      // The launch path does not wait for the roster; every other caller (the
+      // members panel, an invite accept) still gets the full refresh it expects.
+      if (opts?.rosterInBackground) {
+        void roster.catch((e) => console.warn("[vault] roster refresh failed", e));
+        return;
+      }
+      await roster;
     } catch (e) {
+      // A failure that belongs to a session the user has since left is not this
+      // session's error to show.
+      if (authInitGen !== gen) return;
       set({ authError: errMsg(e) });
     }
   },
@@ -1804,6 +4028,7 @@ export const useStore = create<AppStore>((set, get) => ({
   turnOnSyncForCurrentVault: async (name) => {
     const vault = get().vault;
     if (!vault) throw new Error("Open a vault first.");
+    const stampedOrgId = await peekStampedOrgId(vault.path);
     // Which vault this folder belongs to (if any) decides what happens — NOT
     // whether the account happens to have an active vault. See `planTurnOnSync`
     // for why: `activeOrganizationId` survives opening a plain local folder, so
@@ -1816,20 +4041,28 @@ export const useStore = create<AppStore>((set, get) => ({
       orgVaults: readOrgVaults(),
       // The folder's own stamp: heals a lost binding (switch back to the vault
       // this folder already is) and blocks adopting another account's folder.
-      stampedOrgId: await peekStampedOrgId(vault.path),
+      stampedOrgId: stampedOrgId,
+      // …unless the server has told us that vault is gone, in which case the
+      // stamp is a tombstone and refusing would strand the folder forever.
+      stampedOrgGone: stampedOrgId != null && vaultsConfirmedGone.has(stampedOrgId),
     });
     if (plan.kind === "blocked-foreign") {
       // Creating a vault here would upload every note in this folder into a
       // fresh vault under the WRONG account — the exact duplication this plan
-      // exists to prevent. The dialog surfaces this message as-is.
-      throw new Error(
-        "This folder already belongs to a synced vault that this account can't access. " +
-          "Sign in with the account it was synced with to open it.",
-      );
+      // exists to prevent. The dialog surfaces this message as-is. The stamp
+      // carries no server URL, so the message covers both "another server" and
+      // "another account on this server".
+      throw new Error(foreignFolderMessage(plan.orgId));
     }
     if (plan.kind === "retry-active") {
       await get().enableSyncForVault();
       if (!get().syncEnabled) {
+        // The stamp guard refused: the folder belongs to another vault, which
+        // no amount of reconnecting fixes. Say so instead of blaming the network.
+        const refusal = lastSyncRefusal;
+        if (refusal?.kind === "stamp-mismatch") {
+          throw new Error(foreignFolderMessage(refusal.stampedOrgId));
+        }
         throw new Error(
           "Couldn't connect to this vault. Check your connection and try again.",
         );
@@ -1855,8 +4088,16 @@ export const useStore = create<AppStore>((set, get) => ({
     // the folder you're already in and syncs its existing files up. Create the
     // org directly, bind THIS folder, then let enableSyncForVault reconcile the
     // current tree into the new server vault.
+    // The icon this folder showed as a LOCAL vault becomes the synced vault's
+    // icon — its chosen one, or else its DEFAULT, written out explicitly. A
+    // default is derived from the vault's identity, which changes here
+    // (`local:<path>` → `org:<id>`), so leaving it implicit swapped the glyph
+    // and colour the moment sync turned on.
+    const logo = serializeVaultIcon(
+      resolveVaultIcon(`local:${vault.path}`, readLocalVaultIcon(vault.path)),
+    );
     const org = await createWithUniqueSlug(name?.trim() || vault.name, (input) =>
-      authManager.api.createOrganization(input),
+      authManager.api.createOrganization({ ...input, logo }),
     );
     // Bind the folder the moment the org exists — before the awaits below, each
     // of which can throw or go stale. This used to sit after all four, so a
@@ -1879,6 +4120,35 @@ export const useStore = create<AppStore>((set, get) => ({
     await get().refreshOrgBilling();
   },
 
+  turnOnSyncNow: async (name) => {
+    if (get().turningOnSync) return false;
+    set({ turningOnSync: true });
+    try {
+      await get().turnOnSyncForCurrentVault(name);
+      return get().syncEnabled;
+    } catch (e) {
+      // A plan limit IS the upgrade moment: open the plan comparison with the
+      // reason, as the General page does.
+      const kind = classifyLimitError(e);
+      if (kind) {
+        const limit = limitFromError(e);
+        get().requestUpgradeDialog({
+          reason:
+            kind === "vault_limit"
+              ? vaultLimitReason(limit ?? get().billingConfig?.freeLimits?.vaultsPerUser ?? 1)
+              : undefined,
+        });
+      } else {
+        toast(`Couldn't turn on sync: ${errMsg(e)}`, "error", {
+          action: { label: "Retry", run: () => void get().turnOnSyncNow(name) },
+        });
+      }
+      return false;
+    } finally {
+      set({ turningOnSync: false });
+    }
+  },
+
   setActiveOrganization: async (organizationId, opts = {}) => {
     const previousOrgId = get().session?.activeOrganizationId ?? null;
     // Claim the switch. Everything below awaits the network, so a second switch
@@ -1890,9 +4160,11 @@ export const useStore = create<AppStore>((set, get) => ({
     const gen = ++orgSwitchGen;
     const superseded = () => orgSwitchGen !== gen;
 
-    // Announce the destination BEFORE the first await. A switch is many round
-    // trips (activate org → re-read session → roster → billing → open the folder
-    // → re-enable sync → reconcile), and until the folder actually swaps, the
+    // Announce the destination BEFORE the first await. A vault already on this
+    // device swaps its folder in a few IPCs (the fast path in `switchToOrg`),
+    // too quickly for the overlay's fade-in; one without a folder yet is many
+    // round trips (activate org → re-read session → roster → billing →
+    // rediscover or mint a folder), and until the folder actually swaps, the
     // sidebar still shows the vault you just left. Clicking a vault and watching
     // the old one sit there is indistinguishable from the click not registering,
     // so the chrome reads this and renames itself to the target at once.
@@ -1938,6 +4210,10 @@ export const useStore = create<AppStore>((set, get) => ({
         rememberOrgVault(previousOrgId, currentVaultPath);
       }
 
+      // Finish the editor's durable write before changing the vault epoch.
+      await bridgeManager.currentBridge()?.flushEgest();
+      if (superseded()) return;
+
       // Stop syncing the vault we're leaving before anything else. Everything
       // below awaits the network, and one branch swaps the Rust vault slot
       // (applyVaultFolder) while the other leaves the old folder on screen with a
@@ -1947,19 +4223,90 @@ export const useStore = create<AppStore>((set, get) => ({
       leaveVaultSync();
       set(vaultScopedSyncReset());
 
-      await authManager.api.setActiveOrganization(organizationId);
+      // FAST PATH — the vault is already on this device. Each vault owns its
+      // own local folder; when that folder is bound and still on disk, open it
+      // and paint its tree BEFORE any network round trip. The switch itself is
+      // local work (the folder IS the vault); activating the org, refreshing
+      // the roster and reconciling sync are what FOLLOW it, not what it waits
+      // for. Until this reordering the overlay stayed up through six serial
+      // requests plus the whole registry reconcile, so switching to a synced
+      // vault took seconds and grew with vault size while a local switch was
+      // instant.
+      //
+      // `deferSync`: sync must not start in there — `enableSyncForVault` reads
+      // the org from `session.activeOrganizationId`, which still names the
+      // vault we are LEAVING until the two calls below land. (Rust's
+      // `vault-opened` event meanwhile scopes the folder to that stale org via
+      // `setVault`; nothing reads a scope's org, and `syncManager.enable`
+      // re-begins the scope with the right one before any sync work.)
+      //
+      // A folder that is present but won't open falls through to the SAME
+      // prompt as before, but only after the org is active: the prompt's
+      // resolution enables sync from the session, so it must name this vault.
+      // The server activation runs BESIDE the folder open (#E): every route the
+      // sync path uses (vault token, per-doc sync token, registry listings,
+      // locks, the vault channel) authorizes by MEMBERSHIP and names the org
+      // explicitly; only panel routes (join code, MCP token, a POST /vaults
+      // without an org) read the session's active org. Settled here so a
+      // rejection is only ever observed by the awaits below.
+      const activation = authManager.api.setActiveOrganization(organizationId);
+      activation.catch(() => {});
+      const bound = readOrgVaults()[organizationId];
+      const boundOk = !!bound && (await ipc.folderExists(bound).catch(() => false));
+      if (superseded()) return;
+      let openError: unknown = null;
+      if (boundOk) {
+        try {
+          await get().applyVaultFolder(organizationId, bound, { deferSync: true });
+        } catch (e) {
+          openError = e ?? new Error("open failed");
+        }
+        if (superseded()) return;
+        // The folder is open and the tree is painted: the switch is done as far
+        // as the user can tell. Lower the overlay now, not after the network
+        // tail (the `finally` above then has nothing left to do).
+        if (openError === null) set({ switchingVault: null });
+      }
+
+      if (boundOk && openError === null) {
+        // The folder is open: start its sync now instead of after two serial
+        // round trips (activate, re-read the session). `enableSyncForVault`
+        // reads the org from the session, so name the new org on the local
+        // session first; the server's answer replaces it below.
+        const prior = get().session;
+        if (prior && prior.activeOrganizationId !== organizationId) {
+          set({ session: { ...prior, activeOrganizationId: organizationId } });
+        }
+        void get()
+          .enableSyncForVault({ background: true })
+          .catch((e) => console.warn("[sync] enable after switch failed", e));
+        await activation;
+        if (superseded()) return;
+        const confirmed = await authManager.currentSession();
+        if (superseded()) return;
+        set({ session: confirmed });
+        // Roster + seat usage feed the members and billing panels, not the tree,
+        // and the reconcile is the part that scales with the vault: none of them
+        // is worth making the user wait for. Each swallows its own errors and
+        // gates its state writes on this still being the open vault.
+        void get().refreshVault();
+        void get().refreshOrgBilling();
+        return;
+      }
+
+      await activation;
       if (superseded()) return;
       const session = await authManager.currentSession();
       if (superseded()) return;
       set({ session });
+
       await get().refreshVault();
       if (superseded()) return;
       // Seat usage + plan are per-vault, so refresh on every switch.
       await get().refreshOrgBilling();
       if (superseded()) return;
 
-      // Each vault owns its own local folder. If one is already bound and still
-      // on disk, swap to it. If not, do NOT reuse the folder that's currently
+      // No local folder opened above. Do NOT reuse the folder that's currently
       // open — rediscover this vault's existing folder, or mint one.
       const org = get().organizations.find((o) => o.id === organizationId);
       const orgName = org?.name ?? "New vault";
@@ -1976,28 +4323,21 @@ export const useStore = create<AppStore>((set, get) => ({
         });
       };
 
-      const bound = readOrgVaults()[organizationId];
-      if (bound && (await ipc.folderExists(bound).catch(() => false))) {
-        if (superseded()) return;
-        try {
-          await get().applyVaultFolder(organizationId, bound);
-          return;
-        } catch (e) {
-          // The folder is present but wouldn't open (locked index, permissions,
-          // transient I/O). This used to fall through to the auto-folder path,
-          // which minted a full duplicate copy of the vault under the vaults
-          // root AND re-pointed the binding at it — a hiccup made permanent.
-          // Ask instead; the binding stays on the user's real folder.
-          console.warn("[vault] bound folder failed to open", e);
-          if (superseded()) return;
-          askForFolder({
-            text: `This vault's folder couldn't be opened: ${e instanceof Error ? e.message : String(e)}`,
-            path: bound,
-          });
-          return;
-        }
+      if (boundOk) {
+        // The folder is present but wouldn't open (locked index, permissions,
+        // transient I/O). This used to fall through to the auto-folder path,
+        // which minted a full duplicate copy of the vault under the vaults
+        // root AND re-pointed the binding at it — a hiccup made permanent.
+        // Ask instead; the binding stays on the user's real folder.
+        console.warn("[vault] bound folder failed to open", openError);
+        askForFolder({
+          text: `This vault's folder couldn't be opened: ${
+            openError instanceof Error ? openError.message : String(openError)
+          }`,
+          path: bound,
+        });
+        return;
       }
-      if (superseded()) return;
 
       // No binding, or the bound path is gone (folder moved/renamed in Finder,
       // cleared webview storage, another device). Before minting a folder, look
@@ -2034,9 +4374,42 @@ export const useStore = create<AppStore>((set, get) => ({
       // vault while the user's real notes sit in the moved folder — the exact
       // surprise-duplicate this flow used to produce. Ask for the new location.
       if (bound) {
+        // Inside the vaults root the folder is ours to manage: rebind a renamed
+        // copy or recreate it and sync down, and say so (2026-10-09). Outside
+        // the root (an unmounted drive looks exactly like a delete) we ask.
+        const plan = await planForMissingFolder(organizationId, bound);
+        if (superseded()) return;
+        if (plan.kind === "present" || plan.kind === "rebind") {
+          const target = plan.kind === "rebind" ? plan.path : bound;
+          try {
+            await get().applyVaultFolder(organizationId, target);
+            if (plan.kind === "rebind") toast(reboundToastText(orgName, target));
+            return;
+          } catch (e) {
+            console.warn("[vault] rebinding the vault folder failed", e);
+            if (superseded()) return;
+          }
+        } else if (plan.kind === "recreate") {
+          try {
+            await get().applyVaultFolder(organizationId, bound, {
+              create: true,
+              seedIfEmpty: opts.seedIfEmpty,
+            });
+            set({ folderAutoRestored: { orgId: organizationId, name: orgName, path: bound } });
+            return;
+          } catch (e) {
+            console.warn("[vault] auto-restoring the vault folder failed; asking", e);
+            if (superseded()) return;
+            if (isDocumentsDenied(e)) {
+              askForFolder({ text: DOCUMENTS_BLOCKED_TEXT, path: null, documentsDenied: true });
+              return;
+            }
+          }
+        }
         askForFolder({
-          text: "This vault's folder is no longer there — it may have been moved or renamed.",
+          text: "This vault's folder is missing. It was moved, renamed or deleted.",
           path: bound,
+          missing: true,
         });
         return;
       }
@@ -2065,15 +4438,110 @@ export const useStore = create<AppStore>((set, get) => ({
       } catch (e) {
         console.warn("[vault] auto folder failed; asking instead", e);
         if (superseded()) return;
+        // Documents blocked by macOS privacy: explain it rather than invite
+        // "any folder" (a user once picked their home folder from here).
+        if (isDocumentsDenied(e)) {
+          askForFolder({ text: DOCUMENTS_BLOCKED_TEXT, path: null, documentsDenied: true });
+          return;
+        }
       }
       askForFolder(null);
     }
   },
 
-  inviteMember: async (email, role) => {
-    const activeOrgId = get().session?.activeOrganizationId ?? undefined;
-    await authManager.api.inviteMember({ email, role, organizationId: activeOrgId });
+  inviteMember: async (email, role, organizationId) => {
+    const orgId = organizationId ?? get().session?.activeOrganizationId ?? undefined;
+    const invitation = await authManager.api.inviteMember({
+      email,
+      role,
+      organizationId: orgId,
+    });
+    // Creating the row sends nothing by itself — the explicit send is what
+    // lets us say "emailed" only when the provider actually took the message,
+    // and show the link instead when it didn't.
+    let emailed = false;
+    let emailError: string | null = null;
+    const methods = await authManager.api.getAuthMethods();
+    if (methods.invitationEmail) {
+      try {
+        await authManager.api.sendInvitationEmail(invitation.id);
+        emailed = true;
+      } catch (e) {
+        const body = e instanceof ApiError && e.body && typeof e.body === "object" ? (e.body as { message?: unknown }) : null;
+        emailError =
+          (typeof body?.message === "string" && body.message) ||
+          (e instanceof Error ? e.message : String(e));
+      }
+    }
     await get().refreshVault();
+    // Returned, not just refreshed into `pendingInvitations`: the caller needs
+    // THIS invitation's id to build its link, and the roster list is keyed by
+    // email with no promise about which row is the one just created.
+    return { invitation, emailed, emailError };
+  },
+
+  resendVerificationEmail: async () => {
+    const email = get().session?.user.email;
+    if (!email) throw new Error("Not signed in");
+    await authManager.api.sendVerificationEmail(email);
+  },
+
+  handleAccountLink: async (kind) => {
+    if (kind === "verified") {
+      // The browser just flipped `emailVerified`; re-read the session so the
+      // account screen (and anything else keyed on it) updates in place.
+      if (get().authStatus !== "signed-in") {
+        toast("Email confirmed. Sign in to continue.", "neutral");
+        return;
+      }
+      const session = await authManager.currentSession();
+      if (session) set({ session });
+      toast("Email confirmed. Thanks!", "success");
+      return;
+    }
+    // "signin": a password reset in the browser revoked every session for that
+    // account, this device's included. Re-check rather than assume — the reset
+    // may have been for a different account than the one signed in here.
+    const session = await authManager.currentSession().catch(() => null);
+    if (session) {
+      toast("Password updated.", "success");
+      return;
+    }
+    if (get().authStatus === "signed-in") await get().signOut();
+    set({ authPrompt: "sign-in" });
+    toast("Password updated. Sign in with your new password.", "success");
+  },
+
+  handleBillingLink: async (orgId) => {
+    if (get().authStatus !== "signed-in") {
+      toast("Payment received. Sign in to see your Team plan.", "neutral");
+      return;
+    }
+    // Ask the server to re-read the live subscription from the provider once
+    // (a webhook may not have landed yet); a failure or an old server is fine.
+    await authManager.api.getBillingAccount({ refresh: true }).catch(() => undefined);
+    // Both readers of the fact: the active vault's badge/limits and the
+    // Subscriptions list. The Upgrade dialog, if it is still open, watches
+    // these and flips to its success screen on its own.
+    await Promise.all([get().refreshOrgBilling(), get().refreshMyBilling()]);
+    const active = get().session?.activeOrganizationId ?? null;
+    const target = orgId ?? active;
+    const row = target ? get().myBilling?.vaults.find((v) => v.orgId === target) : undefined;
+    const isPro =
+      row?.plan === "pro" ||
+      (target !== null && target === active && get().orgBilling?.status === "active");
+    if (isPro) {
+      const name = row?.name;
+      toast(
+        name ? `${name} is now on Team.` : "You are now on Team.",
+        "success",
+      );
+      return;
+    }
+    // Paid, but the confirmation hasn't landed yet (provider still processing,
+    // or a webhook on its way). Polling in the Upgrade dialog and the next
+    // Billing visit pick it up; say so rather than nothing.
+    toast("Payment received. Your subscription will show up in a moment.", "neutral");
   },
 
   removeMember: async (userId) => {
@@ -2090,7 +4558,30 @@ export const useStore = create<AppStore>((set, get) => ({
     await get().refreshVault();
   },
 
+  refreshUserInvitations: async () => {
+    if (!get().session) return;
+    const gen = authInitGen;
+    try {
+      const invs = await authManager.api.listUserInvitations();
+      // A sign-out or account switch while the GET was out: not ours to set.
+      if (authInitGen !== gen || !get().session) return;
+      set({ userInvitations: invs.filter((i) => i.status === "pending") });
+    } catch (e) {
+      console.warn("[invitations] refresh failed", e);
+    }
+  },
+
+  dropUserInvitation: (invitationId) => {
+    const cur = get().userInvitations;
+    if (cur.some((i) => i.id === invitationId)) {
+      set({ userInvitations: cur.filter((i) => i.id !== invitationId) });
+    }
+  },
+
   acceptInvitation: async (invitationId) => {
+    // This flow owns the session from here: a detached `initAuth` still
+    // restoring the previous one must not land its state on top of ours.
+    ++authInitGen;
     const inv = get().userInvitations.find((i) => i.id === invitationId);
     await authManager.api.acceptInvitation(invitationId);
     // Make the joined vault active through the switch path so it gets its
@@ -2116,15 +4607,29 @@ export const useStore = create<AppStore>((set, get) => ({
         null;
     }
     if (orgId) {
+      // B4: the invite's secret (if the link carried one) unlocks this vault's
+      // key as soon as it opens; claimed before the switch so the gate sees it.
+      claimInviteSecret(invitationId, orgId);
       await get().setActiveOrganization(orgId);
     }
+    // The invite card is spent — leaving it up would offer to accept an
+    // invitation that no longer exists. Only the CARD: the queue is cleared by
+    // whoever consumed it, so an invitation parked for a different flow (a
+    // pending server switch) is not eaten by an unrelated accept.
+    set({ invitePrompt: null });
     // The joiner celebrates locally too (they connect after the server push).
     const me = get().session?.user;
     get().celebrateMemberJoined(me?.name || me?.email || "You");
   },
 
   joinVault: async (code) => {
+    // This flow owns the session from here: a detached `initAuth` still
+    // restoring the previous one must not land its state on top of ours.
+    ++authInitGen;
+    // C: `<code>-<J>` goes to the server as typed (it reads the part before
+    // the first `-`); J stays in memory until the vault opens.
     const joined = await authManager.api.joinVault(code.trim());
+    offerJoinSecret(joined.organizationId, joinCodeSecret(code));
     // The code was good, so the welcome screen's join flow is over: disarm the
     // landing suppression before switching in (it's module state, and leaving it
     // armed would silently strand the NEXT sign-in on the welcome screen).
@@ -2139,6 +4644,13 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   removeVaultLocally: async (organizationId) => {
+    // The review queue is saved under the folder path, so a later join into
+    // the same folder would replay this membership's rows (#295). End it here,
+    // and clear the live report while this vault is still the open one.
+    const removedPath = readOrgVaults()[organizationId] ?? null;
+    if (removedPath) forgetPersisted(removedPath);
+    if (removedPath) reconcileReport.clear(removedPath);
+    if (get().session?.activeOrganizationId === organizationId) reconcileReport.clear();
     // Forget this vault's local folder so it won't auto-open here again.
     forgetOrgVault(organizationId);
     forgetLastVault(organizationId);
@@ -2167,11 +4679,249 @@ export const useStore = create<AppStore>((set, get) => ({
     await get().refreshVault();
   },
 
+  leaveVault: async (organizationId) => {
+    // Where this vault lives here, captured BEFORE the detach forgets it.
+    const path = readOrgVaults()[organizationId] ?? null;
+    // Server first: an owner's 409 (or being offline) must leave this device
+    // exactly as it was. Once this returns, the membership is gone everywhere.
+    await authManager.api.leaveVault(organizationId);
+    // The server confirmed: the membership is gone. Run the membership-loss
+    // cleanup — stop syncing, close it if open, and PERMANENTLY delete its
+    // folder here (owner decision 2026-10-09: no Trash, no recovery copy).
+    await get().handleMembershipLost(organizationId, "left", path);
+  },
+
+  handleMembershipLost: async (organizationId, reason, knownPath) => {
+    const name =
+      get().organizations.find((o) => o.id === organizationId)?.name ?? null;
+    const path = knownPath ?? readOrgVaults()[organizationId] ?? null;
+    // Re-list first: a vault the account still lists is a live membership
+    // (owners always are), and a stale or replayed frame must not delete it.
+    const refreshed = await authManager.currentSession().catch(() => null);
+    if (refreshed) set({ session: refreshed });
+    await get()
+      .refreshVault()
+      .catch((e: unknown) => console.warn("[vault] refresh before membership cleanup failed", e));
+    if (get().organizations.some((o) => o.id === organizationId)) return;
+    // Read before the folder (and its stamp) is deleted below.
+    const keyHint = await stampedVaultIdFor(path, organizationId);
+
+    const vault = get().vault;
+    const isOpen =
+      (vault != null && path != null && vault.path === path) ||
+      get().session?.activeOrganizationId === organizationId;
+    if (isOpen) {
+      // Same order as "make local only": stop the sync layer first, then
+      // close every tab and the vault itself before the folder goes.
+      leaveVaultSync();
+      get().closeAllTabs();
+      get().closeNote();
+      set({ vault: null, ...vaultScopedSyncReset(), pendingVaultFolder: null });
+      void ipc.clearLastVault().catch(() => {
+        /* best-effort — the folder is about to be gone anyway */
+      });
+    }
+    if (path) {
+      forgetPersisted(path);
+      reconcileReport.clear(path);
+    }
+    forgetOrgVault(organizationId);
+    forgetLastVault(organizationId);
+    forgetTeamAccessCache(get().serverUrl, organizationId);
+    const userId = get().session?.user.id;
+    if (userId) forgetMembership(get().serverUrl, userId, organizationId);
+    // The membership is confirmed gone (re-listed above): this device's key for
+    // the vault goes too. Wraps are deleted server-side; the account key stays.
+    await forgetVaultKeysForOrg(userId, organizationId, keyHint);
+
+    if (path) {
+      // Rust refuses links, roots, the home and vaults folders, and any folder
+      // whose own stamp names a different vault. Permanent: no Trash, and the
+      // CRDT store under `.context/` goes with it. Also drops it from recents.
+      await ipc.deleteDepartedVault(path, organizationId).catch((e: unknown) => {
+        console.warn("[vault] membership ended but the folder could not be deleted", path, e);
+      });
+    }
+
+    if (isOpen) {
+      const next = get().organizations[0];
+      if (next) {
+        await get()
+          .setActiveOrganization(next.id)
+          .catch((e: unknown) => console.warn("[vault] switch after membership loss failed", e));
+      }
+    }
+    const text = membershipLostNotice(name ?? path?.split(/[\\/]/).filter(Boolean).pop() ?? "", reason);
+    // The notice slot lives in the editor column; with no vault open (welcome
+    // screen) the same line goes out as a toast instead, never both.
+    if (get().vault) set({ membershipLost: { text, at: Date.now() } });
+    else toast(text, "neutral");
+  },
+
+  checkLostMemberships: async () => {
+    const serverUrl = get().serverUrl;
+    const userId = get().session?.user.id;
+    if (!userId || get().authStatus !== "signed-in") return;
+    if (membershipCheckUnsupported(serverUrl)) return;
+    const listed = get().organizations.map((o) => o.id);
+    rememberMemberships(serverUrl, userId, listed);
+    const asked = orgIdsToCheck({
+      ledger: knownMemberships(serverUrl, userId),
+      bound: readOrgVaults(),
+      listed,
+    });
+    for (const ids of chunk(asked)) {
+      let body: unknown;
+      try {
+        body = await authManager.api.membershipCheck(ids);
+      } catch (e) {
+        const status = e instanceof ApiError ? e.status : null;
+        if (checkFailure(status) === "unsupported") markMembershipCheckUnsupported(serverUrl);
+        return;
+      }
+      for (const orgId of removalsFromCheck(ids, body)) {
+        await get().handleMembershipLost(orgId, "removed");
+      }
+    }
+  },
+
+  membershipLost: null,
+  recentsVersion: 0,
+  dismissMembershipLost: () => set({ membershipLost: null }),
+
   deleteRemoteVault: async (organizationId) => {
     // Permanent, server-side, owner-only. 403s here if the caller isn't owner.
-    await authManager.api.deleteRemoteVault(organizationId);
+    // A vault on Team is cancelled at the provider FIRST, so a 502 here means
+    // nothing was deleted — which is also why the result is handed back rather
+    // than swallowed: only the caller can tell the user when the paid period
+    // ends and that it can still be moved to another vault until then (#111).
+    const result = await authManager.api.deleteRemoteVault(organizationId);
+    // This device's folder, captured BEFORE the teardown forgets the binding.
+    const folderPath = readOrgVaults()[organizationId] ?? null;
+    // The vault is gone for everyone (server confirmed): forget its key here.
+    await forgetVaultKeysForOrg(
+      get().session?.user.id,
+      organizationId,
+      await stampedVaultIdFor(folderPath, organizationId),
+    );
     // Then tear down the same local state as a device-level removal.
     await get().removeVaultLocally(organizationId);
+    // The vault is gone for everyone, so this device's copy goes to the Trash
+    // too (owner decision 2026-10-09; recoverable, `.context` included). The
+    // server delete already counts: a trash failure only says so.
+    if (folderPath) {
+      if (get().vault?.path === folderPath) get().closeLocalVault();
+      try {
+        await ipc.deleteVault(folderPath);
+      } catch (e) {
+        toast(e instanceof Error ? e.message : String(e), "error");
+      }
+      forgetVaultPath(folderPath);
+      set((s) => ({ recentsVersion: s.recentsVersion + 1 }));
+    }
+    return result;
+  },
+
+  unsyncVault: async (organizationId, confirmName) => {
+    // 1. Server first. Anything thrown here — 403, a 409 `name_mismatch`, the
+    //    502 a refusing billing provider produces, or simply being offline —
+    //    propagates with NOTHING changed on this device, the same rule
+    //    `leaveVault` states. Only once this returns is the server copy gone.
+    const result = await authManager.api.unsyncVault(organizationId, confirmName);
+    // It is gone, and we watched it go: the stamp on its folder is a tombstone
+    // from here on, even if the clear below fails.
+    vaultsConfirmedGone.add(organizationId);
+    // 2. Where this vault lives here, captured BEFORE the binding is forgotten.
+    const folderPath = readOrgVaults()[organizationId] ?? null;
+    const label =
+      get().organizations.find((o) => o.id === organizationId)?.name ?? "This vault";
+    // Whether this is the folder on screen decides what the user still has to
+    // do, so read it BEFORE the teardown moves the state underneath.
+    const wasOpenFolder = folderPath != null && get().vault?.path === folderPath;
+    await unsyncLocalTeardown(get, set, organizationId, folderPath);
+    const folder = folderPath ? (folderPath.split("/").pop() ?? folderPath) : null;
+    // Neutral, not success: nothing was gained, and the one thing the user needs
+    // to hear is WHERE their notes still are.
+    //
+    // A folder that is NOT open keeps its stamp by design (`unsyncLocalTeardown`
+    // only clears the open one), and heals on its next open via
+    // `checkUnsyncedVaultStamp`. Say so, or the user is left thinking the job is
+    // finished while that folder still needs one more action before it can sync
+    // again.
+    toast(
+      folder
+        ? wasOpenFolder
+          ? `${label} is local only now. Your files are still in ${folder}.`
+          : `${label} is local only now. Your files are still in ${folder}. Open that folder to keep it local or turn sync back on.`
+        : `${label} is local only now. Your files were not touched.`,
+      "neutral",
+    );
+    return result;
+  },
+
+  checkUnsyncedVaultStamp: async () => {
+    const vault = get().vault;
+    if (!vault) return;
+    // Signed out we have no way to ask, and no right to conclude anything.
+    if (get().authStatus !== "signed-in") return;
+    const stampedOrgId = await peekStampedOrgId(vault.path);
+    // The cheap half: a folder with no stamp, or one stamped for a vault we are
+    // plainly a member of, is answered locally and never touches the network.
+    // `"unknown"` here is a placeholder — the local branches don't read it, so
+    // anything but `unknown` is a final answer. That includes a stamp MISMATCH
+    // (this profile binds the folder to another vault we're in): the 404 such a
+    // stamp gets from this server proves nothing, and the turn-on-sync refusal
+    // already says what's wrong.
+    const boundOrgId =
+      Object.entries(readOrgVaults()).find(([, p]) => p === vault.path)?.[0] ?? null;
+    if (
+      planUnsyncStamp({
+        stampedOrgId,
+        knownOrgIds: get().organizations.map((o) => o.id),
+        statusAnswer: "unknown",
+        boundOrgId,
+      }) !== "unknown"
+    ) {
+      if (get().vaultUnsynced) set({ vaultUnsynced: null });
+      return;
+    }
+    const stamped = stampedOrgId as string;
+    // Never throws: an unreachable server answers `unknown`, which stays silent.
+    const status = await authManager.api.getOrgStatus(stamped);
+    // A vault switch while we asked: the answer is about the folder we left.
+    if (get().vault?.path !== vault.path) return;
+    const verdict = planUnsyncStamp({
+      stampedOrgId: stamped,
+      knownOrgIds: get().organizations.map((o) => o.id),
+      statusAnswer: status.kind,
+      boundOrgId,
+    });
+    if (verdict === "local-only") vaultsConfirmedGone.add(stamped);
+    set({
+      vaultUnsynced:
+        verdict === "local-only" ? { organizationId: stamped, path: vault.path } : null,
+    });
+  },
+
+  keepUnsyncedVaultLocal: async () => {
+    const pending = get().vaultUnsynced;
+    if (!pending) return;
+    // The server side already happened (somewhere else, or by the owner). All
+    // that is left is this device's half of the teardown — and it touches no
+    // file: the folder stays open, the notes stay put, the index survives.
+    await unsyncLocalTeardown(get, set, pending.organizationId, pending.path);
+    toast("This vault is a local folder now. Your files were not touched.", "neutral");
+  },
+
+  resyncUnsyncedVault: async () => {
+    const pending = get().vaultUnsynced;
+    if (!pending) return;
+    // Clear the dead stamp FIRST: with it in place `planTurnOnSync` answers
+    // `blocked-foreign` and refuses. Cleared, the folder belongs to nobody and
+    // turns into a brand-new vault — reusing the doc ids already in
+    // `.context/index.sqlite`, so every note keeps its identity and history.
+    await unsyncLocalTeardown(get, set, pending.organizationId, pending.path);
+    await get().turnOnSyncForCurrentVault();
   },
 
   // ---- Vault folder resolution ----
@@ -2188,13 +4938,26 @@ export const useStore = create<AppStore>((set, get) => ({
       opts.resync ? (get().session?.activeOrganizationId ?? null) : null,
     );
     get().closeNote();
+    // A different folder is on screen: whatever the open gate knew belonged to
+    // the last one. Re-arm it, forget the old answer, and ask again — this path
+    // bypasses `setVault`'s switch detection (Rust already swapped the vault),
+    // so without this a new local vault kept the previous vault's answer and
+    // every note open waited out the sync gate.
+    armSyncGate();
     set({
       vault: info,
+      personalPins: readPersonalPins(info.path),
+      personalHomeDocId: readPersonalHome(info.path, get().homeSectionHidden),
+      homePickerOpen: false,
+      homeLandingPending: true,
+      homeNavigationPath: null,
       ...vaultScopedSyncReset(),
+      openFolderIsSynced: null,
       itemColors: readItemColors(info.path),
       itemOrder: readItemOrder(info.path),
       pendingVaultFolder: null,
     });
+    probeFolderSync(get, set, info.path);
     await get().refreshTree();
     await get().refreshTitles();
     if (!sameVault(get, info.epoch)) return;
@@ -2221,8 +4984,24 @@ export const useStore = create<AppStore>((set, get) => ({
     // Prefer this entry point over `adoptOpenedVault` wherever the caller controls
     // the open, precisely because it can tear down first; `adoptOpenedVault` exists
     // for the picker commands, which open the vault themselves as part of picking.
-    leaveVaultSync();
-    await get().adoptOpenedVault(await ipc.openVault(path));
+    // Announce the switch to the chrome (header rename + app-wide overlay) the
+    // same way an org switch does — but only when there IS a vault to switch
+    // from; a first open from the picker has its own busy state.
+    const isSwitch = get().vault != null;
+    if (isSwitch) {
+      const name = path.split(/[\\/]/).filter(Boolean).pop() ?? "vault";
+      set({ switchingVault: { orgId: null, name } });
+    }
+    try {
+      leaveVaultSync();
+      await get().adoptOpenedVault(await ipc.openVault(path));
+    } finally {
+      // Clear only our own claim: an org switch that started meanwhile owns
+      // the flag now.
+      if (isSwitch && get().switchingVault?.orgId === null) {
+        set({ switchingVault: null });
+      }
+    }
   },
 
   removeLocalVault: async (path) => {
@@ -2237,19 +5016,30 @@ export const useStore = create<AppStore>((set, get) => ({
 
   deleteLocalVault: async (path) => {
     // Tear down open state FIRST if this is the current folder, so nothing keeps
-    // reading from it while it's moved to the trash.
-    if (!get().syncEnabled && get().vault?.path === path) {
+    // reading from it while it's moved to the trash. Whatever the sync state:
+    // a signed-in session with a local folder open used to skip this, so the
+    // app kept (and later tried to reopen) a folder that was in the Trash.
+    if (get().vault?.path === path) {
       get().closeLocalVault();
     }
     // Move the folder (and all its notes) to the OS trash; this also forgets it
-    // from recents. Destructive — the UI gates it behind a two-click confirm.
-    await ipc.deleteVault(path);
+    // from recents and drops a `current` link to it. Destructive — the UI gates
+    // it behind the confirm dialog.
+    try {
+      await ipc.deleteVault(path);
+    } finally {
+      // Re-read recents either way: the welcome screen mounted when the vault
+      // closed above and read them while the folder still existed.
+      set((s) => ({ recentsVersion: s.recentsVersion + 1 }));
+    }
+    forgetVaultPath(path);
   },
 
   closeLocalVault: () => {
     // Detach from the open local folder and drop to the welcome/empty state.
     leaveVaultSync();
     get().closeNote();
+    armSyncGate();
     set({
       vault: null,
       ...vaultScopedSyncReset(),
@@ -2270,26 +5060,59 @@ export const useStore = create<AppStore>((set, get) => ({
     const v = await ipc.openVaultInRoot(path, { create: opts?.create ?? false });
     enterVaultScope(v, orgId);
     get().closeNote();
+    // A new folder is opening: re-arm the open gate for it (the enable below
+    // resolves it at the prime). This is a vault the SESSION names, so its
+    // folder does sync — say so, rather than making the first click wait for a
+    // peek this path already knows the answer to.
+    armSyncGate();
     set({
       vault: v,
+      personalPins: readPersonalPins(v.path),
+      personalHomeDocId: readPersonalHome(v.path, get().homeSectionHidden),
+      homePickerOpen: false,
+      homeLandingPending: true,
+      homeNavigationPath: null,
       ...vaultScopedSyncReset(),
+      openFolderIsSynced: true,
       itemColors: readItemColors(v.path),
       itemOrder: readItemOrder(v.path),
       pendingVaultFolder: null,
     });
     rememberOrgVault(orgId, v.path);
     rememberLastVault(orgId);
-    // Turn sync on BEFORE the tree reads. Those two awaits were the window in
-    // which another vault switch (or a `vault-opened` event, or StrictMode's
-    // double-open in dev) could make this call stale and skip sync entirely,
-    // leaving a freshly joined vault sitting there not syncing. The staleness
-    // check still guards the call itself — `enableSyncForVault` re-checks the
-    // epoch internally — but it is no longer gated behind work it doesn't need.
-    if (sameVault(get, v.epoch)) {
-      await get().enableSyncForVault({ seedIfEmpty: opts?.seedIfEmpty });
+    // Start sync BEFORE the tree reads, but never WAIT for it.
+    //
+    // Starting first: the two tree awaits were the window in which another
+    // vault switch (or a `vault-opened` event, or StrictMode's double-open in
+    // dev) could make this call stale and skip sync entirely, leaving a freshly
+    // joined vault sitting there not syncing. `enableSyncForVault` re-checks the
+    // epoch internally, so the staleness check still guards the call itself.
+    //
+    // Not waiting: this used to be awaited, so the sidebar kept showing the
+    // vault being LEFT until the whole registry reconcile had finished — a full
+    // walk of the vault plus several server listings, i.e. seconds that grew
+    // with vault size — while a local vault switched instantly. The folder on
+    // disk IS the vault; the tree below is a top-level directory listing that
+    // needs nothing from the server. Every state write the reconcile makes is
+    // epoch-gated, and it re-reads the tree itself to surface the notes it
+    // materialized, so nothing here depends on it finishing. (A note opened
+    // before it lands is re-attached by the editor when `syncEnabled` flips.)
+    //
+    // `deferSync`: `enableSyncForVault` reads the org from the SESSION, so the
+    // caller that opens the folder before activating the org must start sync
+    // itself once the session names the new vault.
+    if (!opts?.deferSync && sameVault(get, v.epoch)) {
+      void get()
+        .enableSyncForVault({ seedIfEmpty: opts?.seedIfEmpty })
+        .catch((e) => console.warn("[sync] enable failed", e));
     }
     await get().refreshTree();
-    await get().refreshTitles();
+    // Titles wait on the index lock, which the background rebuild holds; the
+    // `index-ready` event refreshes them again once it commits, so the switch
+    // must not sit behind the rebuild (launch already voids this the same way).
+    void get()
+      .refreshTitles()
+      .catch((e) => console.warn("[vault] title refresh failed", e));
     // A shared link parked on the choose-a-folder prompt resumes here, now
     // that the vault has a folder and its pull has started. Guarded by orgId
     // so a link queued for some OTHER flow isn't eaten by an unrelated bind.
@@ -2299,35 +5122,89 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  chooseVaultFolder: async () => {
-    const pending = get().pendingVaultFolder;
-    if (!pending) return;
+  // The Set-up prompt's two buttons ARE the #228 recovery pair: with a prompt
+  // up, `folderRecoveryTarget` names its vault, so there is one code path.
+  chooseVaultFolder: () => get().locateVaultFolder(),
+
+  startEmptyVault: () => get().restoreVaultFolder(),
+
+  restoreVaultFolder: async () => {
+    const target = folderRecoveryTarget(get);
+    if (!target) return;
+    if (!target.orgId) throw new Error("This vault isn't synced, so there is nothing to restore it from.");
+    // A missing folder comes back where it was; a vault that never had one
+    // ("Start with an empty folder") gets a fresh folder under the vaults root.
+    const folder = target.path ?? (await freeVaultFolder(target.orgName));
+    // A switch during that read would replace the prompt; binding a folder for the
+    // superseded vault would point the Rust slot at the wrong folder.
+    if (!target.stillCurrent()) return;
+    await get().applyVaultFolder(target.orgId, folder, {
+      create: true,
+      seedIfEmpty: target.seedIfEmpty,
+    });
+  },
+
+  locateVaultFolder: async () => {
+    const target = folderRecoveryTarget(get);
+    if (!target) return;
     const picked = await ipc.pickFolder();
     if (!picked) return; // cancelled the native dialog — keep the prompt up
     // The native picker is the longest await in the app (the user browsing their
     // filesystem), so the prompt can be superseded or dismissed while it is open.
     // Binding this folder then would point the Rust vault slot at it on behalf of
-    // a vault that is no longer the one being resolved. Same guard as
-    // `startEmptyVault`, which has a far shorter window.
-    if (get().pendingVaultFolder?.orgId !== pending.orgId) return;
+    // a vault that is no longer the one being resolved.
+    if (!target.stillCurrent()) return;
     // Deliberately no `seedIfEmpty` passthrough: the user native-picked an
     // EXISTING folder of their own, and a picked folder is adopted exactly as
     // it is (same rule as "Open existing") — even for a just-created vault.
-    await get().applyVaultFolder(pending.orgId, picked);
+    if (target.orgId) await get().applyVaultFolder(target.orgId, picked);
+    else await get().openLocalVault(picked);
   },
 
-  startEmptyVault: async () => {
-    const pending = get().pendingVaultFolder;
-    if (!pending) return;
-    const folder = await freeVaultFolder(pending.orgName);
-    // A switch during that read would replace the prompt; binding a folder for the
-    // superseded vault would point the Rust slot at the wrong folder.
-    if (get().pendingVaultFolder?.orgId !== pending.orgId) return;
-    await get().applyVaultFolder(pending.orgId, folder, {
-      create: true,
-      seedIfEmpty: pending.seedIfEmpty,
+  autoRecoverMissingRoot: async () => {
+    const v = get().vault;
+    const orgId = get().syncEnabled ? (get().session?.activeOrganizationId ?? null) : null;
+    // A local-only vault has nothing to sync down: the banner stays.
+    if (!v || !orgId) return;
+    const still = () =>
+      get().vault?.epoch === v.epoch && get().structureNotice.rootMissing && !get().pendingVaultFolder;
+    const plan = await planForMissingFolder(orgId, v.path);
+    if (!still()) return;
+    if (plan.kind === "rebind") {
+      await get().applyVaultFolder(orgId, plan.path);
+      toast(reboundToastText(v.name, plan.path));
+      return;
+    }
+    if (plan.kind !== "recreate") return; // ask: the banner's choice stands
+    try {
+      await get().restoreVaultFolder();
+    } catch (e) {
+      // The banner is still up with its two choices; nothing else to do.
+      console.warn("[vault] auto-restore failed; leaving the banner", e);
+      return;
+    }
+    set({ folderAutoRestored: { orgId, name: v.name, path: v.path } });
+  },
+
+  resetLocalVaultCopy: async () => {
+    const v = get().vault;
+    const orgId = get().session?.activeOrganizationId ?? null;
+    if (!v || !get().syncEnabled || !orgId) {
+      throw new Error("Only a synced vault can be reset. A local vault has no other copy.");
+    }
+    // Every tab names a file about to be deleted.
+    get().closeAllTabs();
+    await syncManager.withDeliberateRootChange(async () => {
+      // Stop sync before the folder goes: nothing may push, pull or drain
+      // against it, and Rust stops the watcher before it deletes.
+      leaveVaultSync();
+      await ipc.resetVaultLocalCopy(v.path, v.epoch);
+      // …then exactly Restore here: the same folder, recreated, synced down.
+      await get().applyVaultFolder(orgId, v.path, { create: true });
     });
   },
+
+  unsyncedNotePaths: () => syncManager.unsyncedNotePaths?.() ?? [],
 
   cancelVaultFolder: async () => {
     const pending = get().pendingVaultFolder;
@@ -2372,9 +5249,10 @@ export const useStore = create<AppStore>((set, get) => ({
   // ---- Locks ----
 
   refreshLocks: async () => {
+    const generation = ++locksRefreshGen;
     const vaultId = syncManager.registry.vaultId;
     if (!vaultId || !get().syncEnabled) {
-      set({ locks: [], denies: [] });
+      set({ locks: [], denies: [], lifts: [] });
       return;
     }
     const epoch = get().vault?.epoch;
@@ -2382,19 +5260,27 @@ export const useStore = create<AppStore>((set, get) => ({
       const overlay = await authManager.api.listVaultLocks(vaultId);
       // Locks are per-vault; publishing another vault's set would badge the
       // wrong rows in the sidebar.
-      if (!sameVault(get, epoch) || syncManager.registry.vaultId !== vaultId) return;
-      // The endpoint returns both overlay kinds. They MUST stay apart here:
-      // everything downstream of `locks` (badges, tooltips, the read-only cap)
-      // assumes every row is a lock, and a Private row rendered as a lock would
-      // put a padlock on a folder that is not read-only at all.
+      if (generation !== locksRefreshGen || !sameVault(get, epoch) || syncManager.registry.vaultId !== vaultId) return;
+      // The endpoint returns THREE kinds of row on one response. They MUST stay
+      // apart here: everything downstream of `locks` (badges, tooltips, the
+      // read-only cap, the row menu's Unlock) assumes every row is a lock. A
+      // Private row rendered as a lock would padlock a folder that isn't
+      // read-only at all, and an `edit` lift rendered as one would offer Unlock
+      // on a grant — which would revoke it.
+      //
+      // Split on `permission`, not on absence, so a kind this build has never
+      // heard of lands in none of the three rather than in the wrong one.
       set({
-        locks: overlay.filter((s) => s.permission === "locked"),
+        locks: overlay
+          .filter((s) => s.permission === "locked" || s.permission === "readonly")
+          .map((s) => (s.permission === "readonly" ? { ...s, permission: "locked" as const } : s)),
         denies: overlay.filter((s) => s.permission === "denied"),
+        lifts: overlay.filter((s) => s.permission === "edit"),
       });
     } catch (e) {
       console.warn("[locks] refresh failed", e);
-      if (!sameVault(get, epoch)) return;
-      set({ locks: [], denies: [] });
+      // A failed read is not evidence that every restriction was removed.
+      // Keep the last confirmed overlay until a successful refresh replaces it.
     }
   },
 
@@ -2481,19 +5367,19 @@ export const useStore = create<AppStore>((set, get) => ({
     if (!vaultId || !get().syncEnabled) {
       // `null`, not `[]`: a local vault has no checkpoints to *have*, which the
       // tab renders as a sync gate rather than "no checkpoints yet".
-      set({ checkpoints: null });
+      set({ checkpoints: null, checkpointSchedule: null });
       return;
     }
     try {
-      const checkpoints = await authManager.api.listCheckpoints(vaultId);
+      const { checkpoints, schedule } = await authManager.api.listCheckpoints(vaultId);
       // Checkpoints are per-vault; publishing another vault's set would offer a
       // revert that rewrites the wrong notes.
       if (syncManager.registry.vaultId !== vaultId) return;
-      set({ checkpoints });
+      set({ checkpoints, checkpointSchedule: schedule });
     } catch (e) {
       console.warn("[checkpoints] refresh failed", e);
       if (syncManager.registry.vaultId !== vaultId) return;
-      set({ checkpoints: [] });
+      set({ checkpoints: [], checkpointSchedule: null });
     }
   },
 
@@ -2518,20 +5404,25 @@ export const useStore = create<AppStore>((set, get) => ({
     // server broadcasts `registry-changed` to everyone including us, but pulling
     // here means the vault we just reverted converges on this device without
     // waiting for that round trip.
-    syncManager.handleRegistryChanged();
+    syncManager.handleRegistryChanged("revert");
     return result;
   },
 
   // ---- Billing ----
 
   refreshBillingConfig: async () => {
+    // Gated like every other detached-restore write: a config fetched for the
+    // account we just signed out of must not survive into the next one.
+    const gen = authInitGen;
     // getBillingConfig never throws — it returns { enabled: false } on any
     // failure (older/self-hosted server), so the billing UI simply stays hidden.
     const billingConfig = await authManager.api.getBillingConfig();
+    if (authInitGen !== gen) return;
     set({ billingConfig });
   },
 
   refreshOrgBilling: async () => {
+    const gen = authInitGen;
     const orgId = get().session?.activeOrganizationId;
     if (!orgId || !get().billingConfig?.enabled) {
       set({ orgBilling: null });
@@ -2539,30 +5430,80 @@ export const useStore = create<AppStore>((set, get) => ({
     }
     try {
       const orgBilling = await authManager.api.getOrgBilling(orgId);
+      if (authInitGen !== gen) return;
       set({ orgBilling });
     } catch (e) {
       console.warn("[billing] refresh failed", e);
+      if (authInitGen !== gen) return;
       set({ orgBilling: null });
+    }
+  },
+
+  refreshMyBilling: async () => {
+    // Account-wide, so it needs a session rather than an active vault — the
+    // Billing tab is reachable from a local vault now. Failures are swallowed
+    // like refreshOrgBilling's: the list simply doesn't render, it never takes
+    // the settings page down with it.
+    if (!get().session || !get().billingConfig?.enabled) {
+      set({ myBilling: null });
+      return;
+    }
+    try {
+      const activeOrgId = get().session?.activeOrganizationId ?? null;
+      const wasPro = !!get().myBilling?.vaults.some(
+        (vault) => vault.orgId === activeOrgId && vault.plan === "pro",
+      );
+      const myBilling = await authManager.api.getMyBilling();
+      set({ myBilling });
+      const isPro = !!myBilling.vaults.some(
+        (vault) => vault.orgId === activeOrgId && vault.plan === "pro",
+      );
+      // An attachment-plan refusal is memoised after the first 402 so watcher
+      // retries cannot loop. Only a confirmed Free -> Team transition clears
+      // that refusal and schedules a fresh attachment comparison.
+      if (!wasPro && isPro) syncManager.recheckAttachmentEntitlement();
+      else syncManager.checkAttachmentEntitlement?.();
+    } catch (e) {
+      console.warn("[billing] mine refresh failed", e);
+      set({ myBilling: null });
     }
   },
 
   // ---- Sync ----
 
-  setSyncStatus: (status) =>
-    set(
+  setSyncStatus: (status) => {
+    if (get().syncStatus !== status) console.info(`[sync] badge status ${get().syncStatus} → ${status}`);
+    return set(
       status === "synced"
         ? { syncStatus: status, lastSyncedAt: Date.now() }
         : // Leaving "synced" (new doc connecting, offline, error…) clears any
           // stale "Saving…" — pending only makes sense while connected.
           { syncStatus: status, syncPending: false },
-    ),
+    );
+  },
 
   setSyncPending: (pending) => set({ syncPending: pending }),
 
   // A server ack of all pending changes: this is the real "synced just now".
   markSynced: () => set({ lastSyncedAt: Date.now(), syncPending: false }),
+  dismissSyncPause: () => set((s) => ({ syncPauseDismissed: s.syncPause?.since ?? null })),
 
-  setSyncProgress: (progress) => set({ syncProgress: progress }),
+  setSyncProgress: (progress) => {
+    const prev = get().syncProgress;
+    if (prev?.phase !== progress?.phase) {
+      console.info(
+        `[sync] badge progress ${prev?.phase ?? "null"} → ${progress?.phase ?? "null"} ${JSON.stringify(progress ?? null).slice(0, 160)}`,
+      );
+    }
+    // A FRESH arrival at `error` is a new failed run, and the only thing that
+    // may un-dismiss the note-limit banner. Later emissions of the same phase
+    // (the reporter re-flushes while failures trickle in) must not, or a
+    // dismissed banner would pop back up as the counter moved.
+    if (prev?.phase !== "error" && progress?.phase === "error") {
+      set((s) => ({ failedRunToken: s.failedRunToken + 1 }));
+    }
+    return set({ syncProgress: progress });
+  },
 
   // Merged rather than replaced: per-doc transitions arrive one (or a batch) at a
   // time over a long run, so a writer never has to hold the whole map. Keys are
@@ -2577,20 +5518,32 @@ export const useStore = create<AppStore>((set, get) => ({
       return { docSyncState: next };
     }),
 
+  // Replaced, not merged, for the same reason `setDocIdByPath` is: the mirror
+  // publishes the whole local binary set each pass, so a merge would keep dots
+  // for files that have since been deleted, renamed, or left with the vault.
+  setFileSyncState: (states) => set({ fileSyncState: states }),
+  setAttachmentSyncBlocked: (blocked) => set({ attachmentSyncBlocked: blocked }),
+
   // Replaced, not merged: the registry publishes the whole index for the open
   // vault, so a merge would keep rows for notes it has stopped mapping (deleted,
   // renamed, or belonging to the vault we just left).
   setDocIdByPath: (map) => set({ docIdByPath: map }),
 
   enableSyncForVault: async (opts = {}) => {
+    lastSyncRefusal = null;
     const { session, vault } = get();
+    // Every refusal below is an ANSWER — sync is not coming for this folder — so
+    // each one releases the open gate rather than leaving the first click to
+    // time out against it.
     if (!session || !vault) {
       set({ syncEnabled: false });
+      resolveSyncGate();
       return;
     }
     const orgId = session.activeOrganizationId;
     if (!orgId) {
       set({ syncEnabled: false });
+      resolveSyncGate();
       return;
     }
     // The vault this call is FOR. `reconcile` can take many seconds on a large
@@ -2611,52 +5564,107 @@ export const useStore = create<AppStore>((set, get) => ({
     const stamped = await peekStampedOrgId(vault.path);
     if (stale()) return;
     if (stamped && stamped !== orgId) {
+      lastSyncRefusal = { kind: "stamp-mismatch", stampedOrgId: stamped };
       set({ syncEnabled: false });
+      resolveSyncGate();
       console.warn(
         `[sync] not enabled: folder is stamped for vault ${stamped}, not active vault ${orgId}`,
       );
       return;
     }
 
-    // No tree is passed: `store.tree` is the sidebar's LAZY tree (top level only,
-    // unexpanded folders hold an empty `children` placeholder), and reconcile
-    // needs every note in the vault. It reads the full tree itself.
-    const result = await syncManager.enable(session, {
-      orgId,
-      name: vault.name,
-      path: vault.path,
-      epoch,
-      seedIfEmpty: opts.seedIfEmpty,
+    // The prime half of `enable`, as a promise `background` callers can return
+    // on. Resolved by `onPrimed` below, and by the `finally` regardless — a
+    // refused or thrown enable must never leave a caller waiting.
+    let resolvePrimed = () => {};
+    const primed = new Promise<void>((r) => {
+      resolvePrimed = r;
     });
-    // `syncManager.enable` already dropped its own work if the scope went stale;
-    // this guard keeps the STORE from claiming sync is on for the wrong vault.
-    if (stale()) return;
-    set({ syncEnabled: result.ok });
-    if (result.ok) {
-      // Broadcast the user's current activity status on this session's presence.
-      syncManager.setPresenceStatus(get().activityStatus);
-      // This folder is now the one this vault opens with.
-      rememberOrgVault(orgId, vault.path);
-      rememberLastVault(orgId);
-      // Reconcile may have materialized server-only notes onto disk; refresh so
-      // the sidebar reflects the full vault, not just what was already local.
-      await get().refreshTree();
+
+    const tail = (async () => {
+      // No tree is passed: `store.tree` is the sidebar's LAZY tree (top level
+      // only, unexpanded folders hold an empty `children` placeholder), and
+      // reconcile needs every note in the vault. It reads the full tree itself.
+      const result = await syncManager.enable(
+        session,
+        {
+          orgId,
+          name: vault.name,
+          path: vault.path,
+          epoch,
+          seedIfEmpty: opts.seedIfEmpty,
+        },
+        {
+          onPrimed: () => {
+            if (stale()) return;
+            // The vault DOES sync and this device knows its doc ids. Say so
+            // now: the badge stops reading "Local", and a click on a mapped
+            // note gets a provider instead of seeding from disk.
+            set({ syncEnabled: true });
+            syncManager.setPresenceStatus(get().activityStatus);
+            rememberOrgVault(orgId, vault.path);
+            rememberLastVault(orgId);
+            perf.mark("sync-primed");
+            resolveSyncGate();
+            resolvePrimed();
+          },
+        },
+      );
+      // `syncManager.enable` already dropped its own work if the scope went stale;
+      // this guard keeps the STORE from claiming sync is on for the wrong vault.
       if (stale()) return;
-      await get().refreshTitles();
-      if (stale()) return;
-      await get().refreshLocks();
-      if (stale()) return;
-      await get().refreshVaultSettings();
-      if (stale()) return;
-      // A brand-new vault was just seeded with welcome content — greet the
-      // user with the welcome note if nothing else is open.
-      if (result.seeded && !get().openNote) {
-        await get().openNoteByPath(WELCOME_NOTE_PATH);
+      set({ syncEnabled: result.ok });
+      // Either outcome is an answer: nothing is left for a waiting open to
+      // gain by waiting longer.
+      resolveSyncGate();
+      if (result.ok) {
+        perf.mark("sync-enabled");
+        // Broadcast the user's current activity status on this session's presence.
+        syncManager.setPresenceStatus(get().activityStatus);
+        // This folder is now the one this vault opens with.
+        rememberOrgVault(orgId, vault.path);
+        rememberLastVault(orgId);
+        // Reconcile may have materialized server-only notes onto disk; refresh so
+        // the sidebar reflects the full vault, not just what was already local.
+        // Independent reads (disk tree, index titles, server locks, server
+        // settings): run them together instead of four serial round trips.
+        // Each one re-checks its own vault epoch before writing state.
+        await Promise.all([
+          get().refreshTree(),
+          get().refreshTitles(),
+          get().refreshLocks(),
+          get().refreshVaultSettings(),
+        ]);
+        if (stale()) return;
+        // A brand-new vault was just seeded with welcome content — greet the
+        // user with the welcome note if nothing else is open.
+        if (result.seeded && !get().openNote) {
+          await get().openNoteByPath(WELCOME_NOTE_PATH);
+        }
+      } else {
+        set({ locks: [] });
+        if (result.reason) console.warn("[sync] not enabled:", result.reason);
+        // W3: paused for the vault key. Nothing on disk was touched; run the
+        // whole enable again once the key state is known and safe.
+        if (result.reason === VAULT_KEY_PAUSE_REASON) {
+          const off = onVaultKeyBlockChange((_vaultId, blocked) => {
+            if (blocked) return;
+            off();
+            if (!stale()) void get().enableSyncForVault(opts);
+          });
+        }
       }
-    } else {
-      set({ locks: [] });
-      if (result.reason) console.warn("[sync] not enabled:", result.reason);
+    })().finally(resolvePrimed);
+
+    if (opts.background) {
+      // The launch and the vault switch: the vault is usable at the prime, and
+      // the reconcile (plus its tree/titles/locks/settings tail) has no
+      // business in front of the user.
+      void tail.catch((e) => console.warn("[sync] background enable failed", e));
+      await primed;
+      return;
     }
+    await tail;
   },
 }));
 
@@ -2673,8 +5681,123 @@ function requireSyncedVaultId(get: () => AppStore): string {
   return vaultId;
 }
 
+/** Password unlock of the account key, capped so sign-in never waits long. */
+const PASSWORD_UNLOCK_WAIT_MS = 8_000;
+async function passwordUnlockBounded(userId: string, password: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  await Promise.race([
+    vaultKeysPasswordUnlock(userId, password),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, PASSWORD_UNLOCK_WAIT_MS);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+}
+
+async function launchPasswordUnlock(serverUrl: string, userId: string, email: string | null | undefined): Promise<void> {
+  if (!email) return;
+  // A stale remembered password is tried once, never on every launch (each
+  // try counts in the sign-in throttle); see lib/vaultKeys/launchUnlock.ts.
+  await runLaunchUnlock({
+    server: serverUrl,
+    userId,
+    loadPassword: () => loadRememberedPassword(serverUrl, email),
+    unlock: (password) => vaultKeysPasswordUnlock(userId, password),
+  });
+}
+
 function errMsg(e: unknown): string {
   if (e instanceof ApiError) return e.message;
   if (e instanceof Error) return e.message;
   return String(e);
 }
+
+// ---- dev only: never hot-swap this module in half ---------------------------
+//
+// The same reason `lib/sync/docSession.ts` ends this way: `useStore` is a module
+// singleton and the manager→store wiring happens once per page load inside
+// `initAuth`. An HMR round that re-executes this file hands the app a brand-new
+// store (no vault, no session) that nothing re-initialises. Reload instead;
+// stripped from production builds.
+if (import.meta.hot) {
+  import.meta.hot.accept(() => {
+    window.location.reload();
+  });
+}
+
+// The signed-in user's picture feeds the shared avatar rule: the directory (so
+// every surface that knows only their id draws the account bar's face) and the
+// presence payload (so teammates see the picked character too). A change is
+// re-published on any live presence at once.
+{
+  let lastImage: string | null | undefined;
+  const publishSelfAvatar = (session: AppStore["session"]) => {
+    const image = session?.user.image ?? null;
+    setSelfAvatarImage(session?.user.id, image);
+    if (image === lastImage) return;
+    const first = lastImage === undefined;
+    lastImage = image;
+    if (!first && session) syncManager.setPresenceStatus(useStore.getState().activityStatus);
+  };
+  publishSelfAvatar(useStore.getState().session);
+  useStore.subscribe((s, prev) => {
+    if (s.session !== prev.session) publishSelfAvatar(s.session);
+  });
+}
+
+// The editor text size is a CSS token on :root, so it must be published once at
+// startup (after restart) as well as on every change.
+applyEditorFontSize(useStore.getState().editorFontSize);
+
+// Vault appearance: recompute the effective look whenever the open vault (or
+// its org) changes, and fetch that org's defaults once per open. A switch to a
+// local vault or another team drops the previous vault's theme immediately.
+useStore.getState().applyAppearance();
+useStore.subscribe((state, prev) => {
+  const org = (st: typeof state) =>
+    st.vault && st.syncEnabled ? (st.session?.activeOrganizationId ?? null) : null;
+  const now = org(state);
+  const before = org(prev);
+  if (now !== before || state.vault !== prev.vault) {
+    state.applyAppearance();
+    if (now && (now !== before || state.vault?.path !== prev.vault?.path)) {
+      void state.loadVaultAppearance(now);
+    }
+  } else if (
+    now &&
+    state.vaultSyncStatus === "synced" &&
+    prev.vaultSyncStatus !== "synced"
+  ) {
+    // Appearance is not in the channel's `ready`: refetch on every (re)connect
+    // so a frame missed while disconnected cannot leave a stale look.
+    void state.loadVaultAppearance(now);
+  }
+  // The account-scoped legacy auto-colour key needs the user id: migrate with
+  // it the first time a session appears on a device that never migrated.
+  if (state.session?.user.id !== prev.session?.user.id && state.session?.user.id) {
+    const overrides = readAppearanceOverrides(state.session.user.id);
+    if (JSON.stringify(overrides) !== JSON.stringify(state.appearanceOverrides)) {
+      useStore.setState({ appearanceOverrides: overrides });
+      state.applyAppearance();
+    }
+  }
+});
+
+// The Members and access caches are paint-only but keyed per server, not per
+// account: sign-out, a different account or a different server forgets them
+// so one account's roster never paints for another (#307).
+useStore.subscribe((state, prev) => {
+  if (
+    state.serverUrl !== prev.serverUrl ||
+    (prev.session != null && state.session == null) ||
+    (state.session?.user.id ?? null) !== (prev.session?.user.id ?? null)
+  ) {
+    resetMembersAccessCaches();
+  }
+});
+
+// Registry pull → store mirror (see `lib/sync/vaultVisibility`).
+vaultVisibility.subscribe((v) => useStore.setState({ vaultVisibility: v }));
+
+// A timed status set before a restart still clears on time.
+scheduleStatusClear(useStore.getState().activityStatusUntil);

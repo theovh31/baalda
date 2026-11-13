@@ -3,9 +3,19 @@ import type { IncomingMessage, Server as HttpServer } from "node:http";
 import type { Socket } from "node:net";
 import { config } from "../config.js";
 import { type PubSub, vaultTopic } from "./pubsub.js";
+import { decodeUserEvent, MESSAGES_CAP, USER_EVENTS_CAP, userTopic } from "./user-events.js";
 import { verifyVaultToken } from "../tokens/vault-token.js";
-import { listReadableDocsInVault } from "../permissions/vault-docs.js";
+import { listReadableDocsInVault, type SharedVaultReads } from "../permissions/vault-docs.js";
 import { listEmptyDocs, loadDocDiff } from "../yjs/persistence.js";
+import { deletedNotesAmong } from "../trash/access.js";
+import { pool } from "../db/pool.js";
+import { vaultKeysEnabled } from "../crypto/config.js";
+import { kickVaultBackfill } from "../crypto/backfill.js";
+import { vaultKeyCache } from "../crypto/key-cache.js";
+import { CLOSE_KEY_REQUIRED, KEY_REQUIRED_CODE, decodeVk, loadVkCheck } from "../crypto/transport.js";
+import { verifyVk } from "../crypto/vk-check.js";
+import type { DocCrypto } from "../crypto/doc-crypto.js";
+import { observeCount } from "../metrics/sync-metrics.js";
 import {
   parseHello,
   parsePresence,
@@ -13,12 +23,26 @@ import {
   encodePubsubUpdate,
   encodePubsubAclChanged,
   encodePubsubRegistryChanged,
+  encodePubsubMetaChanged,
+  encodePubsubActivityChanged,
   encodePubsubMemberJoined,
+  encodePubsubOrgChanged,
+  encodePubsubAppearanceChanged,
+  encodePubsubSkillsChanged,
+  encodePubsubMessagesChanged,
+  MESSAGES_TOPIC,
+  PS_MESSAGES_CHANGED,
+  type AppearanceChange,
+  type OrgChange,
+  encodePubsubRejected,
+  encodePubsubBrake,
   encodePubsubPresence,
   encodePubsubPresenceQuery,
   encodePubsubVoice,
   encodeVoiceFrame,
   decodePubsub,
+  encodePubsubMemberRemoved,
+  type MemberRemovedReason,
   decodeVoiceFrame,
   VOICE_FRAME,
   VOICE_RATE_BYTES_PER_SEC,
@@ -61,6 +85,8 @@ export interface VaultChannelDeps {
   loadDiff?: typeof loadDocDiff;
   /** Which readable docs hold no server content — reported on `ready`. */
   listEmpty?: typeof listEmptyDocs;
+  /** Which of the client's held ids are soft-deleted — `ready.tombstones`. */
+  listDeletedAmong?: typeof deletedNotesAmong;
   verifyToken?: typeof verifyVaultToken;
   backfillConcurrency?: number;
   /** Per-connection outbound cap in bytes (default `config.vaultSendCapBytes`). */
@@ -73,25 +99,78 @@ export interface VaultChannelDeps {
   heartbeatMs?: number;
   /** Coalescing window for `registry` broadcasts (ms; 0 disables). */
   registryCoalesceMs?: number;
+  /**
+   * Is this user's content in this vault held by the shrink burst brake right
+   * now (on THIS process)? Asked once per connection after `ready`, so a client
+   * that (re)connects during a hold is told why its writes are not landing.
+   * Unbound: never held.
+   */
+  brakeState?: (userId: string, vaultId: string) => { until: number; count: number } | null;
+  /**
+   * Record that this member was active in this vault (Members page "last
+   * active"). Called once per authenticated hello, fire-and-forget; the
+   * implementation throttles and never throws. Unbound: nothing is recorded.
+   */
+  noteLastSeen?: (userId: string, vaultId: string) => void;
 }
 
 /** Default coalescing window for structural-change broadcasts (ms). A reconcile
  *  creates one row per folder/note, each firing `onRegistryChanged`; folding them
  *  into one frame per window is the difference between ~1,100 broadcasts (and
  *  ~1,100 per-subscriber ACL recomputes) and a handful. */
+/**
+ * Close codes this channel sends, in the 4000-4999 application range.
+ *
+ * `UNAUTHORIZED` is fatal — the client must stop retrying, the way it already
+ * stops on an HTTP 403 from the token mint. `PROTOCOL` covers a client that did
+ * not speak `hello` correctly or whose ACL could not be resolved; those are also
+ * not worth an immediate retry, but they are not a credential problem.
+ * Mirrored in `desktop/src/lib/sync/vaultSyncEngine.ts` as `WS_CLOSE_*`.
+ */
+export const WS_CLOSE_UNAUTHORIZED = 4401;
+/** Live updates held per connection while its first ACL read is in flight. */
+export const PRE_ACL_UPDATES_MAX = 256;
+export const WS_CLOSE_PROTOCOL = 4400;
+
 export const REGISTRY_COALESCE_MS = 120;
+
+/** Most docs one `ready.behind` names — the same bound `ready.empty` uses. */
+export const BEHIND_CAP = 2000;
+
+/**
+ * Most docs one `ready.revoked` names.
+ *
+ * The list is already bounded by what the CLIENT says it holds — the manifest's
+ * notes plus `hello.files`' tree binaries — so this cap is about frame size, not
+ * about the size of the vault. A member of a private-by-default vault with
+ * 10,000 docs they never had is named zero of them.
+ *
+ * Notes and files share the one budget deliberately: they are one namespace to
+ * `effectivePermission` and one list to the client, and giving binaries their
+ * own allowance would let a vault of PDFs push its notes out of the frame.
+ */
+export const REVOKED_CAP = 2000;
+
+/** Most ids one `ready.tombstones` names; `tombstonesTruncated` says more exist. */
+export const TOMBSTONES_CAP = 2000;
+
+/** Most ids one `ready.covered` names; `coveredTruncated` says more exist. */
+export const COVERED_CAP = 2000;
 
 export class VaultChannel {
   private readonly pubsub: PubSub;
   private readonly listReadableDocs: typeof listReadableDocsInVault;
   private readonly loadDiff: typeof loadDocDiff;
   private readonly listEmpty: typeof listEmptyDocs;
+  private readonly listDeletedAmong: typeof deletedNotesAmong;
   private readonly verifyToken: typeof verifyVaultToken;
   private readonly concurrency: number;
   private readonly sendCapBytes: number;
   private readonly sendStallMs: number;
   private readonly sendPollMs: number;
   private readonly heartbeatMs: number;
+  private readonly brakeState: VaultChannelDeps["brakeState"];
+  private readonly noteLastSeen: VaultChannelDeps["noteLastSeen"];
   /** Live connections, so the shared heartbeat has something to sweep. Entries
    *  remove themselves from `cleanup()`, i.e. on close/terminate/failure. */
   private readonly connections = new Set<VaultConnection>();
@@ -103,12 +182,28 @@ export class VaultChannel {
     string,
     { timer: ReturnType<typeof setTimeout>; origins: Set<string>; anonymous: boolean }
   >();
+  /** Pending last-edited-stamp and Activity broadcasts, per vault. Same
+   *  coalescing window as the registry: a returning device pushing 40 notes
+   *  stamps 40 rows inside a second, and that is one announcement. */
+  private readonly pendingMeta = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly pendingActivity = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * One memo per delivered pubsub message. Both pubsub implementations hand the
+   * SAME payload object to every local handler of a topic, synchronously, so
+   * every socket refreshing its readable set for one `acl-changed` /
+   * `registry-changed` finds the memo the first one made. Every read in it
+   * started after that message arrived, i.e. after the change it announces was
+   * committed, so no socket can be served a set older than its own trigger. A
+   * new message is a new object and a new memo: nothing outlives the event.
+   */
+  private readonly readsByMessage = new WeakMap<object, SharedVaultReads>();
 
   constructor(deps: VaultChannelDeps) {
     this.pubsub = deps.pubsub;
     this.listReadableDocs = deps.listReadableDocs ?? listReadableDocsInVault;
     this.loadDiff = deps.loadDiff ?? loadDocDiff;
     this.listEmpty = deps.listEmpty ?? listEmptyDocs;
+    this.listDeletedAmong = deps.listDeletedAmong ?? deletedNotesAmong;
     this.verifyToken = deps.verifyToken ?? verifyVaultToken;
     this.concurrency = deps.backfillConcurrency ?? config.backfillConcurrency;
     this.sendCapBytes = deps.sendCapBytes ?? config.vaultSendCapBytes;
@@ -116,6 +211,8 @@ export class VaultChannel {
     this.sendPollMs = deps.sendPollMs ?? config.vaultSendPollMs;
     this.heartbeatMs = deps.heartbeatMs ?? config.vaultHeartbeatMs;
     this.registryCoalesceMs = deps.registryCoalesceMs ?? REGISTRY_COALESCE_MS;
+    this.brakeState = deps.brakeState;
+    this.noteLastSeen = deps.noteLastSeen;
   }
 
   /** Fan an incremental doc update out to the vault's subscribers (any instance). */
@@ -176,6 +273,53 @@ export class VaultChannel {
   }
 
   /**
+   * Signal that only "last edited by" stamps changed in a vault (#262).
+   *
+   * This used to ride `publishRegistryChanged` with a null origin, which made
+   * every subscriber — the editor's own app included — recompute its readable
+   * set AND re-pull the whole registry for a change that moves no row and grants
+   * nothing. A returning device pushing its notes one connection at a time
+   * stamped each one, so every doc connect was followed by a full
+   * `/api/folders` + `/api/notes` pull on every open app in the vault. Now the
+   * readable set is left alone and the client is told it may fold the stamp into
+   * a throttled pull.
+   */
+  async publishMetaChanged(vaultId: string): Promise<void> {
+    this.publishCoalesced(this.pendingMeta, vaultId, encodePubsubMetaChanged);
+  }
+
+  /**
+   * Signal that the vault's trash or shrink-event listings changed (#260): a
+   * soft delete, restore or purge, or a `pre-shrink` version. Subscribers
+   * refetch the Activity feed on this instead of polling it every minute.
+   */
+  async publishActivityChanged(vaultId: string): Promise<void> {
+    this.publishCoalesced(this.pendingActivity, vaultId, encodePubsubActivityChanged);
+  }
+
+  private publishCoalesced(
+    pending: Map<string, ReturnType<typeof setTimeout>>,
+    vaultId: string,
+    encode: () => Uint8Array,
+  ): void {
+    const send = () =>
+      void this.pubsub
+        .publish(vaultTopic(vaultId), encode())
+        .catch((err) => console.error("Vault channel publish failed:", err));
+    if (this.registryCoalesceMs <= 0) {
+      send();
+      return;
+    }
+    if (pending.has(vaultId)) return; // folds into the window already open
+    const timer = setTimeout(() => {
+      pending.delete(vaultId);
+      send();
+    }, this.registryCoalesceMs);
+    timer.unref?.();
+    pending.set(vaultId, timer);
+  }
+
+  /**
    * Publish every still-open coalescing window immediately instead of waiting out
    * its timer. Called when this instance's WebSocketServer closes: the publish
    * goes to the shared pubsub, so subscribers on OTHER instances still learn about
@@ -188,6 +332,18 @@ export class VaultChannel {
       if (entry) clearTimeout(entry.timer);
       this.flushRegistry(vaultId);
     }
+    for (const [pending, encode] of [
+      [this.pendingMeta, encodePubsubMetaChanged],
+      [this.pendingActivity, encodePubsubActivityChanged],
+    ] as const) {
+      for (const [vaultId, timer] of [...pending]) {
+        clearTimeout(timer);
+        pending.delete(vaultId);
+        void this.pubsub
+          .publish(vaultTopic(vaultId), encode())
+          .catch((err) => console.error("Vault channel publish failed:", err));
+      }
+    }
   }
 
   /** Announce that a new member joined the vault (organization) this note
@@ -195,6 +351,72 @@ export class VaultChannel {
    *  celebration. (`vaultId` here is the note-collection id.) */
   async publishMemberJoined(vaultId: string, name: string): Promise<void> {
     await this.pubsub.publish(vaultTopic(vaultId), encodePubsubMemberJoined(name));
+  }
+
+  /** The vault (organization) this collection belongs to was renamed or got a
+   *  new icon (#306); subscribers patch their vault list without a re-list. */
+  async publishOrgChanged(vaultId: string, change: OrgChange): Promise<void> {
+    await this.pubsub.publish(vaultTopic(vaultId), encodePubsubOrgChanged(change));
+  }
+
+  /** The vault's shared appearance changed; every subscriber applies the
+   *  settings carried inline (same org-wide fan-out as {@link publishOrgChanged}). */
+  async publishAppearanceChanged(vaultId: string, change: AppearanceChange): Promise<void> {
+    await this.pubsub.publish(vaultTopic(vaultId), encodePubsubAppearanceChanged(change));
+  }
+
+  /** The vault's team skills changed; every subscriber refetches its skills
+   *  manifest (same org-wide fan-out as {@link publishOrgChanged}). */
+  async publishSkillsChanged(vaultId: string, orgId: string): Promise<void> {
+    await this.pubsub.publish(vaultTopic(vaultId), encodePubsubSkillsChanged(orgId));
+  }
+
+  /** In-app messages changed for everyone. Rides {@link MESSAGES_TOPIC}, which
+   *  every instance subscribes to once ({@link listenForMessages}), so the hint
+   *  reaches connections on every instance, not only this one. */
+  async publishMessagesChanged(): Promise<void> {
+    await this.pubsub.publish(MESSAGES_TOPIC, encodePubsubMessagesChanged());
+  }
+
+  /** Subscribe this process to the fleet-wide messages topic. Call once from
+   *  the entrypoint; returns the unsubscribe. */
+  async listenForMessages(): Promise<() => void> {
+    return this.pubsub.subscribe(MESSAGES_TOPIC, (p) => {
+      if (p[0] === PS_MESSAGES_CHANGED) this.broadcastMessagesChanged();
+    });
+  }
+
+  /** A read-only connection's edit was dropped (`ready`-independent; see the
+   *  `rejected` frame). Every instance forwards it to that user's sockets. */
+  async publishRejected(vaultId: string, userId: string, docId: string): Promise<void> {
+    await this.pubsub.publish(vaultTopic(vaultId), encodePubsubRejected(userId, docId, "read_only"));
+  }
+
+  /** The shrink burst brake engaged (`held`) or lifted for `userId` in this
+   *  vault. Every instance forwards it to that user's sockets only. */
+  async publishBrake(
+    vaultId: string,
+    userId: string,
+    state: { held: true; until: number; count: number } | { held: false },
+  ): Promise<void> {
+    await this.pubsub.publish(
+      vaultTopic(vaultId),
+      state.held
+        ? encodePubsubBrake(userId, true, state.until, state.count)
+        : encodePubsubBrake(userId, false),
+    );
+  }
+
+  /** `userId` is no longer a member of `orgId`, whose note collection is
+   *  `vaultId`. Every instance tells that user's connections (cap-gated) and
+   *  closes them with `WS_CLOSE_UNAUTHORIZED`; nobody else hears it. */
+  async publishMemberRemoved(
+    vaultId: string,
+    orgId: string,
+    userId: string,
+    reason: MemberRemovedReason,
+  ): Promise<void> {
+    await this.pubsub.publish(vaultTopic(vaultId), encodePubsubMemberRemoved(orgId, userId, reason));
   }
 
   /** Wire the channel onto the HTTP server's upgrade at `config.vaultSyncPath`. */
@@ -248,6 +470,26 @@ export class VaultChannel {
     this.heartbeat = null;
   }
 
+  /**
+   * Tell every authenticated connection on THIS instance that a new desktop
+   * release exists (#269). Per instance on purpose: each instance runs its own
+   * release watcher, so no pub/sub fan-out is needed. Returns how many
+   * connections were told.
+   */
+  broadcastVersionAvailable(version: string): number {
+    let told = 0;
+    for (const conn of [...this.connections]) if (conn.hintVersionAvailable(version)) told++;
+    return told;
+  }
+
+  /** Tell every authenticated connection on THIS instance that advertises the
+   *  `messages` cap to refetch its messages. Returns how many were told. */
+  broadcastMessagesChanged(): number {
+    let told = 0;
+    for (const conn of [...this.connections]) if (conn.hintMessagesChanged()) told++;
+    return told;
+  }
+
   /** Live connection count — the number that grew without bound while ghosts
    *  accumulated (one `VaultConnection` + subscription each). */
   connectionCount(): number {
@@ -260,12 +502,23 @@ export class VaultChannel {
       listReadableDocs: this.listReadableDocs,
       loadDiff: this.loadDiff,
       listEmpty: this.listEmpty,
+      listDeletedAmong: this.listDeletedAmong,
       verifyToken: this.verifyToken,
       concurrency: this.concurrency,
       sendCapBytes: this.sendCapBytes,
       sendStallMs: this.sendStallMs,
       sendPollMs: this.sendPollMs,
+      brakeState: this.brakeState,
+      noteLastSeen: this.noteLastSeen,
       onGone: (c) => this.connections.delete(c),
+      sharedReadsFor: (trigger) => {
+        let reads = this.readsByMessage.get(trigger);
+        if (!reads) {
+          reads = new Map();
+          this.readsByMessage.set(trigger, reads);
+        }
+        return reads;
+      },
     });
     this.connections.add(conn);
   }
@@ -275,13 +528,30 @@ interface ConnDeps {
   listReadableDocs: typeof listReadableDocsInVault;
   loadDiff: typeof loadDocDiff;
   listEmpty: typeof listEmptyDocs;
+  listDeletedAmong: typeof deletedNotesAmong;
   verifyToken: typeof verifyVaultToken;
   concurrency: number;
   sendCapBytes: number;
   sendStallMs: number;
   sendPollMs: number;
+  brakeState?: VaultChannelDeps["brakeState"];
+  noteLastSeen?: VaultChannelDeps["noteLastSeen"];
   onGone: (conn: VaultConnection) => void;
+  /** The per-message memo ({@link VaultChannel} `readsByMessage`). */
+  sharedReadsFor?: (trigger: object) => SharedVaultReads;
 }
+
+/**
+ * How long an upgraded socket may stay silent before its `hello`.
+ *
+ * The window is not just the wire: a desktop client mints its vault token over
+ * HTTP against this same server, and builds up to 0.1.67 also load their whole
+ * durable state-vector manifest AFTER the upgrade. On a large vault's first
+ * launch that could run past the old 10 s, and the socket was dropped and the
+ * whole connect paid again. 30 s still reaps sockets that never authenticate — the
+ * idle-protection point — while leaving slack for a slow mint under load.
+ */
+export const HELLO_TIMEOUT_MS = 30_000;
 
 class VaultConnection {
   private userId: string | null = null;
@@ -294,7 +564,31 @@ class VaultConnection {
    *  clients would misparse as doc updates (see {@link HelloFrame.caps}). */
   private caps = new Set<string>();
   private readable = new Set<string>();
+  /**
+   * ACL refreshes run concurrently (registry-changed, acl-changed, reauth each
+   * start one) and resolve out of order. Only a result at least as new as the
+   * last one applied may replace `readable`: an older read finishing last would
+   * otherwise re-admit a doc a newer refresh just dropped, and backfill it.
+   */
+  private aclRefreshStarted = 0;
+  private aclRefreshApplied = 0;
+  /**
+   * The connect-time readable set is read AFTER subscribing to the vault topic,
+   * so an ACL change committed while the hello was in flight is never missed.
+   * A refresh that lands before that first read finishes only marks the set
+   * dirty; it is read once more right after.
+   */
+  private aclLoaded = false;
+  private aclDirty = false;
+  /** Live updates heard before that first read lands; replayed through the ACL gate (bounded). */
+  private preAclUpdates: Array<{ docId: string; update: Uint8Array }> | null = [];
   private unsubscribe: (() => void) | null = null;
+  /** The user-addressed topic (`invitations` cap only, sync/user-events.ts). */
+  private unsubscribeUser: (() => void) | null = null;
+  /** W3: releases this connection's hold on the vault key cache entry. */
+  private releaseKey: (() => void) | null = null;
+  /** W3: the key this connection verified at hello; zeroed on cleanup. */
+  private docCrypto: DocCrypto | null = null;
   private helloSeen = false;
   // Set once by cleanup(). `close` fires exactly once, so anything that outlives
   // it (an in-flight hello await) must consult this instead of relying on
@@ -303,7 +597,13 @@ class VaultConnection {
   private readonly helloTimer: ReturnType<typeof setTimeout>;
   // This connection's last-announced presence (which note the user is viewing),
   // kept so we can re-broadcast it when a newcomer asks, and clear it on close.
-  private myPresence: { docId: string | null; name: string; color: string; status: string } | null =
+  private myPresence: {
+    docId: string | null;
+    name: string;
+    color: string;
+    status: string;
+    moment?: string;
+  } | null =
     null;
   /** A presence frame that arrived before auth finished; replayed right after
    *  the pub/sub subscribe so the announce (and the roster query it triggers)
@@ -351,7 +651,7 @@ class VaultConnection {
     // Drop connections that never authenticate (spec 05 §4 idle protection).
     this.helloTimer = setTimeout(() => {
       if (!this.helloSeen) this.fail("hello timeout");
-    }, 10_000);
+    }, HELLO_TIMEOUT_MS);
 
     ws.on("message", (data, isBinary) => {
       this.alive = true; // traffic from the peer is proof of life, like a pong
@@ -410,17 +710,47 @@ class VaultConnection {
     try {
       claims = await this.deps.verifyToken(hello.token);
     } catch {
-      return this.fail("invalid or expired vault token");
+      // Fatal: retrying with the same token only burns the ladder.
+      return this.fail("invalid or expired vault token", WS_CLOSE_UNAUTHORIZED);
     }
     this.userId = claims.userId;
     this.vaultId = claims.vaultId;
+    try {
+      this.deps.noteLastSeen?.(this.userId, this.vaultId);
+    } catch {
+      // never let a "last active" stamp affect the handshake
+    }
     if (this.closed) return; // closed while verifying — don't run the ACL query
 
-    try {
-      this.readable = await this.deps.listReadableDocs(this.userId, this.vaultId);
-    } catch (err) {
-      console.error("Vault channel ACL resolve failed:", err);
-      return this.fail("acl resolve failed");
+    // W3: a hello may carry the vault key. Verified against `vk_check`, it is
+    // held in the process cache for this connection (background work only);
+    // released in cleanup(). Flag off or no key: exactly today's path.
+    // A keyed vault without a valid key is refused: close 4409, err frame
+    // message `key_required` (the desktop asks a member's device for the key).
+    if (vaultKeysEnabled()) {
+      let state;
+      try {
+        state = await loadVkCheck(this.vaultId, pool);
+      } catch (err) {
+        console.error("Vault channel key check failed:", (err as Error)?.message ?? err);
+        return this.fail("key check failed");
+      }
+      if (this.closed) return;
+      if (state) {
+        const vk = decodeVk(hello.vk);
+        try {
+          if (!vk || !verifyVk(vk, this.vaultId, state.vkCheck)) {
+            return this.fail(KEY_REQUIRED_CODE, CLOSE_KEY_REQUIRED);
+          }
+          this.releaseKey = vaultKeyCache.acquire(this.vaultId, vk, state.generation);
+          // Index notes skipped while no key was held, and seal old rows.
+          void kickVaultBackfill(this.vaultId);
+          // This connection's own copy for its backfill reads (never the cache).
+          this.docCrypto = { vaultId: this.vaultId, key: Buffer.from(vk), generation: state.generation };
+        } finally {
+          vk?.fill(0);
+        }
+      }
     }
 
     // Subscribe BEFORE backfill so no live update is missed during the drain;
@@ -440,6 +770,50 @@ class VaultConnection {
     }
     this.unsubscribe = off;
 
+    // The readable set is read only now, AFTER subscribing: an access change
+    // that commits during the auth I/O above is either seen by this read or
+    // arrives as a pubsub message (which marks the set dirty until the read
+    // lands, and forces one more). Read first, it could be missed for good and
+    // the backfill would hand over a doc access was just removed from.
+    try {
+      for (;;) {
+        this.aclDirty = false;
+        const seq = ++this.aclRefreshStarted;
+        const read = await this.deps.listReadableDocs(this.userId, this.vaultId);
+        if (seq >= this.aclRefreshApplied) {
+          this.aclRefreshApplied = seq;
+          this.readable = read;
+        }
+        if (!this.aclDirty) break;
+      }
+      this.aclLoaded = true;
+    } catch (err) {
+      this.preAclUpdates = null;
+      console.error("Vault channel ACL resolve failed:", err);
+      return this.fail("acl resolve failed");
+    }
+    const held = this.preAclUpdates;
+    this.preAclUpdates = null;
+    if (this.closed || this.ws.readyState !== this.ws.OPEN) return;
+    for (const u of held ?? []) if (this.readable.has(u.docId)) this.forwardLive(u.docId, u.update);
+
+    // Events addressed to this USER (an invitation to another vault, a change
+    // to their messages) ride whichever vault channel they have open. Opt-in by
+    // cap, per frame: an old client would not know the frame.
+    if (this.caps.has(USER_EVENTS_CAP) || this.caps.has(MESSAGES_CAP)) {
+      const offUser = await this.pubsub.subscribe(userTopic(this.userId), (p) => {
+        const event = decodeUserEvent(p);
+        if (!event || this.closed) return;
+        const cap = event.t === "messages-changed" ? MESSAGES_CAP : USER_EVENTS_CAP;
+        if (this.caps.has(cap)) this.send(event);
+      });
+      if (this.closed || this.ws.readyState !== this.ws.OPEN) {
+        offUser();
+        return;
+      }
+      this.unsubscribeUser = offUser;
+    }
+
     // Replay the announce that raced the auth I/O — BEFORE the backfill, so the
     // rest of the vault sees this user (and this user gets the re-announce
     // round) seconds before their own download finishes.
@@ -449,7 +823,13 @@ class VaultConnection {
       this.handlePresence(parked);
     }
 
-    await this.backfill(hello.manifest, hello.priority ?? []);
+    // `mode: "live-only"` — the client is pulling its cold state over the
+    // bootstrap HTTP routes, so the socket is for live updates only. `ready`
+    // still ships below: its `empty` and `revoked` lists are what the client
+    // ACTS on (seed these from disk; remove these from disk), and they cost one
+    // query and no query respectively. `behind` is the only casualty, and it is
+    // a by-product of the diff this mode is skipping.
+    if (hello.mode !== "live-only") await this.backfill(hello.manifest, hello.priority ?? []);
 
     // Backfill sends nothing for a doc with no server state, so the client would
     // otherwise sit on a blank note it can't tell apart from one still in flight
@@ -471,13 +851,152 @@ class VaultConnection {
     } catch (err) {
       console.error("Vault channel empty-doc probe failed:", err);
     }
+    // Docs the backfill found this client AHEAD on — it holds ops the server has
+    // never received. Named so the client pushes them; the feed itself cannot.
+    const behind = this.behind;
+    const behindTruncated = this.behindTruncated;
+    // §8 proof metric: these two numbers per connect show whether the gap
+    // between "registered" and "has content" is closing for new clients.
+    // Bucketed counters only; the per-connect line is logged when non-zero so
+    // a healthy reconnect storm adds no log volume. Ids only, never paths.
+    observeCount("ready.empty.count", empty.length);
+    if (hello.mode !== "live-only") observeCount("ready.behind.count", behind.length);
+    if (empty.length > 0 || behind.length > 0) {
+      console.info(
+        `[ready] vault=${this.vaultId} user=${this.userId} empty=${empty.length}` +
+          `${emptyTruncated ? "+" : ""} behind=${behind.length}${behindTruncated ? "+" : ""} ` +
+          `mode=${hello.mode ?? "full"}`,
+      );
+    }
+    // …and the mirror image: docs this client says it HOLDS that it may no
+    // longer read. Pure set arithmetic over two things already in hand (the
+    // hello manifest and `this.readable`), so it costs no query.
+    const batchedRevocations = this.caps.has("revocation-batches");
+    const heldIds = [...(hello.files ?? []), ...(hello.held ?? [])];
+    // Soft-deleted docs among what the client holds are TOMBSTONES, not
+    // revocations: named separately so the client resolves them as deletes (and
+    // can push unseen edits into Trash first), and never in both lists. One
+    // bounded query over the client's own non-readable ids; a failure degrades
+    // to the old frame (everything non-readable stays in `revoked`).
+    let deleted = new Set<string>();
+    try {
+      const candidates = [...new Set([...Object.keys(hello.manifest), ...heldIds])].filter(
+        (id) => !this.readable.has(id),
+      );
+      deleted = await this.deps.listDeletedAmong(this.vaultId!, candidates);
+    } catch (err) {
+      console.error("Vault channel tombstone probe failed:", err);
+    }
+    const tombstones = [...deleted].slice(0, TOMBSTONES_CAP);
+    const tombstonesTruncated = deleted.size > TOMBSTONES_CAP;
+    const { revoked, revokedTruncated } = this.revokedFromManifest(hello.manifest, heldIds, deleted);
+    // Backfill only walks readable docs, so `covered` cannot overlap `revoked`
+    // or `tombstones`; filtered anyway so the frame's contract never rests on
+    // that. Live-only mode skipped the backfill: the field is omitted.
+    const excluded = new Set([...revoked, ...deleted]);
+    const covered =
+      hello.mode === "live-only" ? [] : this.covered.filter((d) => !excluded.has(d));
+    const coveredTruncated = hello.mode !== "live-only" && this.coveredTruncated;
+    if (batchedRevocations) {
+      for (let i = 0; i < revoked.length; i += REVOKED_CAP) {
+        this.send({ t: "revoked", docIds: revoked.slice(i, i + REVOKED_CAP) });
+      }
+    }
     this.send({
       t: "ready",
       // Omitted when nothing is empty, so the common frame is byte-identical to
       // what every shipped client already parses.
       ...(empty.length > 0 ? { empty } : {}),
       ...(empty.length > 0 && emptyTruncated ? { emptyTruncated: true as const } : {}),
+      ...(behind.length > 0 ? { behind } : {}),
+      ...(behind.length > 0 && behindTruncated ? { behindTruncated: true as const } : {}),
+      ...(!batchedRevocations && revoked.length > 0 ? { revoked } : {}),
+      ...(revoked.length > 0 && revokedTruncated ? { revokedTruncated: true as const } : {}),
+      ...(tombstones.length > 0 ? { tombstones } : {}),
+      ...(tombstonesTruncated ? { tombstonesTruncated: true as const } : {}),
+      ...(covered.length > 0 ? { covered } : {}),
+      ...(coveredTruncated ? { coveredTruncated: true as const } : {}),
     });
+    // After `ready`, so it never delays the frame that turns the client live.
+    // A hold this process does not know about (another instance's, or one a
+    // restart forgot) is simply not announced — the batch push's `shrink_held`
+    // still tells the client on its next attempt.
+    this.announceBrake();
+  }
+
+  private announceBrake(): void {
+    if (!this.deps.brakeState || !this.userId || !this.vaultId) return;
+    let hold: { until: number; count: number } | null = null;
+    try {
+      hold = this.deps.brakeState(this.userId, this.vaultId);
+    } catch (err) {
+      console.error("Vault channel brake lookup failed:", err);
+      return;
+    }
+    if (hold) this.send({ t: "brake", held: true, until: hold.until, count: hold.count });
+  }
+
+  /**
+   * The docs this client's `hello` manifest claims which are NOT in its readable
+   * set: it is holding local copies of notes it may no longer read.
+   *
+   * This is the server STATING a revocation. Everything else on this path leaves
+   * the client to infer one from a registry listing that came back short, and a
+   * client cannot safely tell that apart from a server fault — so the desktop
+   * only removes files wholesale when an access change was ANNOUNCED. The live
+   * announcement (`acl-changed` -> `refreshAcl` -> `reauth`) reaches only a
+   * client that was connected when the rules changed; set a vault to Private
+   * while a member's app is closed and their next launch had no announcement
+   * behind it at all. This one rides every `ready`, so a cold launch is covered.
+   *
+   * Deliberately manifest-scoped rather than vault-scoped. Naming "every doc in
+   * the vault you cannot read" would be unbounded on a private-by-default vault
+   * and would also leak the existence of notes this user has never been shown.
+   * What the client already holds is both bounded and, by definition, already
+   * known to it.
+   *
+   * Both kinds of doc: the manifest's notes AND the `files` ids `hello.files`
+   * carries. A binary has no state vector to put in the manifest, but it is the
+   * same doc id to the resolver and the same removal to the client.
+   *
+   * A doc the owner DELETED also leaves the readable set and so is named here.
+   * The frame's contract is "these are gone for you", not "an admin revoked
+   * these". Usually the client then resolves it as a tombstone on the pull that
+   * follows, where the deletion cap — which this frame never lifts — applies.
+   * That depends on the tombstone actually being answerable for this caller, so
+   * `listDeletedReadableDocsInVault` has to resolve a share whose FOLDER was
+   * hard-deleted (see `permissions/vault-docs.ts`, the `folder_tombstones`
+   * branch); before it did, a share-only member's deleted notes fell through to
+   * the revocation path and were removed with no recoverable copy.
+   */
+  private revokedFromManifest(
+    manifest: Record<string, string>,
+    files?: string[],
+    /** Soft-deleted ids, reported as `ready.tombstones` instead. */
+    tombstoned: Set<string> = new Set(),
+  ): {
+    revoked: string[];
+    revokedTruncated: boolean;
+  } {
+    const revoked: string[] = [];
+    const seen = new Set<string>();
+    let revokedTruncated = false;
+    // Notes first, then the tree binaries the client listed separately. Both are
+    // ordinary doc ids to `listReadableDocsInVault` (its `files` UNION is the
+    // whole reason a `.pdf` set to Private leaves the readable set at all), so
+    // this stays pure set arithmetic over two things already in hand.
+    for (const docId of [...Object.keys(manifest), ...(files ?? [])]) {
+      if (this.readable.has(docId)) continue;
+      if (tombstoned.has(docId)) continue;
+      if (seen.has(docId)) continue;
+      if (!this.caps.has("revocation-batches") && revoked.length >= REVOKED_CAP) {
+        revokedTruncated = true;
+        break;
+      }
+      seen.add(docId);
+      revoked.push(docId);
+    }
+    return { revoked, revokedTruncated };
   }
 
   /** Binary from the client. Only voice frames are defined; the leading type
@@ -506,6 +1025,7 @@ class VaultConnection {
       name: frame.name,
       color: frame.color,
       status: frame.status,
+      ...(frame.moment ? { moment: frame.moment } : {}),
     };
     void this.pubsub.publish(
       vaultTopic(this.vaultId),
@@ -588,12 +1108,53 @@ class VaultConnection {
     return true;
   }
 
+  /**
+   * Docs whose backfill found the CLIENT ahead of the server (see
+   * `DocDiff.clientAhead`), collected during {@link backfill} and named on the
+   * `ready` that terminates it. Capped like `ready.empty`: one frame must stay
+   * bounded however large the vault.
+   */
+  private behind: string[] = [];
+  private behindTruncated = false;
+  /**
+   * Manifest docs whose hello state vector the server's stored state fully
+   * covers (equal, or server ahead: the backfill diff carries everything the
+   * client lacks and the client holds nothing the server lacks). A by-product
+   * of the same `loadDiff` the backfill already runs; named on `ready.covered`
+   * so the client can record a server-acknowledged base. Never collected in
+   * live-only mode, where the backfill is skipped.
+   */
+  private covered: string[] = [];
+  private coveredTruncated = false;
+
   /** Stream missing ops for every readable doc, priority docs first. */
   private async backfill(manifest: Record<string, string>, priority: string[]): Promise<void> {
+    this.behind = [];
+    this.behindTruncated = false;
+    this.covered = [];
+    this.coveredTruncated = false;
     const prioritized = priority.filter((d) => this.readable.has(d));
     const prioritySet = new Set(prioritized);
     const rest = [...this.readable].filter((d) => !prioritySet.has(d));
-    const ordered = [...prioritized, ...rest];
+    let ordered = [...prioritized, ...rest];
+    // The readable set also names binary tree files (`files` ids), which never
+    // carry Yjs state: `loadDiff` would spend 1-3 queries each to answer null.
+    // Drop ids that are a `files` row and NOT a `notes` row. Best-effort: on a
+    // failed lookup nothing is skipped.
+    try {
+      const { rows } = await pool.query<{ id: string }>(
+        `SELECT f.id FROM files f
+          WHERE f.id = ANY($1::text[])
+            AND NOT EXISTS (SELECT 1 FROM notes n WHERE n.id = f.id)`,
+        [ordered],
+      );
+      if (rows.length > 0) {
+        const fileIds = new Set(rows.map((r) => r.id));
+        ordered = ordered.filter((d) => !fileIds.has(d));
+      }
+    } catch {
+      // fall through with the full list
+    }
     await runPool(ordered, this.deps.concurrency, (docId) =>
       this.sendDocBackfill(docId, manifest[docId]),
     );
@@ -610,21 +1171,75 @@ class VaultConnection {
     // The ACL can be revoked while we're parked — re-check before reading.
     if (!this.readable.has(docId)) return;
     const clientSv = clientSvB64 ? new Uint8Array(Buffer.from(clientSvB64, "base64")) : null;
+    // The channel zeroes its key on close, possibly while this read is parked
+    // or running: read with a private copy, and stop once the socket is gone.
+    if (this.closed) return;
+    const held = this.docCrypto;
+    const crypto = held ? { ...held, key: Buffer.from(held.key) } : undefined;
     let diff;
     try {
-      diff = await this.deps.loadDiff(docId, clientSv);
+      diff = await this.deps.loadDiff(docId, clientSv, undefined, crypto);
     } catch (err) {
+      if (this.closed) return; // the socket went away mid-read; the next connect re-sends
       console.error(`Vault channel backfill failed for ${docId}:`, err);
       return;
+    } finally {
+      crypto?.key.fill(0);
+    }
+    if (diff?.clientAhead) {
+      if (this.behind.length < BEHIND_CAP) this.behind.push(docId);
+      else this.behindTruncated = true;
+    } else if (diff && clientSv) {
+      if (this.covered.length < COVERED_CAP) this.covered.push(docId);
+      else this.coveredTruncated = true;
     }
     if (!diff || diff.upToDate) return; // nothing new for this client
+    // ...and again AFTER the read: access can be removed while `loadDiff` runs
+    // (a large doc takes a while), and a frame sent after the `drop` would hand
+    // a now-restricted doc's content to a member who lost it.
+    if (this.closed || !this.readable.has(docId)) return;
     this.sendBinary(encodeWsUpdate(docId, diff.update));
+  }
+
+  /**
+   * This user's readable set, shared with their other sockets on this instance
+   * that answer the SAME message (and the user-independent reads shared with
+   * everyone else's). Without a trigger it is computed alone, as before.
+   * `this.readable` is only ever replaced, never edited, so one Set instance
+   * may back several connections.
+   */
+  private readableFor(trigger: object | undefined): Promise<Set<string>> {
+    const userId = this.userId!;
+    const vaultId = this.vaultId!;
+    const reads = trigger && this.deps.sharedReadsFor ? this.deps.sharedReadsFor(trigger) : undefined;
+    if (!reads) return this.deps.listReadableDocs(userId, vaultId);
+    const key = `readable\u0000${vaultId}\u0000${userId}`;
+    let p = reads.get(key) as Promise<Set<string>> | undefined;
+    if (!p) {
+      const fresh = this.deps.listReadableDocs(userId, vaultId, undefined, reads);
+      p = fresh;
+      reads.set(key, fresh);
+      fresh.catch(() => {
+        if (reads.get(key) === fresh) reads.delete(key);
+      });
+    }
+    return p;
   }
 
   private onPubsub(payload: Uint8Array): void {
     const msg = decodePubsub(payload);
     if (!msg) return;
     if (msg.type === "update") {
+      if (!this.aclLoaded) {
+        // Subscribed, but the readable set is not read yet: hold it (a
+        // live-only client has no backfill to cover it) and judge it after.
+        if (this.preAclUpdates && this.preAclUpdates.length < PRE_ACL_UPDATES_MAX) {
+          this.preAclUpdates.push({ docId: msg.docId, update: msg.update });
+        } else {
+          this.preAclUpdates = null; // overflow: the backfill / next connect re-sends
+        }
+        return;
+      }
       if (this.readable.has(msg.docId)) this.forwardLive(msg.docId, msg.update);
       return;
     }
@@ -638,26 +1253,110 @@ class VaultConnection {
       // every teammate edit to that note until the next reconnect. Coalescing
       // (see `publishRegistryChanged`) is what makes this cheap — a 500-note
       // reconcile costs a handful of recomputes, not ~1,100.
-      void this.refreshAcl();
-      // Self-exclusion applies to the re-pull only. This client already holds the
-      // ids the API returned it, so asking it to re-pull its own writes is a
-      // wasted round trip (listFolders + listNotes + a full client syncStructure).
+      //
+      // `if-changed` is what keeps a structural change from being announced as an
+      // ACL change. A create/rename/move/delete can add or remove docs, and those
+      // cases DO need `reauth`; what it never does is flip a permission on a doc
+      // the client can already see. Sending `reauth` unconditionally made every
+      // structural write cost every subscriber — the author included, since this
+      // branch has no origin skip — a token re-mint (which tears the open note's
+      // provider down and back up) plus a full registry pull, whose own writes
+      // then published the next `registry-changed`. On a vault with work left to
+      // do that never settled: the badge blinked Syncing/Synced indefinitely (#93).
       // Skipped only when EVERY origin folded into this window is ours; a window
       // that also carried someone else's change — or an unattributed one — lands.
-      if (
+      const selfOnly =
         this.clientId !== null &&
         msg.origins.length > 0 &&
-        msg.origins.every((o) => o === this.clientId)
-      ) {
-        return;
-      }
+        msg.origins.every((o) => o === this.clientId);
+      // The readable set is recomputed either way — it must never go stale — but a
+      // client is not told that its OWN writes changed what it can read. It made
+      // those rows and already holds them, so the announcement bought nothing and
+      // cost a great deal: registering notes grew this client's own readable set,
+      // `if-changed` fired `reauth` straight back at it, the open note's provider
+      // was torn down and rebuilt (badge: synced→offline→connecting→synced), and
+      // the registry pull that followed published the next `registry-changed`. An
+      // idle client reauthed itself nine times in half an hour that way.
+      void this.refreshAcl({ reauth: selfOnly ? "never" : "if-changed", trigger: payload });
+      // Self-exclusion applies to the re-pull too. This client already holds the
+      // ids the API returned it, so asking it to re-pull its own writes is a
+      // wasted round trip (listFolders + listNotes + a full client syncStructure).
+      if (selfOnly) return;
       this.send({ t: "registry" });
+      return;
+    }
+    if (msg.type === "meta-changed") {
+      // A stamp moves no row and grants nothing, so the readable set is NOT
+      // recomputed — that recompute, times every subscriber, times every
+      // stamped doc, was the bulk of what one returning device cost the vault.
+      // Every subscriber hears it (the stamp has no origin to skip), and a
+      // current client folds it into a throttled pull (#262).
+      this.send({ t: "registry", meta: true });
+      return;
+    }
+    if (msg.type === "activity-changed") {
+      // Trash / shrink listings are filtered per reader on fetch, so this frame
+      // names nothing and needs no ACL gate.
+      this.send({ t: "activity" });
+      return;
+    }
+    if (msg.type === "brake") {
+      // Only the held user's own sockets; nobody else's app changes behaviour.
+      if (msg.userId === this.userId) {
+        this.send(
+          msg.held
+            ? {
+                t: "brake",
+                held: true,
+                ...(msg.until !== undefined ? { until: msg.until } : {}),
+                ...(msg.count !== undefined ? { count: msg.count } : {}),
+              }
+            : { t: "brake", held: false },
+        );
+      }
+      return;
+    }
+    if (msg.type === "rejected") {
+      // Only the user whose edit was dropped; the doc id is one they sent.
+      if (msg.userId === this.userId) {
+        this.send({ t: "rejected", docId: msg.docId, reason: msg.reason });
+      }
+      return;
+    }
+    if (msg.type === "member-removed") {
+      // Only the departed user's own sockets. Tell a client that understands
+      // the frame, then close regardless of cap: the membership is gone, so the
+      // reconnect fails at the token mint (403) and stops there.
+      if (msg.userId !== this.userId) return;
+      if (this.caps.has("member-removed")) {
+        this.send({ t: "member-removed", orgId: msg.orgId, userId: msg.userId, reason: msg.reason });
+      }
+      console.warn(
+        `[vault-channel] closing user=${this.userId} vault=${this.vaultId ?? "?"}: membership ended (${msg.reason})`,
+      );
+      this.ws.close(WS_CLOSE_UNAUTHORIZED, "membership_ended");
+      this.cleanup();
       return;
     }
     if (msg.type === "member-joined") {
       // Org-wide news, not doc-scoped — forward to every subscriber of this
       // vault so their roster refreshes and the join celebration fires live.
       this.send({ t: "member", name: msg.name });
+      return;
+    }
+    if (msg.type === "org-changed") {
+      // Org-wide like a join: every subscriber patches the vault's name/icon.
+      this.send({ t: "org", ...msg.change });
+      return;
+    }
+    if (msg.type === "appearance-changed") {
+      // Org-wide like `org`: every member applies the vault's appearance.
+      this.send({ t: "appearance-changed", ...msg.change });
+      return;
+    }
+    if (msg.type === "skills-changed") {
+      // Org-wide like `appearance-changed`: skills are not doc-scoped, no ACL filter.
+      this.send({ t: "skills-changed", orgId: msg.orgId });
       return;
     }
     if (msg.type === "presence") {
@@ -674,18 +1373,9 @@ class VaultConnection {
       // Vault-wide, like member-joined: audio is addressed to the team, and
       // vault membership is already proven by the token behind every connection.
       //
-      // KNOWN LIMITATION, narrowed but not gone. Member removal now publishes
-      // `acl-changed`, so a removed member's readable set empties immediately and
-      // every doc is dropped — note CONTENT is no longer TTL-bound.
-      //
-      // What remains is the vault-WIDE frames, which are deliberately not
-      // doc-gated: this one and `member-joined`. The socket itself survives (there
-      // is still no `disconnectDoc` equivalent for the vault channel), so a
-      // just-removed member can still hear audio and see joins until the socket
-      // drops or their vault token expires (`SYNC_TOKEN_TTL_SECONDS`, 600s by
-      // default). Closing that needs a `PS_MEMBER_REMOVED` frame carrying a userId
-      // each connection compares against its own and self-terminates on; tracked
-      // as follow-up work, not solved here.
+      // Membership ending publishes `member-removed`, which closes the departed
+      // user's vault-channel sockets on every instance, so vault-wide frames
+      // like this one stop reaching them at once rather than at token expiry.
       //
       // Two gates. Never echo to the speaker — they are hearing themselves live
       // and a loopback would be an echo, not a feature. And only send to clients
@@ -713,35 +1403,93 @@ class VaultConnection {
       return;
     }
     // acl-changed: re-evaluate; drop revoked docs, backfill newly-granted ones.
-    void this.refreshAcl();
+    void this.refreshAcl({ trigger: payload });
   }
 
-  private async refreshAcl(): Promise<void> {
+  private async refreshAcl(
+    opts: { reauth?: "always" | "if-changed" | "never"; trigger?: object } = {},
+  ): Promise<void> {
     if (!this.userId || !this.vaultId) return;
+    if (!this.aclLoaded) {
+      this.aclDirty = true;
+      return;
+    }
+    const seq = ++this.aclRefreshStarted;
     let next: Set<string>;
     try {
-      next = await this.deps.listReadableDocs(this.userId, this.vaultId);
+      next = await this.readableFor(opts.trigger);
     } catch (err) {
       console.error("Vault channel ACL refresh failed:", err);
       return;
     }
+    // A newer refresh already applied a fresher read: this one is stale.
+    if (seq < this.aclRefreshApplied || this.closed) return;
+    this.aclRefreshApplied = seq;
     const prev = this.readable;
     this.readable = next;
-    for (const docId of prev) {
-      if (!next.has(docId)) this.send({ t: "drop", docId }); // access lost
+    // A doc that fell out because it was DELETED is not a revocation: the
+    // `registry` broadcast that accompanies a delete makes the client re-pull,
+    // and the pull's tombstone list handles it as a delete (Trash-aware).
+    // Only genuinely revoked ids go out as `revoked` / `drop`. A probe failure
+    // keeps the old behaviour (everything that fell out is announced).
+    const fellOut = [...prev].filter((d) => !next.has(d));
+    let deletedNow = new Set<string>();
+    if (fellOut.length > 0) {
+      try {
+        deletedNow = await this.deps.listDeletedAmong(this.vaultId, fellOut);
+      } catch (err) {
+        console.error("Vault channel tombstone probe (live) failed:", err);
+      }
     }
+    let lost = 0;
+    let revokedBatch: string[] = [];
+    for (const docId of prev) {
+      if (!next.has(docId)) {
+        if (deletedNow.has(docId)) {
+          lost++;
+          continue;
+        }
+        if (this.caps.has("revocation-batches")) {
+          revokedBatch.push(docId);
+          if (revokedBatch.length === REVOKED_CAP) {
+            this.send({ t: "revoked", docIds: revokedBatch });
+            revokedBatch = [];
+          }
+        } else {
+          this.send({ t: "drop", docId });
+        }
+        lost++;
+      }
+    }
+    if (revokedBatch.length > 0) this.send({ t: "revoked", docIds: revokedBatch });
+    const added = [...next].filter((d) => !prev.has(d));
     // The set of readable docs only shifts on add/remove — but a view↔edit change
     // (or a lock) leaves the set intact while flipping the OPEN note's editability.
     // The open note syncs over its own Hocuspocus socket, not this feed, so tell
     // the client to re-mint that doc's sync token; it reconnects read-only/edit to
-    // match. Sent on every ACL change (this channel is always-on) so downgrades and
-    // unlocks both reach open editors in realtime without a reopen (spec 04 §4).
-    this.send({ t: "reauth" });
-    const added = [...next].filter((d) => !prev.has(d));
+    // match. Sent on every genuine ACL change (this channel is always-on) so
+    // downgrades and unlocks both reach open editors in realtime without a reopen
+    // (spec 04 §4) — `always` is therefore the default, and only the structural
+    // caller opts out with `if-changed`, which still re-mints whenever the set
+    // actually moved. A re-mint the client does not need is not free: it drops and
+    // reopens the open note's socket.
+    // `never` is for a change this very client authored: the drops above still go
+    // out (losing access is news however it happened), but there is nothing to
+    // re-mint for writes it made itself.
+    const mode = opts.reauth ?? "always";
+    if (mode !== "never" && (mode === "always" || added.length > 0 || lost > 0)) {
+      this.send({ t: "reauth" });
+    }
     if (added.length > 0 && this.vaultId) {
       // We can now see docs we couldn't before — ask the vault to re-announce
       // presence so viewers of the newly-readable docs light up for us.
       void this.pubsub.publish(vaultTopic(this.vaultId), encodePubsubPresenceQuery());
+    }
+    // Large grants use the client's bounded HTTP bootstrap, with real download
+    // progress. Flooding the live feed here bypasses its backfill counters.
+    if (added.length >= 25 && this.caps.has("bulk-regrant")) {
+      this.send({ t: "bootstrap" });
+      return;
     }
     // Newly-readable docs: full backfill (client holds no state vector for them).
     await runPool(added, this.deps.concurrency, (docId) => this.sendDocBackfill(docId, undefined));
@@ -902,6 +1650,11 @@ class VaultConnection {
   private abort(reason: string): void {
     if (this.closed) return;
     this.lastAbortReason = reason;
+    // Force-closes are rare and always worth a line: a client stuck in a
+    // reconnect loop is otherwise invisible from the server side.
+    console.warn(
+      `[vault-channel] aborting user=${this.userId ?? "?"} vault=${this.vaultId ?? "?"}: ${reason}`,
+    );
     try {
       if (typeof this.ws.terminate === "function") this.ws.terminate();
       else this.ws.close();
@@ -909,6 +1662,21 @@ class VaultConnection {
       /* already gone */
     }
     this.cleanup();
+  }
+
+  /** Forward a release hint once this connection has authenticated. */
+  hintVersionAvailable(version: string): boolean {
+    if (!this.helloSeen || !this.userId) return false;
+    this.send({ t: "version-available", version });
+    return true;
+  }
+
+  /** Forward a messages hint once this connection has authenticated, if its
+   *  client advertises the `messages` cap. */
+  hintMessagesChanged(): boolean {
+    if (!this.helloSeen || !this.userId || !this.caps.has(MESSAGES_CAP)) return false;
+    this.send({ t: "messages-changed" });
+    return true;
   }
 
   private send(control: ServerControl): void {
@@ -940,9 +1708,22 @@ class VaultConnection {
     this.ws.send(payload, { binary });
   }
 
-  private fail(message: string): void {
+  /**
+   * Refuse this connection, telling the client WHY in the close frame.
+   *
+   * The `{t:"err"}` message races the close and routinely loses, so the code is
+   * the only signal the client can rely on. Closing with no code at all (which is
+   * what a bare `ws.close()` sends — 1005) left a rejected token indistinguishable
+   * from a rebooting server, so the client blind-retried a credential the server
+   * had already refused, all the way up its backoff ladder. Keep these in lockstep
+   * with `WS_CLOSE_*` in `desktop/src/lib/sync/vaultSyncEngine.ts`.
+   */
+  private fail(message: string, code: number = WS_CLOSE_PROTOCOL): void {
+    console.warn(
+      `[vault-channel] refusing user=${this.userId ?? "?"} vault=${this.vaultId ?? "?"}: ${message}`,
+    );
     this.send({ t: "err", message });
-    this.ws.close();
+    this.ws.close(code, message.slice(0, 120));
     this.cleanup();
   }
 
@@ -971,6 +1752,18 @@ class VaultConnection {
         encodePubsubPresence({ userId: this.userId, docId: null, name, color, status }),
       );
       this.announced = false;
+    }
+    if (this.releaseKey) {
+      this.releaseKey();
+      this.releaseKey = null;
+    }
+    if (this.docCrypto) {
+      this.docCrypto.key.fill(0);
+      this.docCrypto = null;
+    }
+    if (this.unsubscribeUser) {
+      this.unsubscribeUser();
+      this.unsubscribeUser = null;
     }
     if (this.unsubscribe) {
       this.unsubscribe();

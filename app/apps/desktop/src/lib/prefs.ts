@@ -4,9 +4,83 @@
 // avatar) are NOT here — those are server-backed via Better Auth so they follow
 // the account across devices; see `ApiClient.updateUser`.
 
-import type { TreeSort } from "./tree/sort";
+import type { ServerChoice } from "./auth/serverChoice";
+import type { PropertiesMode } from "./editor/frontmatter";
+import { isTreeSort, type FolderSorts, type TreeSort } from "./tree/sort";
+import {
+  migrateStoredAppearance,
+  parseAppearanceSettings,
+  type AppearanceSettings,
+} from "./appearanceSettings";
 
-export type ActivityStatus = "online" | "away" | "busy" | "invisible";
+/** Status moments: a status your avatar acts out (redesign preview). */
+export type MomentStatus = "smoke" | "coffee" | "lunch" | "meeting" | "focus" | "brb";
+export type ActivityStatus = "online" | "away" | "busy" | "invisible" | MomentStatus;
+
+export const STATUS_MOMENTS: Array<{
+  id: MomentStatus;
+  emoji: string;
+  label: string;
+  hint: string;
+  /** How older apps (and the presence ring) read it. */
+  tone: "away" | "busy";
+}> = [
+  { id: "smoke", emoji: "🚬", label: "Out for a smoke", hint: "Back in a few minutes", tone: "away" },
+  { id: "coffee", emoji: "☕", label: "Coffee break", hint: "Grabbing a coffee", tone: "away" },
+  { id: "lunch", emoji: "🍜", label: "At lunch", hint: "Eating, back soon", tone: "away" },
+  { id: "meeting", emoji: "🎧", label: "In a meeting", hint: "On a call", tone: "busy" },
+  { id: "focus", emoji: "🌙", label: "Focusing", hint: "Heads down, replies later", tone: "busy" },
+  { id: "brb", emoji: "⏱️", label: "Back in 10", hint: "Short break", tone: "away" },
+];
+
+export function isMoment(v: unknown): v is MomentStatus {
+  return STATUS_MOMENTS.some((m) => m.id === v);
+}
+
+/**
+ * How a status travels to teammates. A moment goes out as its plain tone
+ * (away/busy) in `status`, which every app version understands, plus the moment
+ * itself in `moment` for apps that show one. Sent raw, an older app read
+ * "coffee" as an unknown status and showed the person as online.
+ */
+export function statusToWire(status: ActivityStatus): { status: ActivityStatus; moment?: MomentStatus } {
+  const m = STATUS_MOMENTS.find((x) => x.id === status);
+  return m ? { status: m.tone, moment: m.id } : { status };
+}
+
+/** The status to show for a teammate: their moment when they sent one we know. */
+export function statusFromWire(status: unknown, moment: unknown): ActivityStatus | undefined {
+  if (isMoment(moment)) return moment;
+  return typeof status === "string" ? (status as ActivityStatus) : undefined;
+}
+
+/** Clear-after choices, in minutes (null = never). */
+export const STATUS_CLEAR_AFTER: Array<{ label: string; minutes: number | null }> = [
+  { label: "30 min", minutes: 30 },
+  { label: "1 hour", minutes: 60 },
+  { label: "Today", minutes: -1 },
+  { label: "Never", minutes: null },
+];
+const STATUS_UNTIL_KEY = "context.activityStatusUntil";
+
+export function statusUntilFrom(minutes: number | null, now = Date.now()): number | null {
+  if (minutes === null) return null;
+  if (minutes === -1) {
+    const end = new Date(now);
+    end.setHours(23, 59, 59, 999);
+    return end.getTime();
+  }
+  return now + minutes * 60_000;
+}
+
+export function readActivityStatusUntil(): number | null {
+  try {
+    const v = Number(localStorage.getItem(STATUS_UNTIL_KEY));
+    return Number.isFinite(v) && v > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
 
 export const ACTIVITY_STATUSES: Array<{
   id: ActivityStatus;
@@ -21,23 +95,28 @@ export const ACTIVITY_STATUSES: Array<{
 
 const STATUS_KEY = "context.activityStatus";
 const MENTION_SOUND_KEY = "context.mentionSound";
+const AUTOMATIC_ITEM_COLORS_KEY = "context.automaticItemColors:";
 
 function isActivityStatus(v: unknown): v is ActivityStatus {
-  return v === "online" || v === "away" || v === "busy" || v === "invisible";
+  return v === "online" || v === "away" || v === "busy" || v === "invisible" || isMoment(v);
 }
 
 export function readActivityStatus(): ActivityStatus {
   try {
     const v = localStorage.getItem(STATUS_KEY);
+    const until = readActivityStatusUntil();
+    if (until !== null && until <= Date.now()) return "online";
     return isActivityStatus(v) ? v : "online";
   } catch {
     return "online";
   }
 }
 
-export function writeActivityStatus(status: ActivityStatus): void {
+export function writeActivityStatus(status: ActivityStatus, until: number | null = null): void {
   try {
     localStorage.setItem(STATUS_KEY, status);
+    if (until === null) localStorage.removeItem(STATUS_UNTIL_KEY);
+    else localStorage.setItem(STATUS_UNTIL_KEY, String(until));
   } catch {
     /* localStorage unavailable — status stays in-memory only */
   }
@@ -60,6 +139,69 @@ export function writeMentionSound(enabled: boolean): void {
   }
 }
 
+/**
+ * Give otherwise-uncoloured sidebar items a stable personal colour. The key is
+ * account-scoped: two people sharing one computer can keep different choices,
+ * just as two people looking at the same synced vault can see different auto
+ * colours. Automatic colours are ON unless that account explicitly turned them
+ * off — every new vault opens with the colour palette applied.
+ */
+export function readAutomaticItemColors(userId: string | null | undefined): boolean {
+  try {
+    return localStorage.getItem(AUTOMATIC_ITEM_COLORS_KEY + (userId ?? "local")) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+export function writeAutomaticItemColors(
+  userId: string | null | undefined,
+  enabled: boolean,
+): void {
+  try {
+    localStorage.setItem(
+      AUTOMATIC_ITEM_COLORS_KEY + (userId ?? "local"),
+      enabled ? "on" : "off",
+    );
+  } catch {
+    /* localStorage unavailable — preference stays in-memory only */
+  }
+}
+
+// ---- Which server this device's account lives on -----------------------------
+
+const SERVER_CHOICE_KEY = "context.serverChoice";
+
+/**
+ * The answer to "managed service, or your own server?" — asked once, on the
+ * first sign-in this device ever sees (see `lib/auth/serverChoice.ts`).
+ *
+ * Device-local like the theme, and deliberately NOT the server URL itself: that
+ * lives in the Rust app config, because the auth manager needs it before any
+ * localStorage-backed UI exists. This only records whether the question has
+ * been answered, so the step stops appearing once it has.
+ *
+ * An absent or corrupted value reads as `null` — "never asked" — which is the
+ * safe direction: the worst case is asking a question again, never silently
+ * signing someone up on the wrong server.
+ */
+export function readServerChoice(): ServerChoice | null {
+  try {
+    const v = localStorage.getItem(SERVER_CHOICE_KEY);
+    return v === "managed" || v === "custom" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeServerChoice(choice: ServerChoice): void {
+  try {
+    localStorage.setItem(SERVER_CHOICE_KEY, choice);
+  } catch {
+    /* localStorage unavailable — the choice stays in-memory only */
+  }
+}
+
 // ---- Sidebar sort -----------------------------------------------------------
 
 const TREE_SORT_KEY = "context.treeSort";
@@ -76,7 +218,7 @@ const TREE_SORT_KEY = "context.treeSort";
 export function readTreeSort(): TreeSort {
   try {
     const v = localStorage.getItem(TREE_SORT_KEY);
-    return v === "name" || v === "recent" ? v : "recent";
+    return isTreeSort(v) ? v : "recent";
   } catch {
     return "recent";
   }
@@ -90,19 +232,295 @@ export function writeTreeSort(sort: TreeSort): void {
   }
 }
 
+const FOLDER_SORT_PREFIX = "context.folderSort:";
+
+/**
+ * Per-folder sort overrides for one vault (see `FolderSorts`). Per-VAULT, like
+ * item order and colors, because it describes one vault's folders — and
+ * device-local like the vault-wide sort, because it is a reading habit.
+ */
+export function readFolderSorts(vaultPath: string | undefined): FolderSorts {
+  if (!vaultPath) return {};
+  try {
+    const raw = JSON.parse(localStorage.getItem(FOLDER_SORT_PREFIX + vaultPath) ?? "{}");
+    const out: FolderSorts = {};
+    if (raw && typeof raw === "object") {
+      for (const [k, v] of Object.entries(raw)) if (isTreeSort(v)) out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function writeFolderSorts(vaultPath: string, sorts: FolderSorts): void {
+  try {
+    localStorage.setItem(FOLDER_SORT_PREFIX + vaultPath, JSON.stringify(sorts));
+  } catch {
+    /* localStorage unavailable — the sort stays in-memory only */
+  }
+}
+
+// ---- Properties in document -------------------------------------------------
+
+const PROPERTIES_MODE_KEY = "context.propertiesMode";
+
+/**
+ * How YAML frontmatter is drawn in the editor: as a Properties panel, as plain
+ * source, or not at all. Device-local like the theme — it describes how the
+ * editor draws, not what a vault contains, so it must not flip as you switch
+ * vaults. Defaults to the panel, which is the point of the feature.
+ */
+export function readPropertiesMode(): PropertiesMode {
+  try {
+    const v = localStorage.getItem(PROPERTIES_MODE_KEY);
+    return v === "visible" || v === "hidden" || v === "source" ? v : "visible";
+  } catch {
+    return "visible";
+  }
+}
+
+export function writePropertiesMode(mode: PropertiesMode): void {
+  try {
+    localStorage.setItem(PROPERTIES_MODE_KEY, mode);
+  } catch {
+    /* localStorage unavailable — the choice stays in-memory only */
+  }
+}
+
+export const PROPERTIES_MODES: ReadonlyArray<{
+  id: PropertiesMode;
+  label: string;
+  hint: string;
+}> = [
+  { id: "visible", label: "Visible", hint: "Shown as a panel above the note" },
+  { id: "hidden", label: "Hidden", hint: "Not shown; still in the file" },
+  { id: "source", label: "Source", hint: "Shown as plain YAML" },
+];
+
+// ---- Editor layout ----------------------------------------------------------
+
+const EDITOR_MEASURE_KEY = "context.editorMeasure";
+/** The key this replaced: a two-state "Readable line length" switch. Read once,
+ *  to migrate a device that still has it, and never written again. */
+const LEGACY_READABLE_LINE_LENGTH_KEY = "context.readableLineLength";
+const LINE_NUMBERS_KEY = "context.lineNumbers";
+
+/**
+ * How wide the editor's prose column runs: a measure in `ch` — the unit
+ * `--editor-measure` is already expressed in — or `"full"`, the whole pane
+ * minus its gutters.
+ */
+export type EditorMeasure = number | "full";
+
+/** 88ch is the readable measure: past roughly ninety characters the eye loses
+ *  the start of the next line, which is where every typographic rule of thumb
+ *  (and Obsidian's own default) lands. It is what a corrupted numeric value
+ *  falls back to and what a device that had the old "Readable line length"
+ *  switch ON keeps; a device that has never chosen starts at FULL width
+ *  (`EDITOR_MEASURE_UNSET`) — a centred 88ch column in a window sized to the
+ *  screen read as wasted space, and the people who want the narrow column
+ *  know where the slider is. */
+export const EDITOR_MEASURE_DEFAULT = 88;
+/** What a device with no stored choice gets. */
+export const EDITOR_MEASURE_UNSET: EditorMeasure = "full";
+/** Below ~60ch prose starts to hyphenate badly; above ~120ch the measure has
+ *  already stopped being readable and "full" is the honest choice. */
+export const EDITOR_MEASURE_MIN = 60;
+export const EDITOR_MEASURE_MAX = 120;
+/** The slider's granularity. Four characters is the smallest step whose effect
+ *  is actually visible as you drag. */
+export const EDITOR_MEASURE_STEP = 4;
+
+/** Snap to the step and clamp to the usable range. NaN — a corrupted stored
+ *  value, or a garbage slider reading — falls back to the default rather than
+ *  collapsing the column to nothing. ±Infinity clamps to the bounds like any
+ *  other out-of-range number; a clamp that answered "88" to "as wide as
+ *  possible" would be lying. */
+export function clampEditorMeasure(ch: number): number {
+  if (Number.isNaN(ch)) return EDITOR_MEASURE_DEFAULT;
+  const snapped = Math.round(ch / EDITOR_MEASURE_STEP) * EDITOR_MEASURE_STEP;
+  return Math.min(EDITOR_MEASURE_MAX, Math.max(EDITOR_MEASURE_MIN, snapped));
+}
+
+/**
+ * The chosen column width. Device-local like the theme — it describes how the
+ * editor draws, not what a vault contains.
+ *
+ * Migration: this replaced a two-state "Readable line length" switch. With no
+ * value of its own the old key still decides — "off" meant the column filled
+ * the window, which is exactly what `"full"` means now, and anything else meant
+ * the readable measure, which is the default. The legacy key is never written
+ * again, so the first drag of the slider settles it for good.
+ */
+export function readEditorMeasure(): EditorMeasure {
+  try {
+    const raw = localStorage.getItem(EDITOR_MEASURE_KEY);
+    if (raw === null) {
+      // The old two-state switch, if this device still has it: "off" was full
+      // width, anything else was the readable column. A device that has never
+      // had either key gets the unset default.
+      const legacy = localStorage.getItem(LEGACY_READABLE_LINE_LENGTH_KEY);
+      if (legacy === null) return EDITOR_MEASURE_UNSET;
+      return legacy === "off" ? "full" : EDITOR_MEASURE_DEFAULT;
+    }
+    if (raw === "full") return "full";
+    // `Number("")` is 0 — finite, so it would survive the clamp as the MINIMUM
+    // measure. An empty or blank value is a corrupted write, not a request for
+    // the narrowest column.
+    const n = raw.trim() === "" ? Number.NaN : Number(raw);
+    // Not a number at all (a corrupted write) is no choice, so it gets the same
+    // unset default as an absent key — not the readable stop the clamp uses for
+    // a garbage slider reading.
+    return Number.isNaN(n) ? EDITOR_MEASURE_UNSET : clampEditorMeasure(n);
+  } catch {
+    return EDITOR_MEASURE_UNSET;
+  }
+}
+
+export function writeEditorMeasure(measure: EditorMeasure): void {
+  try {
+    localStorage.setItem(EDITOR_MEASURE_KEY, measure === "full" ? "full" : String(measure));
+  } catch {
+    /* localStorage unavailable — the choice stays in-memory only */
+  }
+}
+
+const EDITOR_FONT_SIZE_KEY = "context.editorFontSize";
+/** The note editor's text size in px. 16px is `--fs-lg`, the size the editor
+ *  always used, so a device that never chose sees no change. Only the editor
+ *  reads it (via `--editor-font-size`); the sidebar and chrome do not. */
+export const EDITOR_FONT_SIZE_DEFAULT = 16;
+export const EDITOR_FONT_SIZE_MIN = 12;
+export const EDITOR_FONT_SIZE_MAX = 24;
+export const EDITOR_FONT_SIZE_STEP = 1;
+
+/** Round to whole px and clamp; NaN (a corrupted write) falls back to the default. */
+export function clampEditorFontSize(px: number): number {
+  if (Number.isNaN(px)) return EDITOR_FONT_SIZE_DEFAULT;
+  const snapped = Math.round(px / EDITOR_FONT_SIZE_STEP) * EDITOR_FONT_SIZE_STEP;
+  return Math.min(EDITOR_FONT_SIZE_MAX, Math.max(EDITOR_FONT_SIZE_MIN, snapped));
+}
+
+export function readEditorFontSize(): number {
+  try {
+    const raw = localStorage.getItem(EDITOR_FONT_SIZE_KEY);
+    if (raw === null || raw.trim() === "") return EDITOR_FONT_SIZE_DEFAULT;
+    return clampEditorFontSize(Number(raw));
+  } catch {
+    return EDITOR_FONT_SIZE_DEFAULT;
+  }
+}
+
+export function writeEditorFontSize(px: number): void {
+  try {
+    localStorage.setItem(EDITOR_FONT_SIZE_KEY, String(clampEditorFontSize(px)));
+  } catch {
+    /* localStorage unavailable — the choice stays in-memory only */
+  }
+}
+
+/** Publish the size as the token the editor theme and skeleton read. */
+export function applyEditorFontSize(px: number): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.style.setProperty(
+    "--editor-font-size",
+    `${clampEditorFontSize(px)}px`,
+  );
+}
+
+/**
+ * The note font: a personal, device-local choice (never a vault default — the
+ * server refuses appearance keys it does not know, so a vault-wide font would
+ * fail every appearance save on servers without it). Every option is bundled
+ * with the app or built into the OS, so no font is ever fetched. Only the note
+ * editor reads it (`--editor-font-family`); the chrome keeps the UI font.
+ */
+export type EditorFont = "sauce" | "inter" | "literata" | "atkinson" | "plexmono";
+export const EDITOR_FONTS: ReadonlyArray<{ id: EditorFont; label: string; hint: string; stack: string }> = [
+  { id: "sauce", label: "Open Sauce", hint: "Baalda's own, clean and friendly", stack: "var(--font-body)" },
+  { id: "inter", label: "Inter", hint: "The most legible screen sans", stack: '"Inter", var(--font-body)' },
+  { id: "literata", label: "Literata", hint: "A serif made for long reading", stack: '"Literata", Georgia, serif' },
+  { id: "atkinson", label: "Atkinson Hyperlegible", hint: "Every letter unmistakable, for low vision", stack: '"Atkinson Hyperlegible", var(--font-body)' },
+  { id: "plexmono", label: "IBM Plex Mono", hint: "A warm typewriter feel for drafting", stack: '"IBM Plex Mono", var(--font-mono)' },
+];
+export const EDITOR_FONT_DEFAULT: EditorFont = "sauce";
+const EDITOR_FONT_KEY = "context.editorFont";
+
+export function readEditorFont(): EditorFont {
+  try {
+    const raw = localStorage.getItem(EDITOR_FONT_KEY);
+    return EDITOR_FONTS.some((f) => f.id === raw) ? (raw as EditorFont) : EDITOR_FONT_DEFAULT;
+  } catch {
+    return EDITOR_FONT_DEFAULT;
+  }
+}
+
+export function writeEditorFont(font: EditorFont): void {
+  try {
+    localStorage.setItem(EDITOR_FONT_KEY, font);
+  } catch {
+    /* localStorage unavailable — the choice stays in-memory only */
+  }
+}
+
+/** Publish the font as the token the editor theme reads. */
+export function applyEditorFont(font: EditorFont): void {
+  if (typeof document === "undefined") return;
+  const stack = (EDITOR_FONTS.find((f) => f.id === font) ?? EDITOR_FONTS[0]).stack;
+  document.documentElement.style.setProperty("--editor-font-family", stack);
+}
+
+/**
+ * Show the line-number gutter. OFF by default, unlike everything else here: the
+ * gutter takes real width from the prose column, and a second brain is a place
+ * you write prose, not a place you cite line 42.
+ */
+export function readLineNumbers(): boolean {
+  try {
+    return localStorage.getItem(LINE_NUMBERS_KEY) === "on";
+  } catch {
+    return false;
+  }
+}
+
+export function writeLineNumbers(on: boolean): void {
+  try {
+    localStorage.setItem(LINE_NUMBERS_KEY, on ? "on" : "off");
+  } catch {
+    /* localStorage unavailable — the choice stays in-memory only */
+  }
+}
+
 // ---- Sidebar width ----------------------------------------------------------
 
 const SIDEBAR_WIDTH_KEY = "context.sidebarWidth";
+const SIDEBAR_HIDDEN_KEY = "context.sidebarHidden";
+const HOME_SECTION_HIDDEN_KEY = "context.homeSectionHidden";
+
+export function readHomeSectionHidden(): boolean {
+  try { return localStorage.getItem(HOME_SECTION_HIDDEN_KEY) === "true"; }
+  catch { return false; }
+}
+
+export function writeHomeSectionHidden(hidden: boolean): void {
+  try { localStorage.setItem(HOME_SECTION_HIDDEN_KEY, String(hidden)); }
+  catch { /* Keep the preference in memory when storage is unavailable. */ }
+}
 
 /** The width the sidebar starts at, and what a double-click on the divider
  *  restores. */
-export const SIDEBAR_WIDTH_DEFAULT = 264;
+export const SIDEBAR_WIDTH_DEFAULT = 300;
 /** The default is also the floor: the resizer only ever widens the sidebar.
  *  Narrower than this and the tree header's toolbar runs out of room and pushes
  *  its last button out past the edge — so there is nothing to be gained below
  *  the width the layout was designed at. */
 export const SIDEBAR_WIDTH_MIN = SIDEBAR_WIDTH_DEFAULT;
 export const SIDEBAR_WIDTH_MAX = 560;
+/** Redesign: the wider 300px floor gives way on a window too small to hold it
+ *  next to the editor (or, on Windows, the caption buttons), down to the 264px
+ *  the sidebar was originally designed at — never below. */
+export const SIDEBAR_WIDTH_SQUEEZED = 264;
 
 /** Clamp a width to the usable range, also refusing to eat the whole window on
  *  a small screen. NaN (a corrupted stored value) falls back to the default. */
@@ -110,8 +528,14 @@ export function clampSidebarWidth(px: number, viewport = 1200): number {
   if (!Number.isFinite(px)) return SIDEBAR_WIDTH_DEFAULT;
   // Always leave room for the editor, even when the window is narrower than the
   // nominal maximum.
-  const max = Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, viewport - 320));
-  return Math.round(Math.min(max, Math.max(SIDEBAR_WIDTH_MIN, px)));
+  // Windows caption buttons share the app header, which needs more room than
+  // the editor alone to keep all actions reachable at the minimum window size.
+  const mainMinimum = typeof document !== "undefined" &&
+    document.documentElement.dataset.platform === "windows" ? 440 : 320;
+  const room = viewport - mainMinimum;
+  const min = Math.min(SIDEBAR_WIDTH_MIN, Math.max(SIDEBAR_WIDTH_SQUEEZED, room));
+  const max = Math.max(min, Math.min(SIDEBAR_WIDTH_MAX, room));
+  return Math.round(Math.min(max, Math.max(min, px)));
 }
 
 export function readSidebarWidth(): number {
@@ -129,5 +553,86 @@ export function writeSidebarWidth(px: number): void {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(px)));
   } catch {
     /* localStorage unavailable — the width stays in-memory only */
+  }
+}
+
+/** Whether the window chrome last left the vault sidebar hidden. */
+export function readSidebarHidden(): boolean {
+  try {
+    return localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "hidden";
+  } catch {
+    return false;
+  }
+}
+
+export function writeSidebarHidden(hidden: boolean): void {
+  try {
+    localStorage.setItem(SIDEBAR_HIDDEN_KEY, hidden ? "hidden" : "shown");
+  } catch {
+    /* localStorage unavailable — the choice stays in-memory only */
+  }
+}
+
+// ---- Personal appearance overrides (vault defaults, #appearance) -------------
+
+const APPEARANCE_OVERRIDES_KEY = "context.appearanceOverrides.v1";
+const THEME_STORAGE_KEY = "cbk-theme";
+
+/**
+ * This device's personal appearance OVERRIDES — a key present here wins over
+ * the open vault's default; an absent key INHERITS it (`lib/appearance.ts`).
+ *
+ * The first read on a device that predates vault defaults migrates the old
+ * per-setting keys once (`migrateStoredAppearance`): a stored choice stays an
+ * override so nobody's look changes, except one equal to the app default,
+ * which becomes inherit. The old keys are left alone and never read again.
+ */
+export function readAppearanceOverrides(userId?: string | null): AppearanceSettings {
+  try {
+    const raw = localStorage.getItem(APPEARANCE_OVERRIDES_KEY);
+    if (raw !== null) return parseAppearanceSettings(JSON.parse(raw));
+  } catch {
+    /* corrupted JSON: fall through to a fresh migration */
+  }
+  let migrated: AppearanceSettings = {};
+  try {
+    const legacyLine = localStorage.getItem(LINE_NUMBERS_KEY);
+    // Account-scoped legacy key; before sign-in is known, any account on this
+    // device that turned automatic colours off counts as that choice.
+    let legacyAuto = localStorage.getItem(AUTOMATIC_ITEM_COLORS_KEY + (userId ?? "local"));
+    if (legacyAuto === null && !userId) {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k?.startsWith(AUTOMATIC_ITEM_COLORS_KEY) && localStorage.getItem(k) === "off") {
+          legacyAuto = "off";
+          break;
+        }
+      }
+    }
+    migrated = migrateStoredAppearance({
+      theme: localStorage.getItem(THEME_STORAGE_KEY) ?? undefined,
+      autoColors: legacyAuto === null ? undefined : legacyAuto !== "off",
+      contentWidth:
+        localStorage.getItem(EDITOR_MEASURE_KEY) !== null ||
+        localStorage.getItem(LEGACY_READABLE_LINE_LENGTH_KEY) !== null
+          ? readEditorMeasure()
+          : undefined,
+      textSize:
+        localStorage.getItem(EDITOR_FONT_SIZE_KEY) !== null ? readEditorFontSize() : undefined,
+      lineNumbers: legacyLine === null ? undefined : legacyLine === "on",
+      properties: localStorage.getItem(PROPERTIES_MODE_KEY) ?? undefined,
+    });
+  } catch {
+    /* localStorage unavailable — nothing to migrate */
+  }
+  writeAppearanceOverrides(migrated);
+  return migrated;
+}
+
+export function writeAppearanceOverrides(overrides: AppearanceSettings): void {
+  try {
+    localStorage.setItem(APPEARANCE_OVERRIDES_KEY, JSON.stringify(overrides));
+  } catch {
+    /* localStorage unavailable — overrides stay in-memory only */
   }
 }

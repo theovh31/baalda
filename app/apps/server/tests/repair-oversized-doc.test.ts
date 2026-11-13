@@ -1,9 +1,9 @@
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { createApp } from "../src/http/app.js";
 import { config } from "../src/config.js";
 import { pool } from "../src/db/pool.js";
-import { CLOSE_NOTE_TOO_LARGE } from "../src/sync/hocuspocus.js";
+import { CLOSE_NOTE_TOO_LARGE, noteSizeRefusal } from "../src/sync/hocuspocus.js";
 import { appendUpdate, docStoredBytes, loadDocState, resetDocCrdt } from "../src/yjs/persistence.js";
 import { recordingAppDeps, type RecordingAppDeps } from "./helpers/app.js";
 import { signUp, type TestUser } from "./helpers/auth.js";
@@ -54,6 +54,75 @@ describe("oversized-doc repair", () => {
     // module — this literal is the only thing holding them in lockstep, and a
     // drift silently restores the infinite reconnect loop.
     expect(CLOSE_NOTE_TOO_LARGE).toBe(4413);
+  });
+
+  describe("the size gate", () => {
+    const CAP = 1000;
+
+    it("lets an ordinary message through", () => {
+      expect(noteSizeRefusal(500, "x".repeat(400), CAP)).toBeNull();
+    });
+
+    it("refuses a single message bigger than the cap", () => {
+      expect(noteSizeRefusal(CAP + 1, "", CAP)).toMatch(/oversized sync message/);
+    });
+
+    it("refuses any write to a doc already over the cap", () => {
+      // The half that experience added. A note that doubles doubles from small:
+      // every message in the cascade that took a customer's `Map of Content.md`
+      // from 276 bytes to 16 MB was comfortably under the message cap, so the
+      // message cap alone never fired. The doc cap turns the limit into a wall.
+      expect(noteSizeRefusal(10, "x".repeat(CAP + 1), CAP)).toMatch(/oversized doc/);
+    });
+
+    it("still accepts one more message from a doc at the cap, so it can be edited down", () => {
+      expect(noteSizeRefusal(10, "x".repeat(CAP), CAP)).toBeNull();
+    });
+
+    it("measures the doc in BYTES, not UTF-16 units", () => {
+      // 400 CJK characters are 400 `Y.Text` units and 1200 bytes. Compared as
+      // units this sails under a 1000-byte cap the doc is already 20% past —
+      // which is how a vault of non-Latin notes walks straight through the wall
+      // the cap is supposed to be.
+      const cjk = "漢".repeat(400);
+      expect(cjk.length).toBeLessThan(CAP);
+      expect(Buffer.byteLength(cjk, "utf8")).toBeGreaterThan(CAP);
+      expect(noteSizeRefusal(10, cjk, CAP)).toMatch(/oversized doc/);
+    });
+
+    describe("given the live Y.Text (the per-message path)", () => {
+      const ytext = (s: string): Y.Text => {
+        const t = new Y.Doc().getText("content");
+        t.insert(0, s);
+        return t;
+      };
+
+      it("answers exactly as the string form at, under and over the cap", () => {
+        for (const s of [
+          "",
+          "x".repeat(400),
+          "x".repeat(CAP),
+          "x".repeat(CAP + 1),
+          "漢".repeat(333),
+          "漢".repeat(334),
+          "😀".repeat(250),
+          "😀".repeat(251),
+        ]) {
+          expect(noteSizeRefusal(10, ytext(s), CAP)).toEqual(noteSizeRefusal(10, s, CAP));
+        }
+      });
+
+      it("refuses a CJK doc over the cap in bytes though under it in units", () => {
+        expect(noteSizeRefusal(10, ytext("漢".repeat(400)), CAP)).toMatch(/oversized doc/);
+      });
+
+      it("never stringifies a doc that provably fits", () => {
+        const t = ytext("x".repeat(100));
+        const spy = vi.spyOn(t, "toString");
+        expect(noteSizeRefusal(10, t, CAP)).toBeNull();
+        expect(spy).not.toHaveBeenCalled();
+      });
+    });
   });
 
   it("resets a doc's history and re-seeds it from the supplied text", async () => {

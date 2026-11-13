@@ -1,9 +1,14 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clampSidebarWidth,
   SIDEBAR_WIDTH_DEFAULT,
   SIDEBAR_WIDTH_MAX,
   SIDEBAR_WIDTH_MIN,
+  SIDEBAR_WIDTH_SQUEEZED,
+  readSidebarHidden,
+  writeSidebarHidden,
 } from "./prefs";
 
 // The sidebar width is dragged by the user and restored from localStorage, so
@@ -41,10 +46,23 @@ describe("clampSidebarWidth", () => {
     expect(clampSidebarWidth(9000, 700)).toBeLessThan(700);
   });
 
+  it("reserves room for app actions and caption buttons on Windows", () => {
+    const original = document.documentElement.dataset.platform;
+    document.documentElement.dataset.platform = "windows";
+    try {
+      expect(clampSidebarWidth(9000, 720)).toBe(280);
+      expect(720 - clampSidebarWidth(9000, 720)).toBe(440);
+    } finally {
+      if (original === undefined) delete document.documentElement.dataset.platform;
+      else document.documentElement.dataset.platform = original;
+    }
+  });
+
   it("still yields a usable sidebar on a window narrower than the minimum", () => {
     // Below this the floor wins: the window is too small to honour both the
-    // editor's reserve and the sidebar's floor, and the sidebar keeps its.
-    expect(clampSidebarWidth(9000, 400)).toBe(SIDEBAR_WIDTH_MIN);
+    // editor's reserve and the sidebar's floor, and the sidebar keeps its
+    // squeezed floor (the 300px default floor gives way down to 264px, no more).
+    expect(clampSidebarWidth(9000, 400)).toBe(SIDEBAR_WIDTH_SQUEEZED);
   });
 
   it("falls back to the default for a corrupted stored value", () => {
@@ -61,5 +79,29 @@ describe("clampSidebarWidth", () => {
       const once = clampSidebarWidth(w, 1400);
       expect(clampSidebarWidth(once, 1400)).toBe(once);
     }
+  });
+});
+
+describe("sidebar visibility preference", () => {
+  const values = new Map<string, string>();
+
+  beforeEach(() => {
+    values.clear();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    });
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("defaults to shown and persists either explicit state", () => {
+    localStorage.removeItem("context.sidebarHidden");
+    expect(readSidebarHidden()).toBe(false);
+    writeSidebarHidden(true);
+    expect(readSidebarHidden()).toBe(true);
+    writeSidebarHidden(false);
+    expect(readSidebarHidden()).toBe(false);
   });
 });

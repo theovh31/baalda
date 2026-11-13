@@ -13,6 +13,8 @@ import type { Awareness } from "y-protocols/awareness";
 import type * as Y from "yjs";
 import { ApiClient, ApiError } from "../api";
 import { TokenRefreshScheduler } from "./tokenRefresh";
+import { TerminalSyncError } from "./contentUpload";
+import { isReadOnlyDoc, markReadOnlyDoc } from "../bridge/readOnlyDocs";
 
 export type SyncStatus =
   | "offline" // no network provider / signed out
@@ -20,6 +22,7 @@ export type SyncStatus =
   | "synced" // read-write, converged with server
   | "read-only" // synced but the grant is view-only
   | "no-access" // server refused a token (403) — not shared with this user
+  | "deleted" // server has no such doc (404) — deleted/unregistered, TERMINAL
   | "too-large" // doc's Yjs state exceeds the server cap — TERMINAL, no retry
   | "error"; // transient failure (will retry)
 
@@ -36,10 +39,59 @@ export type SyncStatus =
  */
 export const CLOSE_NOTE_TOO_LARGE = 4413;
 
+/**
+ * How long outgoing Yjs updates are batched into one websocket message.
+ *
+ * The provider sends one message per `doc.on("update")` by default, and a doc
+ * under an ingest (or a fast typist) produces dozens a second — each one its own
+ * frame, its own server `onChange`, its own persistence debounce reset. Within
+ * this window the updates are merged with `Y.mergeUpdates` into a single
+ * message; it is a fixed batch rather than a resetting debounce, so the latency
+ * a teammate sees is capped at this number however long the burst lasts.
+ *
+ * 300 ms: below the 700 ms badge settle (so "Saving…" still reads as one
+ * continuous state), well under the 800 ms local-change debounce, and small
+ * enough that live collaboration keeps feeling live.
+ *
+ * ── The safety property ─────────────────────────────────────────────────────
+ * Batching is a DELAY, not a drop: an update sitting in the window still counts
+ * toward the provider's unsynced total, so {@link DocSync.whenFlushed} cannot
+ * mistake "buffered" for "acked" and mark a doc pushed. The buffer is
+ * nevertheless discarded on `onClose`, so everything that takes a connection
+ * down deliberately — a teardown, a token-refresh reconnect, a destroy — flushes
+ * first ({@link DocSync.flushPending}).
+ */
+export const FLUSH_DELAY_MS = 300;
+
 /** Statuses from which no reconnect will ever help. Reaching one must stop the
  *  provider's own retry loop, not merely paint a different colour. */
 export function isTerminalSyncStatus(s: SyncStatus): boolean {
-  return s === "no-access" || s === "too-large";
+  return s === "no-access" || s === "deleted" || s === "too-large";
+}
+
+/**
+ * What a failed token mint means for this doc's connection.
+ *
+ * Extracted so the one decision that separates "retry" from "give up" is
+ * testable without a socket. The 404 line is the one that was missing: a doc the
+ * server does not know — soft-deleted (`sync-token.ts` filters
+ * `deleted_at IS NULL`), or never registered — can never mint a token, so the
+ * old `error` verdict turned it into a permanent loop. `mintToken` returns null
+ * on failure and the provider's token function then sends `""`, which the server
+ * rejects on every single connect: reject → reconnect → 404 → `""` → reject, for
+ * as long as the note stays open. That is exactly what happened when the OPEN
+ * note's file was deleted from disk and the delete propagated (#93): dozens of
+ * `[onAuthenticate] rejected … (token length 0)` a minute, and a sync badge
+ * strobing Synced/Syncing.
+ *
+ * 401 stays non-terminal-but-quiet: the session, not the doc, is the problem, so
+ * a re-login fixes it without reopening the note.
+ */
+export function mintFailureStatus(httpStatus: number | undefined): SyncStatus {
+  if (httpStatus === 403) return "no-access";
+  if (httpStatus === 404) return "deleted";
+  if (httpStatus === 401) return "offline";
+  return "error";
 }
 
 export interface DocSyncOptions {
@@ -50,6 +102,13 @@ export interface DocSyncOptions {
   /** Base ws:// URL. Defaults to `deriveWsUrl(api base)` (see its doc). */
   wsUrl?: string;
   onStatus?: (status: SyncStatus) => void;
+  /**
+   * Fired when the mint came back **401** — the server refused the SESSION, not
+   * this document. Routed to one central guard (`sessionGuard.ts`, injected by
+   * `docSession.ts`) which re-checks the session before anything signs the app
+   * out; the status verdict below is unchanged either way.
+   */
+  onSessionRejected?: () => void;
   /**
    * Fired when the set of *unsynced* local changes opens/closes: `true` the
    * moment a local edit is made (not yet acked by the server), `false` once
@@ -138,7 +197,9 @@ export class DocSync {
 
   private readonly api: ApiClient;
   private readonly docId: string;
+  private readonly vaultId: string;
   private readonly onStatus?: (status: SyncStatus) => void;
+  private readonly onSessionRejected?: () => void;
   private readonly onPending?: (pending: boolean) => void;
   private readonly onFlushed?: () => void;
   private readonly settleDelayMs: number;
@@ -158,8 +219,18 @@ export class DocSync {
    * about it.
    */
   private unsyncedCount = 0;
+  /**
+   * Local document updates made while the provider was NOT yet synced — the
+   * only edits the handshake can hide. See `onSynced` for why the provider's
+   * count cannot answer this on its own.
+   */
+  private editsDuringHandshake = 0;
+  /** The Y.Doc this provider carries; kept so the update listener can be removed. */
+  private readonly doc: Y.Doc;
   /** Waiters parked in {@link whenFlushed}. */
   private flushWaiters: Array<(ok: boolean) => void> = [];
+  /** In-flight {@link whenSynced} waiters, told of every status change. */
+  private statusWaiters = new Set<(s: SyncStatus) => void>();
   /**
    * Consecutive auth rejections, driving the backoff below. Reset the moment a
    * connection authenticates (onSynced/connected), so a single expiry still
@@ -171,10 +242,17 @@ export class DocSync {
   constructor(opts: DocSyncOptions) {
     this.api = opts.api;
     this.docId = opts.docId;
+    this.vaultId = opts.vaultId;
     this.onStatus = opts.onStatus;
+    this.onSessionRejected = opts.onSessionRejected;
     this.onPending = opts.onPending;
     this.onFlushed = opts.onFlushed;
     this.settleDelayMs = opts.settleDelayMs ?? 700;
+    this.doc = opts.doc;
+    // A view-only verdict this app session already has (an earlier token, a
+    // `rejected` frame) holds from the first frame. Every mint overwrites it,
+    // so a grant that became editable since is picked up on connect.
+    this._readOnly = isReadOnlyDoc(opts.docId);
 
     const wsUrl = opts.wsUrl ?? deriveWsUrl(this.api.getBaseUrl());
     const name = `vault:${opts.vaultId}/note:${opts.docId}`;
@@ -187,10 +265,15 @@ export class DocSync {
       document: opts.doc,
       // A token *function* → the provider re-mints on every (re)connect.
       token: async () => (await this.mintToken()) ?? "",
+      // One message per burst instead of one per keystroke (see FLUSH_DELAY_MS).
+      flushDelay: FLUSH_DELAY_MS,
       ...(opts.webSocketPolyfill
         ? { WebSocketPolyfill: opts.webSocketPolyfill as typeof WebSocket }
         : {}),
-      onAuthenticationFailed: () => {
+      onAuthenticationFailed: (data?: { reason?: string }) => {
+        // W3: a keyed vault without a valid key. Not a lost grant: make the key
+        // ready and let the retry below reconnect with it.
+        if (isKeyRequired(data?.reason)) void this.api.ensureVaultKeyFor?.(this.vaultId);
         // Token rejected/expired. If we still have access, a reconnect re-mints;
         // if the mint itself 403s, mintToken() sets 'no-access' and we stop.
         //
@@ -242,12 +325,33 @@ export class DocSync {
           this.reconnectWithFreshToken();
         }
       },
+      onAuthenticated: () => {
+        // The server accepted THIS connection's token. This is the success edge
+        // that ends a failure streak — not the socket opening (see `onStatus`).
+        if (this.destroyed) return;
+        this.noteAuthSuccess();
+      },
       onStatus: ({ status }) => {
         if (this.destroyed) return;
         if (status === "connected") {
-          // Connected means the server accepted our token, so the streak is over.
-          this.noteAuthSuccess();
-          this.setStatus(this._readOnly ? "read-only" : "synced");
+          // The SOCKET is up. That is all this means: Hocuspocus authenticates
+          // IN-BAND after the connection opens, so this fires before the server
+          // has even seen our token — and both things it used to do here were
+          // therefore wrong.
+          //
+          //  • It reported "synced", so a token the server was about to reject
+          //    still flashed a green "Synced · just now" on every lap of a
+          //    rejection loop. That is the blinking badge from #93.
+          //  • It called noteAuthSuccess(), which zeroes the auth-failure streak
+          //    — pinning `scheduleAuthRetry`'s exponential backoff at its first
+          //    step forever. A doc that can never mint a token (an open note
+          //    whose file was deleted from disk, so the server soft-deleted it)
+          //    cycled reject → connect → reject about once a second instead of
+          //    backing off to 30s.
+          //
+          // `onAuthenticated`/`onSynced` are the honest success edges and both
+          // set the status themselves.
+          if (!isTerminalSyncStatus(this._status)) this.setStatus("connecting");
         } else if (status === "connecting") {
           // `no-access` is TERMINAL and must survive this. The provider runs its
           // own reconnect loop, and each lap emits "connecting" — which used to
@@ -257,10 +361,30 @@ export class DocSync {
           if (isTerminalSyncStatus(this._status)) return;
           this.setStatus("connecting");
         } else if (status === "disconnected") {
+          // A re-mint we asked for ourselves is not an outage. `refreshAccess`
+          // deliberately drops the socket to pick up a new token (a reauth, a TTL
+          // refresh), and reporting that as "offline" is what made the badge
+          // strobe synced→offline→connecting→synced on an ACL announcement about
+          // somebody else's note. The reconnect is already in flight.
+          if (this.reconnectPending) return;
           if (!isTerminalSyncStatus(this._status)) this.setStatus("offline");
         }
       },
       onSynced: () => {
+        // Take over the indicator ONLY for an edit typed during the connect.
+        //
+        // The provider's count is no witness here. `startSync` resets it to 1
+        // for the sync-step it is about to send, and the server's own
+        // sync-step-2 flips `synced` while that unit is still outstanding (its
+        // `SyncStatus` ack answers OUR step 2, which goes out after). So on every
+        // clean note open this fires with count 1 and nothing to send — reading
+        // "count > 0" as pending painted "Syncing…" until the ack plus the
+        // settle delay, on every single click. Only a document update we saw
+        // ourselves during the handshake is an edit the server may not have.
+        if (!this.destroyed && this.editsDuringHandshake > 0 && this.unsyncedCount > 0) {
+          this.setPending(true);
+        }
+        this.editsDuringHandshake = 0;
         if (!this.destroyed && !isTerminalSyncStatus(this._status)) {
           this.noteAuthSuccess();
           this.setStatus(this._readOnly ? "read-only" : "synced");
@@ -282,6 +406,13 @@ export class DocSync {
             clearTimeout(this.settleTimer);
             this.settleTimer = null;
           }
+          // Before the initial sync the count is the HANDSHAKE — the sync-step
+          // and awareness messages the provider queues while the socket comes
+          // up — not an edit anyone made. Reporting it as pending turned every
+          // note open into "Syncing…" for the length of the connect. Edits made
+          // during that window are not lost to the indicator: `onSynced`
+          // re-reads the count once the handshake is out of the way.
+          if (!this.provider.isSynced) return;
           this.setPending(true);
           return;
         }
@@ -300,7 +431,19 @@ export class DocSync {
     });
 
     this.awareness = this.provider.awareness as Awareness;
+    this.doc.on("update", this.trackHandshakeEdit);
   }
+
+  /**
+   * Count a local edit made before the initial sync. Updates the provider
+   * applied (remote ops) carry the provider itself as their origin and are not
+   * edits of ours; anything else — a keystroke, a disk ingest — is content the
+   * server may still be missing when `onSynced` fires.
+   */
+  private readonly trackHandshakeEdit = (_update: Uint8Array, origin: unknown): void => {
+    if (this.destroyed || origin === this.provider) return;
+    if (!this.provider.isSynced) this.editsDuringHandshake++;
+  };
 
   get status(): SyncStatus {
     return this._status;
@@ -312,7 +455,35 @@ export class DocSync {
     return this.provider.isSynced;
   }
 
-  /** Resolve once the initial server sync completes (or reject on no-access). */
+  /**
+   * Send whatever the {@link FLUSH_DELAY_MS} window is holding, right now.
+   *
+   * Called before anything that ends this connection and before anything that
+   * WAITS on the server's ack: the provider drops its buffer in `onClose`, and a
+   * waiter that did not flush first would simply sit out the window. Safe when
+   * nothing is pending, and safe after destroy (the provider guards itself).
+   */
+  flushPending(): void {
+    try {
+      this.provider.flushPendingUpdates();
+    } catch {
+      /* provider already torn down — nothing buffered can be sent anyway */
+    }
+  }
+
+  /**
+   * Resolve once the initial server sync completes, or after `timeoutMs` either
+   * way (offline-first). Rejects with a {@link TerminalSyncError} as soon as the
+   * doc reaches a terminal status — whether it already had one at the call or
+   * reaches it DURING the wait.
+   *
+   * The second half is the one that was missing. A doc the server deleted gets
+   * its 404 from the token mint a moment AFTER the provider is created, so a
+   * waiter that only checked the status at call time sat out the full 10 s and
+   * then reported a transient "server did not respond" — never permanent, so
+   * the same doc was queued again on the next pass. Four upload slots doing
+   * that for ~25 deleted notes, every ~30 s, forever (prod 2026-09-23).
+   */
   whenSynced(timeoutMs = 10_000): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.provider.isSynced) return resolve();
@@ -322,13 +493,18 @@ export class DocSync {
         done = true;
         clearTimeout(timer);
         this.provider.off("synced", onSynced);
+        this.statusWaiters.delete(onStatus);
         fn();
       };
       const onSynced = () => finish(resolve);
+      const onStatus = (s: SyncStatus) => {
+        if (isTerminalSyncStatus(s)) finish(() => reject(new TerminalSyncError(s)));
+      };
       this.provider.on("synced", onSynced);
+      this.statusWaiters.add(onStatus);
       const timer = setTimeout(() => finish(resolve), timeoutMs); // resolve anyway → offline-first
       // If access was already refused, don't wait the full timeout.
-      if (isTerminalSyncStatus(this._status)) finish(() => reject(new Error(this._status)));
+      onStatus(this._status);
     });
   }
 
@@ -345,6 +521,8 @@ export class DocSync {
   whenFlushed(timeoutMs = 30_000): Promise<boolean> {
     if (this.destroyed) return Promise.resolve(false);
     if (isTerminalSyncStatus(this._status)) return Promise.resolve(false);
+    // Nothing may sit in the batch window while somebody waits for its ack.
+    this.flushPending();
     if (this.unsyncedCount === 0 && this.provider.isSynced) return Promise.resolve(true);
     return new Promise<boolean>((resolve) => {
       let done = false;
@@ -400,8 +578,9 @@ export class DocSync {
 
   private async mintToken(): Promise<string | null> {
     try {
-      const res = await this.api.syncToken(this.docId);
+      const res = await this.api.syncToken(this.docId, this.vaultId);
       this._readOnly = res.readOnly;
+      markReadOnlyDoc(this.docId, res.readOnly === true);
       // (Re)arm refresh based on the real token TTL.
       this.refresher.schedule(ttlFromToken(res.token));
       // A minted token is NOT a connected socket. Claiming "synced" here (and,
@@ -413,16 +592,30 @@ export class DocSync {
       if (!isTerminalSyncStatus(this._status) && res.readOnly) {
         this.setStatus("read-only");
       }
-      return res.token;
+      return withVaultKey(res.token, this.api.vaultKeyFor?.(this.vaultId) ?? null);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 403) {
-        this.setStatus("no-access");
+      // One verdict for every mint failure (see `mintFailureStatus`), so 403 and
+      // 404 cannot drift apart: both are refusals no reconnect can talk its way
+      // out of. A 401 means the stored session is no longer valid (expired, or
+      // the user no longer exists on this server) — not this doc's fault, so it
+      // reads as offline and lets the backoff stretch instead of retrying hard.
+      const httpStatus = e instanceof ApiError ? e.status : undefined;
+      const status = mintFailureStatus(httpStatus);
+      this.setStatus(status);
+      // …and the one thing "offline" cannot express: a 401 is the SESSION being
+      // refused, and every mint from here (this doc's refresher, the next doc's
+      // first connect, the vault channel) will get the same answer. Announced
+      // rather than acted on — the guard on the other end re-checks the session
+      // before the app calls itself signed out. See `sessionGuard.ts`.
+      if (httpStatus === 401) this.onSessionRejected?.();
+      if (isTerminalSyncStatus(status)) {
         this.refresher.cancel();
-        // Refusal is terminal: anything waiting on a flush will never get one.
+        // Terminal: anything waiting on a flush will never get one.
         this.releaseFlushWaiters(false);
         // Guards alone can't stop this: HocuspocusProvider reconnects on its own
-        // schedule, so a refused doc would keep opening sockets (and keep getting
-        // rejected) for as long as the note stayed open. Refusal is terminal until
+        // schedule, so a doc we can never mint a token for would keep opening
+        // sockets — and keep being rejected, because the token function falls
+        // back to `""` — for as long as the note stayed open. Terminal until
         // something re-opens the note or an ACL change calls refreshAccess(), so
         // take the socket down instead of leaving it to cycle.
         try {
@@ -430,12 +623,7 @@ export class DocSync {
         } catch {
           /* provider already torn down */
         }
-        return null;
       }
-      // A 401 means the stored session is no longer valid (expired, or the user
-      // no longer exists on this server). Re-minting cannot fix that, so treat it
-      // as offline and let the backoff stretch out instead of retrying hard.
-      this.setStatus(e instanceof ApiError && e.status === 401 ? "offline" : "error");
       return null;
     }
   }
@@ -462,6 +650,9 @@ export class DocSync {
     // strands the provider offline forever. Connect only once the close has
     // actually landed (with a timeout fallback in case it never fires).
     this.reconnectPending = true;
+    // The socket is about to go down and `onClose` discards the batch window:
+    // send its contents while there is still a connection to send them on.
+    this.flushPending();
     let timer: ReturnType<typeof setTimeout> | null = null;
     const connectNow = () => {
       wsp.off("disconnect", connectNow);
@@ -495,6 +686,7 @@ export class DocSync {
     if (this._status === s) return;
     this._status = s;
     this.onStatus?.(s);
+    for (const w of [...this.statusWaiters]) w(s);
   }
 
   private setPending(p: boolean): void {
@@ -505,6 +697,11 @@ export class DocSync {
 
   destroy(): void {
     if (this.destroyed) return;
+    // BEFORE the destroyed latch: the tail of a burst (the last keystrokes
+    // before a note is closed, a vault is switched or the app quits) is still in
+    // the batch window, and this is the last moment it can reach the socket.
+    // `provider.destroy()` flushes too, but only for the path that reaches it.
+    this.flushPending();
     this.destroyed = true;
     // Unpark anything waiting on a flush: the provider is going away, so the ack
     // will never come and the waiter must not sit out its whole timeout.
@@ -520,10 +717,21 @@ export class DocSync {
       this.authRetryTimer = null;
     }
     this.refresher.cancel();
+    this.doc.off("update", this.trackHandshakeEdit);
     try {
       this.provider.destroy();
     } catch {
       /* ignore */
     }
   }
+}
+
+/** W3: the per-doc token carries the vault key as `<jwt>.<vk-b64>` when held. */
+export function withVaultKey(token: string, vk: string | null): string {
+  return token && vk ? `${token}.${vk}` : token;
+}
+
+/** A Hocuspocus permission-denied reason naming the missing vault key. */
+export function isKeyRequired(reason: string | undefined): boolean {
+  return typeof reason === "string" && reason.includes("key_required");
 }

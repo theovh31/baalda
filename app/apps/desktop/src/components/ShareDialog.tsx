@@ -6,7 +6,7 @@ import {
   sharePrincipalId,
 } from "../lib/api";
 import { useStore } from "../store";
-import { Avatar } from "./Identity";
+import { Avatar } from "./Avatar";
 
 export interface ShareTarget {
   resourceType: "folder" | "file";
@@ -127,10 +127,11 @@ export function ShareDialog({ target, onClose }: { target: ShareTarget; onClose:
         ) : (
           <ul className="share-list">
             {shares.map((s) => {
-              const name = memberName(sharePrincipalId(s));
+              const principal = sharePrincipalId(s);
+              const name = memberName(principal);
               return (
                 <li key={s.id}>
-                  <Avatar label={name} />
+                  <Avatar label={name} userId={principal} />
                   <span className="member-name">{name}</span>
                   <span className="member-role">{s.permission}</span>
                   <button className="link-btn danger" onClick={() => void revoke(s.id)}>

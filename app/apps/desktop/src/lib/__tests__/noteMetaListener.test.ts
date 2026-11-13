@@ -34,13 +34,18 @@ const fakeRegistry = vi.hoisted(() => {
     ),
     // Item colors ride the same pull; this suite doesn't exercise them.
     setColorListener: vi.fn(),
+    setFailureListener: vi.fn(),
     setInboundHost: vi.fn(),
     mappedNotes: vi.fn((): Array<{ docId: string; relPath: string }> => []),
     isPushed: vi.fn(() => false),
     markPushed: vi.fn(),
     flushCheckpoint: vi.fn(async () => {}),
+    materializePendingFromBootstrap: vi.fn(async () => false),
+    pendingFromBootstrapCount: vi.fn(() => 0),
     failures: vi.fn((): unknown[] => []),
     hasFailures: vi.fn(() => false),
+    heldRefusals: vi.fn((): unknown[] => []),
+    retryHeldRefusals: vi.fn(() => false),
     limitCode: vi.fn((): string | null => null),
   };
   return reg;

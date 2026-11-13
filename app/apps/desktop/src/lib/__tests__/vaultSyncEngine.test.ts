@@ -125,6 +125,58 @@ describe("VaultSyncEngine", () => {
     expect(hello.priority).toEqual(["A"]);
     // base64 of [1,2] == "AQI="
     expect((hello.manifest as Record<string, string>).A).toBe("AQI=");
+    // No tree binaries here, and the field is omitted rather than sent empty so
+    // the common frame stays byte-identical to what shipped servers parse.
+    expect("files" in hello).toBe(false);
+  });
+
+  it("announces the tree binaries' doc ids in `hello.files`, never in the manifest", async () => {
+    // A binary has no CRDT and so no state vector — nothing to diff, nothing to
+    // backfill. It is announced anyway because `ready.revoked` can only name
+    // what we say we hold, and a `.pdf` set to Private has to leave this disk
+    // exactly as a note does. Before this it could not be named at all.
+    const sink = new MemSink({ A: new Uint8Array([1, 2]) }, ["A"]);
+    let ws: FakeWs | null = null;
+    const engine = new VaultSyncEngine({
+      api: tokenApi(),
+      vaultId: "v1",
+      sink,
+      fileDocIds: () => ["file-1", "file-2"],
+      heldNoteIds: () => ["A", "unopened-note"],
+      wsFactory: () => (ws = new FakeWs()),
+    });
+    engine.start();
+    ws!.onopen?.(null);
+    await tick();
+
+    const hello = ws!.helloText()!;
+    expect(hello.files).toEqual(["file-1", "file-2"]);
+    expect(hello.held).toEqual(["A", "unopened-note"]);
+    expect(Object.keys(hello.manifest as Record<string, string>)).toEqual(["A"]);
+  });
+
+  it("still sends a hello when the files map throws", async () => {
+    // The map is read fresh on every connect (it moves with every upload and
+    // removal). A throw there must cost the binaries their announcement, never
+    // the whole connection.
+    const sink = new MemSink({ A: new Uint8Array([1, 2]) }, ["A"]);
+    let ws: FakeWs | null = null;
+    const engine = new VaultSyncEngine({
+      api: tokenApi(),
+      vaultId: "v1",
+      sink,
+      fileDocIds: () => {
+        throw new Error("vault switched");
+      },
+      wsFactory: () => (ws = new FakeWs()),
+    });
+    engine.start();
+    ws!.onopen?.(null);
+    await tick();
+
+    const hello = ws!.helloText()!;
+    expect(hello.t).toBe("hello");
+    expect("files" in hello).toBe(false);
   });
 
   it("announces presence right behind hello — before ready, so the sidebar dots don't wait out the backfill", async () => {
@@ -258,10 +310,18 @@ describe("VaultSyncEngine", () => {
 
     created[0].onclose?.(null); // disconnect
     expect(scheduled).toHaveLength(1);
-    expect(scheduled[0].ms).toBe(500); // 1000 * 2^0 * 0.5
+    // The FIRST retry ignores `baseMs` and goes almost immediately: a drop is
+    // nearly always a server that is coming straight back, and making the user
+    // watch a backoff ladder for that is the whole reason reconnects felt slow.
+    expect(scheduled[0].ms).toBe(25); // IMMEDIATE_RETRY_MS 50 * 0.5
 
     scheduled[0].fn(); // fire the reconnect
     expect(created).toHaveLength(2);
+
+    // From here the ladder is the ordinary jittered exponential one.
+    created[1].onclose?.(null);
+    expect(scheduled).toHaveLength(2);
+    expect(scheduled[1].ms).toBe(1000); // 1000 * 2^1 * 0.5
   });
 });
 
@@ -314,7 +374,7 @@ describe("VaultSyncEngine — inbound queue", () => {
       sink,
       wsFactory: () => (ws = new FakeWs()),
     });
-    engine.start();
+    engine.start(); await tick(); await tick(); // the socket opens once the sink's manifest has loaded
     ws!.onopen?.(null);
     await awaitHello(ws!);
 
@@ -344,7 +404,7 @@ describe("VaultSyncEngine — inbound queue", () => {
       wsFactory: () => (ws = new FakeWs()),
       onInboundProgress: (done, total) => seen.push([done, total]),
     });
-    engine.start();
+    engine.start(); await tick(); await tick(); // the socket opens once the sink's manifest has loaded
     ws!.onopen?.(null);
     await awaitHello(ws!);
     ws!.onmessage?.({ data: updateFrame("a", [1]) });
@@ -496,7 +556,7 @@ describe("VaultSyncEngine — inbound queue", () => {
       },
       clearTimeoutImpl: () => {},
     });
-    engine.start();
+    engine.start(); await tick(); await tick(); // the socket opens once the sink's manifest has loaded
     created[0].onopen?.(null);
     await tick();
 
@@ -525,7 +585,7 @@ describe("VaultSyncEngine — inbound queue", () => {
       sink,
       wsFactory: () => (ws = new FakeWs()),
     });
-    engine.start();
+    engine.start(); await tick(); await tick(); // the socket opens once the sink's manifest has loaded
     ws!.onopen?.(null);
     await tick();
     for (let i = 0; i < 8; i++) ws!.onmessage?.({ data: updateFrame("d", [i]) });
@@ -547,11 +607,33 @@ describe("VaultSyncEngine — inbound queue", () => {
       wsFactory: () => (ws = new FakeWs()),
     });
     engine.start();
+    // No socket until the manifest has loaded: the server's hello window starts
+    // at the upgrade, so a slow load must never run inside it.
+    expect(ws).toBeNull();
+    for (let i = 0; i < 5 && !ws; i++) await tick();
+    expect(sink.ready).toBe(true);
     ws!.onopen?.(null);
     for (let i = 0; i < 5 && !ws!.helloText(); i++) await tick();
 
-    expect(sink.ready).toBe(true); // hello never precedes the manifest load
     expect((ws!.helloText()!.manifest as Record<string, string>).A).toBe("BQ==");
+  });
+
+  it("a stop() while the manifest loads never opens a socket", async () => {
+    const sink = new SlowSink();
+    let opened = 0;
+    const engine = new VaultSyncEngine({
+      api: tokenApi(),
+      vaultId: "v1",
+      sink,
+      wsFactory: () => {
+        opened++;
+        return new FakeWs();
+      },
+    });
+    engine.start();
+    engine.stop();
+    for (let i = 0; i < 5; i++) await tick();
+    expect(opened).toBe(0);
   });
 });
 
@@ -688,6 +770,16 @@ describe("parseServerControl — ready", () => {
     ).toEqual({ t: "ready", empty: ["a"], emptyTruncated: true });
   });
 
+  it("reads the `behind` list (docs this device holds unpushed ops for) and its flag", () => {
+    expect(parseServerControl(JSON.stringify({ t: "ready", behind: ["x", 3, ""] }))).toEqual({
+      t: "ready",
+      behind: ["x"],
+    });
+    expect(
+      parseServerControl(JSON.stringify({ t: "ready", empty: ["a"], behind: ["b"], behindTruncated: true })),
+    ).toEqual({ t: "ready", empty: ["a"], behind: ["b"], behindTruncated: true });
+  });
+
   it("tolerates an older server that omits both fields", () => {
     expect(parseServerControl(JSON.stringify({ t: "ready" }))).toEqual({ t: "ready" });
   });
@@ -745,6 +837,176 @@ describe("VaultSyncEngine — server-empty reporting", () => {
     ws!.onmessage?.({ data: JSON.stringify({ t: "ready" }) });
     expect(events).toHaveLength(2);
     expect(events[1]).toEqual({ ids: [], truncated: false });
+  });
+
+  it("fires onServerRevoked ahead of the status flip, and only when named", async () => {
+    // `ready.revoked` is the authority a wholesale removal needs. The status flip
+    // to `synced` is what arms the reconnect's registry pull, so the authority
+    // has to be recorded first or it arrives one pull too late — which, on a cold
+    // launch after a revocation, is the entire gap this frame closes.
+    const sink = new MemSink();
+    let ws: FakeWs | null = null;
+    const order: string[] = [];
+    const events: Array<{ ids: string[]; truncated: boolean }> = [];
+    const engine = new VaultSyncEngine({
+      api: tokenApi(),
+      vaultId: "v1",
+      sink,
+      wsFactory: () => (ws = new FakeWs()),
+      onServerRevoked: (ids, truncated) => {
+        events.push({ ids, truncated });
+        order.push("revoked");
+      },
+      onStatus: (s) => order.push(s),
+    });
+    engine.start();
+    ws!.onopen?.(null);
+    await awaitHello(ws!);
+
+    ws!.onmessage?.({
+      data: JSON.stringify({ t: "ready", revoked: ["a", "b"], revokedTruncated: true }),
+    });
+    expect(events).toEqual([{ ids: ["a", "b"], truncated: true }]);
+    expect(order.indexOf("revoked")).toBeLessThan(order.indexOf("synced"));
+
+    // Never fired empty: an ordinary `ready` says nothing about access, and a
+    // no-op call here would stamp the authority clock on every reconnect.
+    ws!.onmessage?.({ data: JSON.stringify({ t: "ready" }) });
+    expect(events).toHaveLength(1);
+  });
+
+  it("a doc in ready.tombstones is a deletion, never a revocation", async () => {
+    const sink = new MemSink();
+    let ws: FakeWs | null = null;
+    const order: string[] = [];
+    const revoked: string[][] = [];
+    const tombstones: string[][] = [];
+    const engine = new VaultSyncEngine({
+      api: tokenApi(),
+      vaultId: "v1",
+      sink,
+      wsFactory: () => (ws = new FakeWs()),
+      onServerTombstones: (ids) => {
+        tombstones.push(ids);
+        order.push("tombstones");
+      },
+      onServerRevoked: (ids) => {
+        revoked.push(ids);
+        order.push("revoked");
+      },
+    });
+    engine.start();
+    ws!.onopen?.(null);
+    await awaitHello(ws!);
+    ws!.onmessage?.({
+      data: JSON.stringify({ t: "ready", revoked: ["gone", "private"], tombstones: ["gone"] }),
+    });
+    expect(tombstones).toEqual([["gone"]]);
+    expect(revoked).toEqual([["private"]]);
+    expect(order).toEqual(["tombstones", "revoked"]);
+
+    // Named ONLY as tombstoned: nothing reaches the revocation path at all.
+    ws!.onmessage?.({ data: JSON.stringify({ t: "ready", revoked: ["gone"], tombstones: ["gone"] }) });
+    expect(revoked).toHaveLength(1);
+    // An older server omits the field: behaviour is unchanged.
+    ws!.onmessage?.({ data: JSON.stringify({ t: "ready", revoked: ["x"] }) });
+    expect(revoked[1]).toEqual(["x"]);
+    expect(tombstones).toHaveLength(2);
+  });
+
+  it("parses and dispatches a read-only rejection; ignores malformed ones", async () => {
+    const sink = new MemSink();
+    let ws: FakeWs | null = null;
+    const got: Array<[string, string]> = [];
+    const engine = new VaultSyncEngine({
+      api: tokenApi(),
+      vaultId: "v1",
+      sink,
+      wsFactory: () => (ws = new FakeWs()),
+      onServerRejected: (docId, reason) => got.push([docId, reason]),
+    });
+    engine.start();
+    ws!.onopen?.(null);
+    await awaitHello(ws!);
+    ws!.onmessage?.({ data: JSON.stringify({ t: "ready" }) });
+    ws!.onmessage?.({ data: JSON.stringify({ t: "rejected", docId: "d1", reason: "read_only" }) });
+    ws!.onmessage?.({ data: JSON.stringify({ t: "rejected", docId: "d2", reason: "something_new" }) });
+    ws!.onmessage?.({ data: JSON.stringify({ t: "rejected", reason: "read_only" }) });
+    expect(got).toEqual([["d1", "read_only"]]);
+    expect(sink.dropped).toEqual([]); // a rejection is not a revocation
+  });
+
+  it("no rejected frame, no dispatch", async () => {
+    const sink = new MemSink();
+    let ws: FakeWs | null = null;
+    const got: string[] = [];
+    const engine = new VaultSyncEngine({
+      api: tokenApi(), vaultId: "v1", sink,
+      wsFactory: () => (ws = new FakeWs()),
+      onServerRejected: (docId) => got.push(docId),
+    });
+    engine.start();
+    ws!.onopen?.(null);
+    await awaitHello(ws!);
+    ws!.onmessage?.({ data: JSON.stringify({ t: "ready", revoked: ["x"] }) });
+    ws!.onmessage?.({ data: JSON.stringify({ t: "drop", docId: "y" }) });
+    expect(got).toEqual([]);
+  });
+
+  it("ready.covered acks the EXACT state vector the hello sent", async () => {
+    const sent = Uint8Array.from([1, 7, 3]); // opaque to the engine
+    const sink = new MemSink({ a: sent, b: Uint8Array.from([1, 9, 9]) });
+    let ws: FakeWs | null = null;
+    const acks: Array<Array<[string, string]>> = [];
+    const engine = new VaultSyncEngine({
+      api: tokenApi(),
+      vaultId: "v1",
+      sink,
+      wsFactory: () => (ws = new FakeWs()),
+      onServerCovered: (a) => acks.push(a),
+    });
+    engine.start();
+    ws!.onopen?.(null);
+    await awaitHello(ws!);
+    const hello = ws!.helloText() as unknown as { manifest: Record<string, string> };
+    // A doc the hello never named ("zzz") cannot be acked from this frame.
+    ws!.onmessage?.({ data: JSON.stringify({ t: "ready", covered: ["a", "zzz"] }) });
+    expect(acks).toEqual([[["a", hello.manifest.a]]]);
+    // No `covered` (older server, or live-only mode): nothing is acked.
+    ws!.onmessage?.({ data: JSON.stringify({ t: "ready" }) });
+    expect(acks).toHaveLength(1);
+  });
+
+  it("consumes bounded revocation batches before ready and rejects malformed batches", async () => {
+    const sink = new MemSink();
+    let ws: FakeWs | null = null;
+    const received: string[] = [];
+    const engine = new VaultSyncEngine({ api: tokenApi(), vaultId: "v1", sink,
+      wsFactory: () => (ws = new FakeWs()),
+      onServerRevoked: (ids) => received.push(...ids),
+    });
+    engine.start();
+    ws!.onopen?.(null);
+    await awaitHello(ws!);
+    for (const docIds of [["a", "b"], ["c"]]) {
+      ws!.onmessage?.({ data: JSON.stringify({ t: "revoked", docIds }) });
+    }
+    expect(received).toEqual(["a", "b", "c"]);
+    expect(sink.dropped).toEqual(received);
+    expect(parseServerControl(JSON.stringify({ t: "revoked", docIds: ["a", 7] }))).toBeNull();
+    expect(parseServerControl(JSON.stringify({ t: "revoked", docIds: Array(2001).fill("a") }))).toBeNull();
+    engine.stop();
+  });
+
+  it("an older server that never sends `revoked` is simply silent", async () => {
+    // Forward compatibility runs both ways: the field is optional on the wire.
+    expect(parseServerControl(JSON.stringify({ t: "ready" }))).toEqual({ t: "ready" });
+    expect(
+      parseServerControl(JSON.stringify({ t: "ready", revoked: ["a", 7, ""] })),
+    ).toEqual({ t: "ready", revoked: ["a"] });
+    expect(
+      parseServerControl(JSON.stringify({ t: "ready", revoked: ["a"], revokedTruncated: 1 })),
+    ).toEqual({ t: "ready", revoked: ["a"] });
   });
 
   it("refresh() sends a fresh hello over the existing backoff", async () => {

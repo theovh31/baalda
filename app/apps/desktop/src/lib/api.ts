@@ -1,3 +1,49 @@
+import type { PinnedItem } from "./pins";
+import type {
+  MemberSkillAccess,
+  SkillAccessLevel,
+  SkillAccessList,
+  SkillDelivery,
+  SkillDetail,
+  SkillDraft,
+  SkillFileInput,
+  SkillOrigin,
+  SkillsCatalog,
+  SkillSource,
+  SkillsManifest,
+  SkillSummary,
+  SkillVersionSummary,
+  SkillVersionWithFiles,
+} from "./skills/types";
+import { parseVaultAppearanceSettings, type VaultAppearanceSettings } from "./appearanceSettings";
+import type { SeedResultFields } from "./sync/seedRegister";
+import { rememberAvatarImage } from "./avatarIdentity";
+import { parseHealth, type ServerHealth } from "./serverFeatures";
+import { CLIENT_OUTDATED_CODE, CLIENT_VERSION, CLIENT_VERSION_PARAM } from "./clientVersion";
+import { APP_CHANNEL, APP_SCHEME } from "./deepLinkScheme";
+import type { DeliveredMessage, MessageReceiptEvent } from "./messages/types";
+
+/**
+ * Which build starts a checkout, so the server's success page hands back to
+ * THIS app (`baalda-staging://` for Staging, `baalda-dev://` for a dev build)
+ * rather than whichever app owns `baalda://`. The server allow-lists the scheme.
+ */
+const CHECKOUT_CLIENT = { channel: APP_CHANNEL, scheme: APP_SCHEME } as const;
+// Type-only import: `bulkTypes.ts` is the hand-mirrored copy of the server's
+// wire contract, and importing the TYPES keeps this module a runtime leaf.
+import type {
+  BootstrapSession,
+  DocPushItem,
+  DocPushResult,
+  FileBatchItem,
+  FileBatchResult,
+  FolderBatchItem,
+  FolderBatchResult,
+  NoteBatchItem,
+  NoteBatchResult,
+  NoteDeleteResult,
+} from "./sync/bulkTypes";
+
 // The ONE typed HTTP boundary to the Baalda server. Every `fetch`
 // to the server lives here — auth, organizations, registry, shares, sync-token.
 // Components and managers call these methods; they never call `fetch` directly.
@@ -78,7 +124,33 @@ export interface Organization {
   id: string;
   name: string;
   slug: string;
+  /** The vault's icon (`lib/vaultIcon.ts` wire format); null = the default. */
+  logo?: string | null;
   createdAt?: string;
+}
+
+/**
+ * Two facts the notes listing's last page states about the caller (server
+ * 2026-10-09). Absent = the server did not say (an older server), which every
+ * reader treats as "unknown" (`?? null`), never as false. A field is present
+ * only when the server sent a boolean, so an old server's listing keeps
+ * exactly its old shape.
+ */
+export interface ListingVisibility {
+  /** The vault holds live notes or files this user cannot read. */
+  hiddenContent: boolean | null;
+  /** A create at the vault root would be allowed. */
+  canCreateRoot: boolean | null;
+}
+
+function listingVisibility(data: {
+  hiddenContent?: unknown;
+  canCreateRoot?: unknown;
+}): Partial<ListingVisibility> {
+  const out: Partial<ListingVisibility> = {};
+  if (typeof data.hiddenContent === "boolean") out.hiddenContent = data.hiddenContent;
+  if (typeof data.canCreateRoot === "boolean") out.canCreateRoot = data.canCreateRoot;
+  return out;
 }
 
 export interface Member {
@@ -98,6 +170,55 @@ export interface Invitation {
   organizationId: string;
   inviterId?: string;
   expiresAt?: string;
+  /** Present on our own `/api/invitations/*` routes, absent on Better Auth's —
+   *  which is why every consumer treats both as optional and falls back. */
+  organizationName?: string;
+  inviterName?: string;
+}
+
+/**
+ * What an invitation id resolves to for someone who is not (yet) signed in as
+ * the invitee — the public shoulder-tap an invite deep link lands on.
+ *
+ * Public because the id IS the capability: an unguessable UUID that only ever
+ * reaches the invitee's inbox. It carries the vault name and who invited them
+ * so the sign-in card can say what the person is joining instead of asking for
+ * a password against an unexplained modal.
+ */
+export interface InvitationPreview {
+  id: string;
+  email: string;
+  role: string;
+  status: "pending" | "accepted" | "rejected" | "canceled" | "expired";
+  organizationId: string;
+  organizationName: string;
+  inviterName: string | null;
+  expiresAt?: string;
+}
+
+/**
+ * Which sign-in routes the server actually offers. Every field is a capability,
+ * so every field fails CLOSED — see {@link ApiClient.getAuthMethods}.
+ */
+export interface AuthMethods {
+  emailPassword: boolean;
+  google: boolean;
+  /** Server can send a "choose a new password" email. */
+  passwordReset: boolean;
+  /** Server delivers invitations by email (otherwise the admin shares a link). */
+  invitationEmail: boolean;
+  /** Server takes "Report a bug" reports (its operator set BUG_REPORT_EMAIL). */
+  bugReport: boolean;
+}
+
+/** Optional app details attached to a bug report; the server keeps only these keys. */
+export interface BugReportDetails {
+  appVersion?: string;
+  platform?: string;
+  os?: string;
+  serverUrl?: string;
+  vault?: string;
+  syncStatus?: string;
 }
 
 export interface Vault {
@@ -109,6 +230,44 @@ export interface Vault {
    *  settings toggle). Absent on an older server — treat that as false. */
   rootFrozen?: boolean;
   root_frozen?: boolean;
+}
+
+/** One soft-deleted note in `GET /api/vaults/:vaultId/trash`. */
+/** `GET /api/notes/:docId/trash-content`. */
+export interface TrashContent {
+  docId: string;
+  relPath: string;
+  text: string;
+  /** ISO timestamp. */
+  deletedAt: string;
+}
+
+export interface TrashItem {
+  docId: string;
+  relPath: string;
+  /** ISO timestamp. */
+  deletedAt: string;
+  /** Null when the deleter is unknown (an older delete, a removed account). */
+  deletedBy: { id: string; name: string } | null;
+  /** ISO timestamp after which the server purges it for good. */
+  purgeAfter: string;
+  sizeBytes: number;
+  /** Someone's edits reached the server after the delete, or never got a
+   *  chance to: the version in Trash may hold work nobody else has seen. */
+  hasUnsyncedContributions: boolean;
+}
+
+export interface TrashListing {
+  items: TrashItem[];
+  truncated: boolean;
+}
+
+/** `POST /api/notes/:docId/restore`. `renamed` ⇒ `relPath` differs from the
+ *  original because that path was taken. */
+export interface RestoredNote {
+  docId: string;
+  relPath: string;
+  renamed: boolean;
 }
 
 export interface RegisteredNote {
@@ -133,6 +292,13 @@ export interface RegisteredNote {
   last_edited_at?: string | null;
   /** Palette id (see `lib/appearance`), shared by the whole team. */
   color?: string | null;
+  /** Who created the note, retained for attribution and config compatibility. */
+  createdBy?: string | null;
+  created_by?: string | null;
+  /** When the server row was created (ISO). `GET /api/notes` sends the raw
+   *  column, `created_at`; the camel spelling is accepted for other routes. */
+  createdAt?: string | null;
+  created_at?: string | null;
 }
 
 /** The normalized "last edited by" fact for one note (see {@link noteLastEdited}). */
@@ -143,10 +309,27 @@ export interface NoteLastEdited {
   at: string;
 }
 
+/** `GET /vaults/:id/access-board`: the access tree plus one person's mode per row. */
+export interface AccessBoardResponse extends AccessTreeResponse {
+  /** One char per item, aligned with folders ++ notes ++ files: e/v/n/m. */
+  modes: string;
+  totals?: { edit: number; view: number; none: number; mixed: number };
+  complete?: boolean;
+}
+
 /** Flat structure listing that powers the Access panel (see `listAccessTree`). */
 export interface AccessTreeResponse {
   folders: Array<{ id: string; path: string; color: string | null }>;
   notes: Array<{ id: string; relPath: string }>;
+  /**
+   * The vault's `files` rows — the tree binaries (pdf/docx/xlsx/mp4/…).
+   *
+   * A separate array rather than a `kind` on `notes`, because they are separate
+   * tables with different path columns; they become one leaf class in the
+   * panel's list, not in the wire shape. Empty from a server too old to send
+   * them, which simply lists no file rows.
+   */
+  files: Array<{ id: string; path: string }>;
 }
 
 export interface RegisteredFolder {
@@ -161,22 +344,223 @@ export interface RegisteredFolder {
   color?: string | null;
 }
 
+/**
+ * A `files` row — the server's generic "this vault path is a doc" record, the
+ * binary twin of {@link RegisteredNote}.
+ *
+ * It exists so a tree binary has a doc_id the ACL can resolve: `shares`,
+ * `effectivePermission` and `listReadableDocsInVault` all already walk these
+ * rows, so registering one is what makes a `.docx` in a shared folder obey the
+ * folder's grant instead of the blob store's path heuristic.
+ */
+export interface RegisteredFile {
+  id: string;
+  docId?: string;
+  vaultId?: string;
+  folderId?: string | null;
+  path: string;
+  /** Who registered the file. `GET /api/files` sends the raw column,
+   *  `created_by`; the camel spelling is accepted defensively. */
+  createdBy?: string | null;
+  created_by?: string | null;
+}
+
+/** Who registered the `files` row, or null when the server didn't say. */
+export function fileCreatedBy(f: { createdBy?: string | null; created_by?: string | null }): string | null {
+  return f.createdBy ?? f.created_by ?? null;
+}
+
 export interface Share {
   id: string;
-  resourceType?: "folder" | "file";
-  resource_type?: "folder" | "file";
+  // `vault` appears on exactly one row: the whole-vault Read-only posture that
+  // `GET /vaults/:id/locks` reports as a synthetic lock. Item shares are only
+  // ever folder/file.
+  resourceType?: "folder" | "file" | "vault";
+  resource_type?: "folder" | "file" | "vault";
   resourceId?: string;
   resource_id?: string;
   principalType?: "user" | "org";
   principal_type?: "user" | "org";
   principalId?: string;
   principal_id?: string;
-  permission: "view" | "edit" | "locked" | "denied";
+  permission: "view" | "edit" | "readonly" | "locked" | "denied";
   createdBy?: string;
   created_by?: string;
+  /**
+   * Why a synthetic lock exists. `billing_lapsed` marks the vault row the
+   * server adds when the vault's Team account lapsed (id `billing:<orgId>`):
+   * sync is read-only until the plan resumes, whatever the access settings say.
+   */
+  reason?: "billing_lapsed" | (string & {});
 }
 
 export type Permission = "view" | "edit";
+
+/** The vault-wide access mode (see {@link ContextApi.getTeamAccess}). */
+export type TeamAccessMode = "open" | "readonly" | "private";
+
+/** One org-principal share row sitting on a folder or note *inside* the vault. */
+export interface TeamAccessOverride {
+  id: string;
+  vaultId: string;
+  resourceType: "folder" | "file";
+  resourceId: string;
+  permission: "edit" | "view" | "readonly" | "locked" | "denied";
+}
+
+/**
+ * The vault's team access as one answer: the mode, the grant row backing it,
+ * and every per-item org row a whole-vault change would replace.
+ *
+ * One request rather than "list the vault's shares, then work the rest out"
+ * because the Access panel has to say how many settings it is about to clear
+ * *before* the user confirms, and a count assembled from several round trips
+ * is a count that can be wrong.
+ */
+export interface TeamAccess {
+  mode: TeamAccessMode;
+  /**
+   * The raw vault posture behind `mode`. `none` means the vault was never
+   * shared: it behaves like No access, but members keep the notes they wrote.
+   * Absent on servers that predate it; derived from `mode` then.
+   */
+  posture: TeamAccessPosture;
+  grantId: string | null;
+  overrides: TeamAccessOverride[];
+}
+
+export type TeamAccessPosture = "edit" | "view" | "sealed" | "none";
+
+/** A person's vault-wide level as the members overview reports it. */
+export type MemberAccessLevel = "edit" | "view" | "none" | "custom";
+
+/** One row of `GET /api/orgs/:orgId/members/overview`. */
+export interface MemberOverview {
+  userId: string;
+  memberId: string;
+  role: "owner" | "admin" | "member";
+  name: string | null;
+  email: string | null;
+  image: string | null;
+  joinedAt: string | null;
+  lastActiveAt: string | null;
+  /** Who invited them, when the server knows (absent on older servers). */
+  invitedBy?: MemberRef | null;
+  /** Only for owner/admin callers. */
+  access?: { level: MemberAccessLevel };
+}
+
+/** A person named inside another record (an inviter, a grantor). */
+export interface MemberRef {
+  userId: string;
+  name: string | null;
+  email: string | null;
+}
+
+/** One row of `GET /api/orgs/:orgId/members/:userId/activity`, newest first. */
+export type MemberActivityEvent =
+  | { kind: "joined"; at: string; invitedBy: MemberRef | null; rejoined?: boolean }
+  | { kind: "created"; at: string; docId: string; path: string }
+  | { kind: "edited"; at: string; docId: string; path: string }
+  | {
+      kind: "accessGranted";
+      at: string;
+      by: MemberRef | null;
+      permission: "edit" | "view" | "readonly" | "denied" | "locked";
+      resourceType: "folder" | "file" | "vault";
+      resourceId: string;
+      path: string | null;
+    };
+
+export interface InvitationOverview {
+  id: string;
+  email: string;
+  role: string;
+  status: string;
+  createdAt: string | null;
+  expiresAt: string | null;
+  access: TeamAccessMode | null;
+}
+
+export interface MembersOverview {
+  members: MemberOverview[];
+  invitations: InvitationOverview[];
+  canManage: boolean;
+}
+
+export interface InviteManyInput {
+  emails: string[];
+  role: "member" | "admin";
+  /** null = whatever the vault's New members setting says. */
+  access: TeamAccessMode | null;
+  /** Seamless keys B1: the vault key wrapped per invitee under a one-time
+   *  secret (sent with `X-Baalda-VK`). Omitted by a device without the key. */
+  vaultKeys?: {
+    vaultId: string;
+    generation: number;
+    items: Array<{ email: string; wrappedVk: string; secret: string }>;
+  };
+}
+
+export interface InviteManyResult {
+  email: string;
+  invitationId?: string;
+  emailed: boolean;
+  error?: string;
+  /** B1: the invited address's existing account key, when it has one. */
+  publicKey?: string | null;
+  inviteeUserId?: string | null;
+}
+
+/** B4: a secret-wrapped vault key of an invitation to the caller. */
+export interface InviteWrap {
+  invitationId: string;
+  generation: number;
+  wrappedVk: string;
+}
+export interface JoinWrap {
+  generation: number;
+  wrappedVk: string;
+}
+
+/** What a whole-vault mode change actually did. */
+export interface TeamAccessResult {
+  mode: TeamAccessMode;
+  /** Per-item org rows deleted. */
+  cleared: number;
+  /** Live sync sockets force-closed because the new mode revoked their access. */
+  disconnectedDocs: number;
+  /** False when the mode was already this and only the per-item rows went. */
+  postureChanged: boolean;
+}
+
+/** Access granted to members who join after this setting is changed. */
+export interface AccessDefault {
+  mode: TeamAccessMode;
+}
+
+export interface BulkAccessResource {
+  resourceType: "folder" | "file" | "vault";
+  resourceId: string;
+}
+
+export type BulkAccessAudience =
+  | { type: "org" }
+  | { type: "users"; userIds: string[] };
+
+export interface BulkAccessInput {
+  resources: BulkAccessResource[];
+  audience: BulkAccessAudience;
+  mode: TeamAccessMode;
+}
+
+export interface BulkAccessResult {
+  mode: TeamAccessMode;
+  resourcesChanged: number;
+  overridesCleared: number;
+  membersAffected: number;
+  disconnectedDocs: number;
+}
 
 /** One member's effective access to a resource, as resolved server-side. */
 export interface ResolvedMemberAccess {
@@ -193,6 +577,11 @@ export interface ResolvedMemberAccess {
 
 export interface AccessResolution {
   members: ResolvedMemberAccess[];
+}
+
+/** Effective mode across selected resource roots, their descendants, and users. */
+export interface AccessSummary {
+  mode: TeamAccessMode | "mixed";
 }
 
 /** An MCP access token (metadata only; the plaintext is shown once at creation). */
@@ -240,6 +629,127 @@ export interface BlobMeta {
   filename?: string | null;
   /** True when the upload deduped to an existing row (server-set). */
   deduped?: boolean;
+  /** `pending` until the bytes land (intent → PUT → complete); `ready` after.
+   *  Absent on servers that predate the transport. */
+  status?: "pending" | "ready";
+  /** Which store holds the bytes — `postgres` or `s3`. Informational: every
+   *  read path asks the SERVER, never this field, which store to talk to. */
+  storageProvider?: string | null;
+  /** The `files` row these bytes are, or null for an `attachments/` drop. The
+   *  server has always sent it; the desktop records it on download so a
+   *  teammate's binary gets a doc id here too (`attachments.ts ServerBlob`). */
+  docId?: string | null;
+}
+
+/** `GET /api/vaults/:vaultId/storage` — attachment/file bytes this vault holds
+ *  on the server. `limitBytes` null ⇒ this vault's plan has no storage cap. */
+export interface VaultStorageUsage {
+  usedBytes: number;
+  pendingBytes: number;
+  blobCount: number;
+  limitBytes: number | null;
+}
+
+/**
+ * The upload an intent hands back — the one shape both storage providers speak.
+ *
+ * `direct` is the whole security story: `true` means the URL is a third-party
+ * presign (S3/R2/MinIO) and MUST NOT carry our bearer; `false` means it is our
+ * own server and the `?t=` query IS the auth, so it must not carry the bearer
+ * either. Nothing in this flow ever sends `Authorization` to an upload URL —
+ * see {@link ApiClient.uploadBytesTo}.
+ */
+export interface BlobUploadSingle {
+  kind: "single";
+  method: string;
+  url: string;
+  /** Sent VERBATIM (content-type + content-length); the presign signs them. */
+  headers: Record<string, string>;
+  /** Epoch millis after which the URL is dead. */
+  expiresAt: number;
+  direct: boolean;
+}
+
+/** One presigned `UploadPart` URL. `partNumber` is 1-based, like S3's. */
+export interface BlobUploadPart {
+  partNumber: number;
+  url: string;
+}
+
+export interface BlobUploadMultipart {
+  kind: "multipart";
+  method: string;
+  uploadId: string;
+  /** Slice size: part n covers `[(n-1)*partBytes, n*partBytes)`. */
+  partBytes: number;
+  parts: BlobUploadPart[];
+  headers: Record<string, string>;
+  expiresAt: number;
+  direct: boolean;
+  /** Carried inside `partsUrl` too; kept for callers that rebuild the URL. */
+  token?: string;
+  /** Absolute; POST `{partNumbers}` here for fresh URLs when one expires. */
+  partsUrl: string;
+}
+
+export type BlobUpload = BlobUploadSingle | BlobUploadMultipart;
+
+/**
+ * The `files` row a one-step upload (`files-with-bytes`) registered or bound
+ * to. `created`: this upload made it. `adopted`: the path already had a row
+ * (possibly under another id) and these bytes are that file's. `pending`: the
+ * intent recorded the registration; `complete` creates the row.
+ */
+export interface OneStepFileRow {
+  id: string;
+  docId: string;
+  folderId: string | null;
+  path: string;
+  status: "pending" | "created" | "adopted";
+}
+
+/** `register` on a blob intent: create the `files` row WITH the bytes. */
+export interface BlobIntentRegister {
+  docId: string;
+  relPath: string;
+  folderId?: string | null;
+}
+
+/** The server already holds these bytes — send nothing. */
+export interface BlobIntentDeduped {
+  deduped: true;
+  blob: BlobMeta;
+  /** One-step upload only: the row these bytes now belong to. */
+  file?: OneStepFileRow;
+}
+
+/** The server wants the bytes, and this is where to PUT them. */
+export interface BlobIntentUpload {
+  deduped?: false;
+  blobId: string;
+  upload: BlobUpload;
+  /** Absolute URL to POST once every byte is in (bearer REQUIRED — ours). */
+  completeUrl: string;
+  /** One-step upload only: `pending` until `complete`, or `adopted` when the
+   *  path already had a row (bind to that id). */
+  file?: OneStepFileRow;
+}
+
+export type BlobIntent = BlobIntentDeduped | BlobIntentUpload;
+
+/** Body of `POST {completeUrl}`: `{}` for single, parts + id for multipart. */
+export interface BlobCompleteBody {
+  uploadId?: string;
+  parts?: Array<{ partNumber: number; etag: string }>;
+}
+
+/** Where to GET an attachment's bytes right now. */
+export interface BlobDownloadTarget {
+  url: string;
+  /** Epoch millis, or null when the URL does not expire (our own route). */
+  expiresAt: number | null;
+  /** `true` = a third-party presign: fetch it with NO `Authorization` at all. */
+  direct: boolean;
 }
 
 // ---- Versioning (per-note history + vault checkpoints) --------------------
@@ -264,6 +774,58 @@ export interface NoteVersion {
   size: number;
 }
 
+/** One `GET /api/vaults/:id/shrink-events` row. */
+export interface ShrinkEvent {
+  versionId: number;
+  docId: string;
+  relPath: string;
+  capturedAt: string;
+  beforeChars: number;
+  afterChars: number;
+  deleted: boolean;
+}
+
+export interface ShrinkEventListing {
+  items: ShrinkEvent[];
+  truncated: boolean;
+  /** `afterChars` is the note's length now, not right after the shrink. */
+  afterIsCurrent: boolean;
+}
+
+/** An invitation that expired unaccepted, as the Activity feed lists it (#268). */
+export interface InvitationExpiry {
+  invitationId: string;
+  organizationId: string;
+  email: string;
+  role: string;
+  expiredAt: string;
+  inviterId: string;
+  inviterName: string | null;
+}
+
+/** One time the shrink burst brake paused someone's sync in a vault (#252):
+ *  `GET /api/vaults/:id/shrink-brakes`. Owners/admins get every member's;
+ *  anyone else only their own. */
+export interface ShrinkBrakeEvent {
+  id: string;
+  userId: string;
+  userName: string | null;
+  noteCount: number;
+  engagedAt: string;
+  heldUntil: string;
+  releasedAt: string | null;
+  releasedBy: string | null;
+  /** Not released and not yet lapsed, as far as the server's record knows. */
+  held: boolean;
+}
+
+export interface ShrinkBrakeListing {
+  items: ShrinkBrakeEvent[];
+  /** True for owners/admins: the listing is the whole vault's and each held
+   *  row may be released. */
+  canRelease: boolean;
+}
+
 export interface NoteVersionDetail extends NoteVersion {
   content: string;
 }
@@ -277,6 +839,21 @@ export interface VaultCheckpoint {
   createdBy: string | null;
   createdByName: string | null;
   noteCount: number;
+}
+
+/** How often this vault takes checkpoints (absent from older servers, which
+ *  means daily automatic ones and unlimited manual ones). */
+export interface CheckpointSchedule {
+  auto: boolean;
+  /** Days between manual checkpoints, or null for no limit. */
+  manualEveryDays: number | null;
+  /** When the next manual checkpoint may be made, or null if it may be now. */
+  nextManualAt: string | null;
+}
+
+export interface CheckpointList {
+  checkpoints: VaultCheckpoint[];
+  schedule: CheckpointSchedule | null;
 }
 
 /** What a whole-vault revert did. Attachments/blobs are never touched. */
@@ -323,8 +900,115 @@ export interface BillingPlan {
  *  server has no billing configured — a self-host runs with unlimited limits. */
 export interface BillingConfig {
   enabled: boolean;
+  /** `team` = per-seat account billing; `vault` (or absent) = an older server
+   *  that bills each vault separately through `plans`. */
+  model?: "vault" | "team";
+  free?: { people: number; syncedVaults: number };
+  team?: {
+    minSeats: number;
+    currency: string;
+    /** `perSeat` in minor units (cents). */
+    prices: { interval: "month" | "year"; perSeat: number }[];
+  };
+  /** Old servers (`model` absent or `vault`). */
   plans?: BillingPlan[];
-  freeLimits?: { vaultsPerUser: number; membersPerVault: number };
+  freeLimits?: { vaultsPerUser: number; membersPerVault: number; notesPerVault?: number };
+}
+
+export type BillingStatus = "none" | "active" | "past_due" | "canceled";
+
+/** `GET /api/billing/account`: the caller's billing account (Team model). */
+/** One live legacy (pre-Team) subscription; `amount` in minor units. */
+export interface LegacyCharge {
+  amount: number;
+  currency: string;
+  interval: "month" | "year";
+  organizationId: string | null;
+  vaultName: string | null;
+  status: string;
+}
+
+export interface MyBillingAccount {
+  id: string;
+  status: BillingStatus;
+  plan: "free" | "team";
+  interval: "month" | "year" | null;
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  /** A live subscription on a pre-Team product: unlimited people, no seats to
+   *  change. Absent on older servers (`isLegacyPlan` infers it). */
+  legacyPlan?: boolean;
+  /** Every live legacy subscription on the account (one per old Pro vault), sent
+   *  only to a manager of a legacy account. Absent on older servers. */
+  legacyCharges?: LegacyCharge[];
+  seats: {
+    /** null on Free (no seats bought). */
+    purchased: number | null;
+    used: number;
+    reserved: number;
+    pendingDecrease: { to: number; effectiveAt: string } | null;
+  };
+  /** Minor units; `charged < list` is a legacy (grandfathered) price. */
+  price: {
+    list: number;
+    charged: number;
+    discountName: string | null;
+    /** How long the discount lasts; absent on servers before migration 055. */
+    discountDuration?: "once" | "repeating" | "forever" | null;
+    discountDurationMonths?: number | null;
+    /** What the next renewal costs (list once a one-time discount is spent). */
+    renewalAmount?: number | null;
+  } | null;
+  people: {
+    userId: string;
+    name: string;
+    email: string;
+    vaults: string[];
+    /** Newer servers: the person's picture and last activity across the account's vaults. */
+    image?: string | null;
+    lastSeenAt?: string | null;
+  }[];
+  vaults: { orgId: string; name: string }[];
+  /** Vaults with pending invitations that hold seats; counts sum to
+   *  `seats.reserved`. Absent on older servers. */
+  invitedByVault?: { orgId: string; name: string; count: number }[];
+  limits: { people: number | null; vaults: number | null; fileSync: boolean };
+  lapsed: boolean;
+  canManage: boolean;
+  complimentaryUntil: string | null;
+}
+
+export interface BillingUsageVault {
+  orgId: string;
+  name: string;
+  people: number;
+  notes: number;
+  storageBytes: number;
+  files: number;
+}
+
+/** `GET /api/billing/account/usage`. */
+export interface BillingUsage {
+  vaults: BillingUsageVault[];
+  totals: { people: number; notes: number; storageBytes: number; files: number; vaults?: number };
+  limits: MyBillingAccount["limits"];
+}
+
+/** `GET /api/billing/account/seats/preview?seats=n`. Minor units (cents); any
+ *  amount the server cannot work out is null. */
+export interface SeatPreview {
+  currentSeats: number | null;
+  newSeats: number;
+  /** Charged per period after the change, discount kept. */
+  newAmount: number | null;
+  perSeat: number | null;
+  currency: string | null;
+  interval: "month" | "year" | null;
+  /** Estimated prorated charge today for an increase. */
+  proratedNow: number | null;
+  currentPeriodEnd: string | null;
+  estimated: boolean;
+  floor?: number;
 }
 
 /** A single vault's subscription state + seat usage. */
@@ -333,11 +1017,161 @@ export interface OrgBilling {
   status: "none" | "active" | "past_due" | "canceled";
   currentPeriodEnd: string | null;
   cancelAtPeriodEnd: boolean;
+  /** Cadence + price of the live subscription, straight from the provider's
+   *  snapshot — so a row can be priced without matching it back to a
+   *  `BillingPlan`. All three are null on a vault with no subscription
+   *  (#109). `amount` is minor units, like {@link BillingPlan.amount}. */
+  interval: "month" | "year" | null;
+  amount: number | null;
+  currency: string | null;
   /** `limit: null` = unlimited (paid). */
   seats: { members: number; pendingInvitations: number; limit: number | null };
+  /** Team model only (`BILLING_MODEL=team`): the plan of the billing account
+   *  this vault is attached to, and that account's id. Absent on servers still
+   *  on the per-vault model, where `plan` is the whole answer. */
+  accountPlan?: "free" | "team";
+  accountId?: string | null;
 }
 
+/** One row of the Subscriptions list: a vault the caller belongs to. */
+export interface MyBillingVault {
+  orgId: string;
+  name: string;
+  role: "owner" | "admin" | "member";
+  plan: "free" | "pro";
+  status: "none" | "active" | "past_due" | "canceled";
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  interval: "month" | "year" | null;
+  amount: number | null;
+  currency: string | null;
+  seats: { members: number; pendingInvitations: number; limit: number | null };
+  /** The vault's owner — who to point a member at when they can't act. */
+  billingOwner: { userId: string; name: string; email: string } | null;
+  /** Owner or admin: may upgrade this vault or open its portal. */
+  canManage: boolean;
+  /** Owner AND the subscription is live: may move it to another vault. */
+  canTransfer: boolean;
+  /** Team model only (`BILLING_MODEL=team`): the plan of the billing account
+   *  this vault is attached to, and that account's id. Absent on servers still
+   *  on the per-vault model, where `plan` is the whole answer. */
+  accountPlan?: "free" | "team";
+  accountId?: string | null;
+}
+
+/**
+ * A subscription whose vault is gone. Deleting a vault cancels its
+ * subscription at the period end rather than instantly, so the paid time the
+ * user already bought survives the vault — and has to be reachable from
+ * somewhere (#109/#111). The server keeps the row as a tombstone; this is it.
+ */
+export interface OrphanedSubscription {
+  orgId: string;
+  orgName: string | null;
+  deletedAt: string;
+  status: "active" | "past_due";
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  interval: "month" | "year" | null;
+  amount: number | null;
+  currency: string | null;
+}
+
+/**
+ * Every subscription the caller can see or act on, in one shot. The per-vault
+ * `GET /api/billing/orgs/:orgId` can't answer this: role is only known for the
+ * active org and plan is only known one org at a time.
+ */
+export interface MyBilling {
+  vaults: MyBillingVault[];
+  orphaned: OrphanedSubscription[];
+  freeLimits: {
+    vaultsPerUser: number;
+    membersPerVault: number;
+    notesPerVault?: number;
+    /** Owned vaults with no subscription — what counts against the cap. */
+    freeVaultsUsed: number;
+  };
+}
+
+/** What `DELETE /api/orgs/:orgId` reports back. */
+export interface VaultDeleteResult {
+  deleted: boolean;
+  vaults: number;
+  docs: number;
+  /** Set when the deleted vault carried a live subscription: the server told
+   *  the provider to stop at the period end, and this is when that is. */
+  subscription: { cancelAtPeriodEnd: boolean; currentPeriodEnd: string | null } | null;
+}
+
+/**
+ * What `GET /api/orgs/:orgId/unsync-preview` reports: everything the server
+ * would destroy if this vault were made local only.
+ *
+ * `members` EXCLUDES the owner — it is the number of people who lose access,
+ * which is the sentence the confirm dialog has to say out loud.
+ */
+export interface UnsyncPreview {
+  orgName: string;
+  notes: number;
+  files: number;
+  folders: number;
+  attachmentBytes: number;
+  members: number;
+  publicLinks: number;
+  mcpTokens: number;
+  checkpoints: number;
+  /** The vault's live subscription, when it has one — the period-end sentence. */
+  subscription: {
+    status: string;
+    currentPeriodEnd: string | null;
+    cancelAtPeriodEnd: boolean;
+  } | null;
+}
+
+/** What `POST /api/orgs/:orgId/unsync` reports back once the server copy is gone. */
+export interface UnsyncResult {
+  unsynced: boolean;
+  notes: number;
+  files: number;
+  members: number;
+  /** Set when the vault carried a live subscription: cancelled at the period end. */
+  subscription: { cancelAtPeriodEnd: boolean; currentPeriodEnd: string | null } | null;
+}
+
+/**
+ * `GET /api/orgs/:orgId/status`, as a VALUE rather than an exception.
+ *
+ * The three answers mean three different things to the folder on disk, and the
+ * caller has to tell them apart: `vault-not-found` is "this vault was made local
+ * only (or deleted) — offer the fix", `not-a-member` is "it is somebody else's
+ * folder — keep refusing", and `unknown` is "we could not ask", which must stay
+ * silent (fail closed). Returning them instead of throwing is what keeps that
+ * distinction from collapsing into one `catch`.
+ */
+export type OrgStatus =
+  | { kind: "member"; orgId: string; name: string; role: string }
+  | { kind: "not-a-member" }
+  | { kind: "vault-not-found" }
+  | { kind: "unknown" };
+
 /** A rejected server response — carries the HTTP status for callers to branch on. */
+/** `GET /api/oauth/consents/:id`: a claude.ai / ChatGPT connection to finish. */
+export interface OAuthConsentRequest {
+  id: string;
+  clientId: string;
+  /** The connector's display name ("Claude"). */
+  app: string;
+  organizationId: string;
+  vaultName: string;
+  /** The vault's collections this device must present keys for. */
+  vaultIds: string[];
+  approved: boolean;
+  /** The connector's registered redirect hosts (absent on older servers). The
+   *  name above is self-chosen by whoever registered the client; this is not. */
+  redirectHosts?: string[];
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -348,6 +1182,263 @@ export class ApiError extends Error {
     this.name = "ApiError";
   }
 }
+
+/**
+ * Did the server refuse this call because THIS build is below its minimum
+ * supported version (`426 client_outdated`, issue #251)? The server answers it
+ * only on the routes that hand out the ability to push note content, so a
+ * caller seeing it should stop syncing and ask for an update — retrying the
+ * same build can never succeed. Nothing is lost by stopping: local edits stay
+ * on disk and in the local CRDT, and the updated build pushes them.
+ */
+export function isClientOutdated(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 426 && errorCodeOf(e.body) === CLIENT_OUTDATED_CODE;
+}
+
+type ClientOutdatedListener = (info: { minVersion: string | null }) => void;
+const clientOutdatedListeners = new Set<ClientOutdatedListener>();
+
+/**
+ * Subscribe to "the server says this build is too old to sync". Fired once per
+ * refused request, from whichever call met the refusal first, so the UI can
+ * show "Update required" without every sync path having to route it there.
+ * Returns the unsubscribe.
+ */
+export function onClientOutdated(listener: ClientOutdatedListener): () => void {
+  clientOutdatedListeners.add(listener);
+  return () => clientOutdatedListeners.delete(listener);
+}
+
+function notifyClientOutdated(body: unknown): void {
+  if (errorCodeOf(body) !== CLIENT_OUTDATED_CODE) return;
+  const raw = (body as { minVersion?: unknown } | null)?.minVersion;
+  const minVersion = typeof raw === "string" ? raw : null;
+  for (const l of clientOutdatedListeners) {
+    try {
+      l({ minVersion });
+    } catch {
+      /* a listener's failure must not turn into the request's */
+    }
+  }
+}
+
+/**
+ * A blob-transport call the server refused, carrying the machine-readable
+ * `code` the flow branches on (`storage_limit_reached`, `attachment_too_large`,
+ * `upload_incomplete`, …) next to the status.
+ *
+ * An `ApiError` subclass so every existing `catch (e) { if (e instanceof
+ * ApiError) }` keeps working — the code is the only thing added, and it is read
+ * through {@link blobErrorCode} so a plain `ApiError` from an older path still
+ * answers.
+ */
+export class BlobTransportError extends ApiError {
+  constructor(
+    status: number,
+    public code: string | null,
+    message: string,
+    body?: unknown,
+  ) {
+    super(status, message, body);
+    this.name = "BlobTransportError";
+  }
+}
+
+/**
+ * The server's error code for a failed blob call, or null when it named none.
+ * Reads `code` first and `error` second, which is how the server's JSON bodies
+ * spell it in the two generations of these routes.
+ */
+export function blobErrorCode(e: unknown): string | null {
+  if (e instanceof BlobTransportError) return e.code;
+  if (e instanceof ApiError) return errorCodeOf(e.body);
+  return null;
+}
+
+/**
+ * The server's plain-words refusal when a key-churn brake answered
+ * (`429 rate_limited` on `PUT /api/me/keys`, `POST /api/me/devices`, a device
+ * approval), else null. Nothing was stored server-side; retrying later works.
+ */
+export function rateLimitedMessage(e: unknown): string | null {
+  if (!(e instanceof ApiError) || e.status !== 429 || errorCodeOf(e.body) !== "rate_limited") return null;
+  const b = e.body as { error?: unknown } | undefined;
+  return typeof b?.error === "string" && b.error ? b.error : "Too many security key changes. Try again later.";
+}
+
+function errorCodeOf(body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const b = body as { code?: unknown; error?: unknown };
+  if (typeof b.code === "string") return b.code;
+  if (typeof b.error === "string") return b.error;
+  return null;
+}
+
+/**
+ * A refused bulk-sync call, carrying the machine-readable `code` the engine
+ * branches on next to the status.
+ *
+ * An {@link ApiError} subclass, like {@link BlobTransportError}, so every
+ * existing `catch (e) { if (e instanceof ApiError) }` keeps working.
+ * `retryAfterMs` is set only for a 503 `bootstrap_busy`, where the server told
+ * us when to come back.
+ */
+export class BulkApiError extends ApiError {
+  constructor(
+    status: number,
+    public code: string | null,
+    message: string,
+    body?: unknown,
+    public retryAfterMs: number | null = null,
+  ) {
+    super(status, message, body);
+    this.name = "BulkApiError";
+  }
+}
+
+/**
+ * The error code for a failed bulk call.
+ *
+ * The server's own `code` wins; the three statuses below are what a bare status
+ * MEANS on these routes. `server_too_old` in particular is never sent by anyone
+ * — it is what a 404 on a route this build requires means, and it is terminal.
+ */
+function bulkCodeFor(status: number, body: unknown): string | null {
+  const code = errorCodeOf(body);
+  if (code) return code;
+  if (status === 404) return "server_too_old";
+  if (status === 410) return "session_expired";
+  if (status === 503) return "bootstrap_busy";
+  return null;
+}
+
+/** Re-type a failed bulk call so callers can branch on the server's `code`. */
+function asBulkError(e: unknown): unknown {
+  if (e instanceof BulkApiError) return e;
+  if (e instanceof ApiError) {
+    return new BulkApiError(e.status, bulkCodeFor(e.status, e.body), e.message, e.body);
+  }
+  return e;
+}
+
+/**
+ * The bulk `code` an error carries, or null (a network failure names none).
+ *
+ * Also reads a plain `code` property off anything else thrown, because the
+ * engine's own modules (`bootstrap.ts`, `docBatchPush.ts`) branch on exactly
+ * that field and their injected transports are not required to be an
+ * {@link ApiError} — the code is the contract, not the class.
+ */
+export function bulkErrorCode(e: unknown): string | null {
+  if (e instanceof BulkApiError) return e.code;
+  if (e instanceof ApiError) return bulkCodeFor(e.status, e.body);
+  const code = (e as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code ? code : null;
+}
+
+/** "This server does not have the bulk engine" — the one terminal verdict. */
+export function isServerTooOld(e: unknown): boolean {
+  return bulkErrorCode(e) === "server_too_old";
+}
+
+/** `Retry-After` as milliseconds: seconds, or an HTTP date, or null. */
+function retryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, Math.round(seconds * 1000));
+  const at = Date.parse(header);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, at - Date.now());
+}
+
+function numHeader(v: string | null): number {
+  const n = v ? Number(v) : 0;
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** One `GET …/bootstrap/:sessionId` page: bytes plus the three headers. */
+export interface BootstrapPageResponse {
+  /** The page, already un-gzipped by the fetch stack. Decode with
+   *  `sync/bootstrapCodec.ts`. */
+  bytes: Uint8Array;
+  /** Cursor for the NEXT page; `null` (header absent) ⇒ drained. */
+  nextCursor: number | null;
+  /** Docs in this page, as the server counted them. */
+  docs: number;
+  /** Uncompressed payload bytes, for the progress subtitle. */
+  uncompressedBytes: number;
+}
+
+/**
+ * Notes per page in {@link ApiClient.listNoteRegistryPaged}.
+ *
+ * 1000 rows is a body of a few hundred KB — small enough that a page parses in
+ * one frame, large enough that a 6,000-note vault is six round trips rather
+ * than sixty. Omitting `limit` entirely is what an OLD server does with it, and
+ * that is exactly today's unpaged behaviour.
+ */
+export const REGISTRY_PAGE_LIMIT = 1000;
+
+/**
+ * A server address didn't check out. Thrown by {@link ApiClient.health}, which
+ * is the one probe in this file that must NOT fail closed.
+ *
+ * The two kinds are worth telling apart because they send the user to different
+ * places: `unreachable` means look at the URL, the DNS and whether the box is
+ * up; `not-baalda` means the address is fine and something else is answering on
+ * it (a proxy's default page, a different app, the wrong port).
+ */
+export class ServerCheckError extends Error {
+  constructor(
+    public kind: "unreachable" | "not-baalda",
+    message: string,
+  ) {
+    super(message);
+    this.name = "ServerCheckError";
+  }
+}
+
+/** How long a server gets to answer `/health` before we call it unreachable. */
+export const HEALTH_TIMEOUT_MS = 6000;
+
+/**
+ * Most doc ids one {@link ContextApi.accessCheck} call may carry.
+ *
+ * MIRRORS the server's `ACCESS_CHECK_MAX` (`http/routes/registry.ts`), which
+ * answers 400 above it. The two cannot import from each other — separate
+ * packages — so the equality is pinned by a test that reads the server source
+ * (`__tests__/accessCheckBound.test.ts`). Drift here is not cosmetic: the client
+ * treats a 400 as "no answer", so one oversized request turns every revocation
+ * on a vault this large into a permanent, repeating failure.
+ */
+export const ACCESS_CHECK_MAX = 2000;
+
+/**
+ * Abort an access-check that has not answered in this long.
+ *
+ * The server resolves each id through `effectivePermission`, so its work grows
+ * with the list. Generous enough for a full 2000-id slice on a remote database,
+ * short enough that a wedged proxy does not hold up the pull that decides
+ * whether files leave the disk. A timeout reads as "no answer", which removes
+ * nothing.
+ */
+export const ACCESS_CHECK_TIMEOUT_MS = 30_000;
+
+/**
+ * Per request (one page) for the folder + note registry listings. Every
+ * registry pull is serialized behind the one before it (`registry.pull`'s
+ * chain), so a listing that never answers parks EVERY later pull behind it —
+ * new local notes then never register while content edits, which ride their
+ * own sockets, keep syncing. A timeout turns that into a failed pull the next
+ * trigger retries.
+ */
+export const REGISTRY_LISTING_TIMEOUT_MS = 120_000;
+
+// The two things a person can actually act on. Kept as constants so the dialog
+// and Settings → Connection say the same words for the same failure.
+const UNREACHABLE_MESSAGE =
+  "Couldn't reach that server. Check the URL and that it's online.";
+const NOT_BAALDA_MESSAGE = "That address answered, but it isn't a Baalda server.";
 
 type FetchLike = typeof fetch;
 
@@ -376,11 +1467,178 @@ function newClientId(): string {
  * Stateful client: holds the base URL + bearer token in memory. The auth
  * manager owns persistence (keychain) and calls `setToken`.
  */
+// ---- Client-held vault keys (W3) -------------------------------------------
+
+/** Carries the base64 vault key on every content request for a keyed vault. */
+export const VAULT_KEY_HEADER = "X-Baalda-VK";
+/** 409 code for a content request to a keyed vault without a valid key. */
+export const KEY_REQUIRED_CODE = "key_required";
+
+/** The path of an absolute or relative URL ("" when unparseable). */
+function pathOf(url: string): string {
+  try {
+    return new URL(url, "http://x").pathname;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * `url` with this build's `clientVersion` query parameter, for every call to
+ * our own API (Better Auth's `/api/auth/*` excepted). A server holding a KEYED
+ * vault treats a request that does not report a vault-key version as a build
+ * that predates vault keys and answers `426 client_outdated` instead of
+ * `409 key_required` (`server src/crypto/transport.ts`), so every route that
+ * can reach a keyed vault must carry it, not only the content-write ones of
+ * #251. A query parameter, not a header: an older server ignores it.
+ */
+export function withClientVersion(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url, "http://x");
+  } catch {
+    return url;
+  }
+  const path = parsed.pathname;
+  if (!path.startsWith("/api/") || path.startsWith("/api/auth/")) return url;
+  if (parsed.searchParams.has(CLIENT_VERSION_PARAM)) return url;
+  const param = `${CLIENT_VERSION_PARAM}=${encodeURIComponent(CLIENT_VERSION)}`;
+  const hash = url.indexOf("#");
+  const head = hash === -1 ? url : url.slice(0, hash);
+  const tail = hash === -1 ? "" : url.slice(hash);
+  return `${head}${head.includes("?") ? "&" : "?"}${param}${tail}`;
+}
+
+/** The collection id of a `/api/vaults/:vaultId/...` path, else null. */
+export function vaultIdFromPath(path: string): string | null {
+  const m = /^\/api\/vaults\/([^/?#]+)\//.exec(path);
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return null;
+  }
+}
+
+export interface VaultKeyInit {
+  vkCheck: string;
+  generation: number;
+  sealedVkForSelf: string;
+}
+export interface VaultKeyWrap {
+  generation: number;
+  sealedVk: string;
+}
+interface MyVaultKeysBody {
+  vkCheck: string;
+  generation: number;
+  wraps: VaultKeyWrap[];
+  /** Every older plaintext copy has been checked and removed on the server.
+   * Undefined: the server does not report it (older server). */
+  fullyEncrypted?: boolean;
+  /** Other current members holding this generation's key (undefined: older server). */
+  otherKeyHolders?: number;
+  /** The server keeps launch recovery copies (crypto/key-recovery.ts). */
+  recoveryNet?: boolean;
+}
+/** A pending answer may still carry `vkCheck`, so a restore can verify a typed key. */
+export type MyVaultKeys =
+  /** The server's DEFINITIVE "this vault has no key" (`{keyed: false}`). */
+  /** `encryptionRequested`: an owner/admin opted this vault in (or it was created
+   * with vault keys on). `conversionAllowed` already includes it. Undefined: the
+   * server predates opt-in (no request route). */
+  | {
+      keyed: false;
+      pending: false;
+      conversionAllowed: boolean;
+      encryptionRequested?: boolean;
+      /** Other current members with an account key (conversion safety rule;
+       *  undefined on a server that does not report it). */
+      otherMembersWithKeys?: number;
+      /** The launch safety net is on: a lost laptop is recoverable by Baalda. */
+      recoveryNet?: boolean;
+      /** Another owner/admin's device started converting and sealed the
+       *  pending key to this account (base64 sealed box). */
+      pendingShare?: string;
+    }
+  | { keyed: true; pending: true; vkCheck?: string; generation?: number }
+  | ({ keyed: true; pending: false } & MyVaultKeysBody);
+export interface VaultKeyRequest {
+  userId: string;
+  publicKey: string;
+  requestedAt: string;
+  keyChangedAt?: string | null;
+  /** `missing`: a current member with an account key and no wrap for the
+   *  current generation who filed no request (sealed exactly like a request).
+   *  Absent on older servers. */
+  kind?: "request" | "missing";
+}
+export interface VaultKeyWrapPost extends VaultKeyWrap {
+  userId: string;
+}
+/** A credential that must keep working after conversion (MCP token, OAuth grant, public link). */
+export interface AllowlistCandidate {
+  kind: string;
+  id: string;
+  hash: string;
+  /** Owner/admin review (newer servers): token name, OAuth app name, or note path. */
+  label?: string | null;
+  /** Who made it (display name, else email). */
+  createdBy?: string | null;
+  createdAt?: string | null;
+  lastUsedAt?: string | null;
+  /** Already allow-listed for this vault. */
+  allowed?: boolean;
+  /** Unchecked in an earlier review: never allow-listed. */
+  excluded?: boolean;
+}
+export interface AllowlistEntry {
+  kind: string;
+  id: string;
+  /** base64 HMAC-SHA256(VK, utf8(id) || utf8(hash)). */
+  mac: string;
+}
+
+export interface PendingDevice {
+  deviceId: string;
+  publicKey: string;
+  requestedAt?: string;
+  /** e.g. "MacBook Pro", when the server knows. */
+  name?: string | null;
+}
+export interface AccountKeysBody {
+  publicKey: string;
+  /** The account key wrapped under the password unlock key (seamless keys F). */
+  privWrappedPassword?: string | null;
+  /** This account's approved, non-revoked device rows. Each approval involves
+   *  an existing computer plus the approved one, so computers = length + 1. */
+  devices?: Array<{ deviceId: string; privWrapped?: string | null }>;
+  /** Optional since the owner decision: the VAULT key is the recovery path. */
+  privWrappedRecovery?: string;
+}
+
 export class ApiClient {
   private baseUrl: string;
   private token: string | null;
   private readonly fetchImpl: FetchLike;
   private readonly clientId: string;
+  /**
+   * Does THIS server speak the intent → PUT → complete upload flow?
+   *
+   * Tri-state on purpose: `null` = not asked yet (try it), `true` = yes,
+   * `false` = it answered 404, so every later upload goes straight to the
+   * legacy `POST /api/vaults/:id/blobs` without paying for a 404 first. The
+   * answer belongs to ONE server, so {@link setBaseUrl} clears it — a user who
+   * switches from the managed instance to a self-host they run from last
+   * spring must not inherit the managed instance's capabilities.
+   */
+  private blobIntentSupported: boolean | null = null;
+  /** Same tri-state for `GET /api/blobs/:id/url` (presigned download). */
+  private blobUrlSupported: boolean | null = null;
+  /** Same tri-state for `PUT /api/vaults/:id/blobs/:id/text` (extracted text).
+   *  A 404 here means the server predates the route OR has forgotten the blob;
+   *  either way there is nothing to retry, so the whole session stops asking. */
+  private blobTextSupported: boolean | null = null;
 
   constructor(opts: ApiClientOptions = {}) {
     this.baseUrl = stripTrailingSlash(opts.baseUrl ?? DEFAULT_SERVER_URL);
@@ -407,7 +1665,14 @@ export class ApiClient {
     return this.baseUrl;
   }
   setBaseUrl(url: string): void {
-    this.baseUrl = stripTrailingSlash(url);
+    const next = stripTrailingSlash(url);
+    if (next !== this.baseUrl) {
+      // Capabilities are per server (see `blobIntentSupported`).
+      this.blobIntentSupported = null;
+      this.blobUrlSupported = null;
+      this.blobTextSupported = null;
+    }
+    this.baseUrl = next;
   }
   getToken(): string | null {
     return this.token;
@@ -416,18 +1681,393 @@ export class ApiClient {
     this.token = token;
   }
 
+  /**
+   * Client-held vault keys (W3): returns the base64 VK for a keyed vault whose
+   * key this device holds, else null. Synchronous (reads the session cache).
+   * The header value is a secret: never log request headers.
+   */
+  private vaultKeyResolver: ((vaultId: string) => string | null) | null = null;
+  setVaultKeyResolver(fn: ((vaultId: string) => string | null) | null): void {
+    this.vaultKeyResolver = fn;
+  }
+  /** On 409 `key_required`: make the vault key ready; true = retry once. */
+  private keyRequiredHandler: ((vaultId: string) => Promise<boolean>) | null = null;
+  setKeyRequiredHandler(fn: ((vaultId: string) => Promise<boolean>) | null): void {
+    this.keyRequiredHandler = fn;
+  }
+  /** The verified base64 VK for a vault (vault channel `hello.vk`, per-doc
+   *  token suffix), or null. A secret: never log it. */
+  vaultKeyFor(vaultId: string): string | null {
+    return this.vaultKeyResolver ? this.vaultKeyResolver(vaultId) : null;
+  }
+  /** Ask the key session to make a vault's key ready (a socket `key_required`). */
+  async ensureVaultKeyFor(vaultId: string): Promise<boolean> {
+    return this.keyRequiredHandler ? this.keyRequiredHandler(vaultId).catch(() => false) : false;
+  }
+
+  /** `X-Baalda-VK` for a vault-scoped path, or nothing. */
+  private vaultKeyHeaders(path: string, scope?: string | null): Record<string, string> {
+    const id = scope ?? vaultIdFromPath(path);
+    const vk = id && this.vaultKeyResolver ? this.vaultKeyResolver(id) : null;
+    return vk ? { [VAULT_KEY_HEADER]: vk } : {};
+  }
+
+  // ---- Client-held vault keys (W3) ----------------------------------------
+
+  /** 200 = keyed now; 409 = already keyed (caller falls through to `mine`). */
+  async initVaultKeys(
+    vaultId: string,
+    body: VaultKeyInit,
+  ): Promise<"created" | "already-keyed" | "not-ready" | "pending-mismatch"> {
+    try {
+      await this.request("POST", `/api/vaults/${encodeURIComponent(vaultId)}/keys/init`, { body });
+      return "created";
+    } catch (e) {
+      const code = e instanceof ApiError && e.status === 409 ? (e.body as { code?: string })?.code : undefined;
+      if (code === "already_keyed") return "already-keyed";
+      if (code === "conversion_not_ready") return "not-ready";
+      if (code === "pending_mismatch") return "pending-mismatch";
+      throw e;
+    }
+  }
+
+  async getMyVaultKeys(vaultId: string): Promise<MyVaultKeys> {
+    const { data, status } = await this.request<Partial<MyVaultKeysBody> & { keyed?: boolean; pending?: boolean }>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/mine`,
+      { query: { [CLIENT_VERSION_PARAM]: CLIENT_VERSION } },
+    );
+    // Only an explicit `keyed: false` means unkeyed; anything unexpected throws
+    // (the caller then does nothing rather than keying a vault that has a key).
+    if (data?.keyed === false && status === 200) {
+      // Rollout gate for converting an existing vault: absent ⇒ false.
+      // `encryptionRequested` absent ⇒ undefined: a server without opt-in
+      // (no migration 081) has no request route, so the UI offers nothing.
+      const d = data as {
+        conversionAllowed?: unknown;
+        encryptionRequested?: unknown;
+        otherMembersWithKeys?: unknown;
+        recoveryNet?: unknown;
+        pendingShare?: unknown;
+      };
+      return {
+        keyed: false,
+        pending: false,
+        conversionAllowed: d.conversionAllowed === true,
+        encryptionRequested: typeof d.encryptionRequested === "boolean" ? d.encryptionRequested : undefined,
+        otherMembersWithKeys: typeof d.otherMembersWithKeys === "number" ? d.otherMembersWithKeys : undefined,
+        recoveryNet: d.recoveryNet === true,
+        ...(typeof d.pendingShare === "string" ? { pendingShare: d.pendingShare } : {}),
+      };
+    }
+    if (status === 202 || data?.pending) {
+      return { keyed: true, pending: true, vkCheck: data?.vkCheck, generation: data?.generation };
+    }
+    if (typeof data?.vkCheck !== "string" || typeof data.generation !== "number" || !Array.isArray(data.wraps)) {
+      throw new ApiError(status, "Unexpected vault key answer", data);
+    }
+    return {
+      keyed: true,
+      pending: false,
+      vkCheck: data.vkCheck,
+      generation: data.generation,
+      wraps: data.wraps,
+      fullyEncrypted: typeof data.fullyEncrypted === "boolean" ? data.fullyEncrypted : undefined,
+      otherKeyHolders: typeof data.otherKeyHolders === "number" ? data.otherKeyHolders : undefined,
+      recoveryNet: data.recoveryNet === true,
+    };
+  }
+
+  /** The owner kept this vault's key (`file` = saved to a file, `confirmed` = said so). */
+  async markVaultKeySaved(vaultId: string, method: "file" | "confirmed"): Promise<void> {
+    await this.request("POST", `/api/vaults/${encodeURIComponent(vaultId)}/keys/saved`, { body: { method } });
+  }
+
+  /** Pending server-driven messages for this user; an older server (404) has none. */
+  /**
+   * Pending messages for this user. `showing` names the one on screen, so the
+   * server keeps it in the answer until it is acted on (here or elsewhere)
+   * instead of hiding it for having just been shown.
+   */
+  async listMessages(
+    openOrgId: string | null,
+    showing?: { id: string; orgId: string | null },
+  ): Promise<DeliveredMessage[]> {
+    const params = new URLSearchParams({ org: openOrgId ?? "" });
+    if (showing) {
+      params.set("showing", showing.id);
+      params.set("showingOrg", showing.orgId ?? "");
+    }
+    try {
+      const { data } = await this.request<{ messages?: DeliveredMessage[] }>("GET", `/api/messages?${params}`);
+      return Array.isArray(data?.messages) ? data.messages : [];
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return [];
+      throw e;
+    }
+  }
+
+  async sendMessageReceipt(
+    id: string,
+    body: { orgId: string | null; event: MessageReceiptEvent; actionId?: string },
+  ): Promise<void> {
+    await this.request("POST", `/api/messages/${encodeURIComponent(id)}/receipt`, { body });
+  }
+
+  /** A Google-only account adds a Baalda password (`POST /api/me/password`). */
+  async setAccountPassword(password: string): Promise<"set" | "has-password"> {
+    try {
+      await this.request("POST", "/api/me/password", { body: { password } });
+      return "set";
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) return "has-password";
+      throw e;
+    }
+  }
+
+  /** Whether this account can sign in with a password (Better Auth's linked accounts). */
+  async hasPasswordLogin(): Promise<boolean | null> {
+    try {
+      const { data } = await this.request<Array<{ providerId?: string; provider?: string }>>(
+        "GET",
+        "/api/auth/list-accounts",
+      );
+      return Array.isArray(data) ? data.some((a) => (a.providerId ?? a.provider) === "credential") : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async listVaultKeyRequests(vaultId: string): Promise<VaultKeyRequest[]> {
+    // The server answers `{ requests: [...] }`. Reading only a bare array made
+    // this list always empty, so no key holder ever shared a vault key with a
+    // new member (they stayed "waiting for a teammate" forever).
+    const { data } = await this.request<VaultKeyRequest[] | { requests?: VaultKeyRequest[] }>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/requests`,
+    );
+    const list = Array.isArray(data) ? data : data?.requests;
+    return Array.isArray(list) ? list : [];
+  }
+
+  /** `vkBase64` proves we hold the key; sent only as `X-Baalda-VK`. */
+  async postVaultKeyWrap(vaultId: string, wrap: VaultKeyWrapPost, vkBase64: string): Promise<void> {
+    await this.request("POST", `/api/vaults/${encodeURIComponent(vaultId)}/keys/wraps`, {
+      body: wrap,
+      headers: { [VAULT_KEY_HEADER]: vkBase64 },
+    });
+  }
+
+  async putMyKeys(body: AccountKeysBody): Promise<void> {
+    await this.request("PUT", "/api/me/keys", { body });
+  }
+
+  /** null when this account has no keys yet (404). */
+  async getMyKeys(): Promise<AccountKeysBody | null> {
+    try {
+      // The server answers 200 with `publicKey: null` before any key exists:
+      // that is "no keys", never another device's key to link against.
+      const body = (await this.request<AccountKeysBody>("GET", "/api/me/keys")).data;
+      return body?.publicKey ? body : null;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  /**
+   * `POST /api/me/keys/unlock` (seamless keys F). The password is the body
+   * only: never logged, never in an error. `wrong-password` (401),
+   * `unavailable` (409 `no_password` / 503 `password_unlock_off` / 404 on an
+   * older server); anything else (429 throttle, 5xx) throws.
+   */
+  async unlockAccountKey(password: string): Promise<{ unlockKey: string } | "wrong-password" | "unavailable"> {
+    try {
+      const { data } = await this.request<{ unlockKey?: string }>("POST", "/api/me/keys/unlock", {
+        body: { password },
+      });
+      if (typeof data?.unlockKey !== "string") throw new ApiError(500, "Unexpected unlock answer");
+      return { unlockKey: data.unlockKey };
+    } catch (e) {
+      if (e instanceof ApiError) {
+        // Only the server's password verdict is "wrong": a 401 for a session
+        // that is gone says nothing about the password (and must never switch
+        // off the launch-time unlock, lib/vaultKeys/launchUnlock.ts).
+        if (e.status === 401) {
+          const b = e.body as { code?: unknown; error?: unknown } | null;
+          return b?.code === "wrong_password" || b?.error === "wrong_password" ? "wrong-password" : "unavailable";
+        }
+        if (e.status === 409 || e.status === 503 || e.status === 404) return "unavailable";
+      }
+      throw e;
+    }
+  }
+
+  /** `PUT /api/me/keys/password-wrap` → `{ stored: true }`. */
+  async putPasswordWrap(privWrapped: string): Promise<void> {
+    await this.request("PUT", "/api/me/keys/password-wrap", { body: { privWrapped } });
+  }
+
+  /** Approve a pending device: the account private key sealed to its key. */
+  async putDeviceKey(deviceId: string, privWrapped: string): Promise<void> {
+    await this.request("PUT", `/api/me/devices/${encodeURIComponent(deviceId)}/key`, { body: { privWrapped } });
+  }
+
+  // ---- Converting an existing vault (W3) ------------------------------------
+
+  /** Claim the conversion with our check. 409 = another device already holds it. */
+  async registerPendingVaultKey(
+    vaultId: string,
+    body: { vkCheck: string; generation: number; deviceId: string },
+    vkBase64: string,
+  ): Promise<"registered" | "claimed"> {
+    try {
+      await this.request("POST", `/api/vaults/${encodeURIComponent(vaultId)}/keys/pending`, {
+        body,
+        headers: { [VAULT_KEY_HEADER]: vkBase64 },
+      });
+      return "registered";
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) return "claimed";
+      throw e;
+    }
+  }
+
+  async getAllowlistCandidates(vaultId: string, vkBase64: string): Promise<AllowlistCandidate[]> {
+    const { data } = await this.request<AllowlistCandidate[] | { candidates?: AllowlistCandidate[] }>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/allowlist-candidates`,
+      { headers: { [VAULT_KEY_HEADER]: vkBase64 } },
+    );
+    const list = Array.isArray(data) ? data : (data?.candidates ?? []);
+    return list.filter((c) => typeof c?.id === "string" && typeof c?.hash === "string");
+  }
+
+  /** Other owners/admins who could hold the pending key (`shared`: they have it). */
+  async listPendingShareTargets(
+    vaultId: string,
+    vkBase64: string,
+  ): Promise<Array<{ userId: string; publicKey: string; shared: boolean }>> {
+    const { data } = await this.request<Array<{ userId: string; publicKey: string; shared: boolean }>>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/pending/shares`,
+      { headers: { [VAULT_KEY_HEADER]: vkBase64 } },
+    );
+    return (Array.isArray(data) ? data : []).filter(
+      (t) => typeof t?.userId === "string" && typeof t?.publicKey === "string",
+    );
+  }
+
+  /** The pending key sealed to another owner/admin's account key. */
+  async postPendingShare(vaultId: string, body: { userId: string; sealedVk: string }, vkBase64: string): Promise<void> {
+    await this.request("POST", `/api/vaults/${encodeURIComponent(vaultId)}/keys/pending/shares`, {
+      body,
+      headers: { [VAULT_KEY_HEADER]: vkBase64 },
+    });
+  }
+
+  /** `rejected`: ids whose MAC the server could not verify (logged, retried next poll).
+   *  `excluded`: what the owner unchecked in the conversion review (never allow-listed). */
+  async postAllowlist(
+    vaultId: string,
+    entries: AllowlistEntry[],
+    vkBase64: string,
+    excluded: Array<{ kind: string; id: string }> = [],
+  ): Promise<{ rejected: string[] }> {
+    const { data } = await this.request<{ accepted?: number; rejected?: string[] }>(
+      "POST",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/allowlist`,
+      { body: excluded.length ? { entries, excluded } : { entries }, headers: { [VAULT_KEY_HEADER]: vkBase64 } },
+    );
+    return { rejected: Array.isArray(data?.rejected) ? data.rejected : [] };
+  }
+
+  /** Keeps the pending key warm on the server and asks whether init may run. */
+  async getConversionReady(vaultId: string, vkBase64: string): Promise<boolean> {
+    const { data } = await this.request<{ ready?: boolean }>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/conversion-ready`,
+      { headers: { [VAULT_KEY_HEADER]: vkBase64 } },
+    );
+    return data?.ready === true;
+  }
+
+  /** Link-a-device: publish this device's ephemeral public key as pending. */
+  async registerPendingDevice(deviceId: string, publicKey: string): Promise<void> {
+    await this.request("POST", "/api/me/devices", { body: { deviceId, publicKey } });
+  }
+
+  async listPendingDevices(): Promise<PendingDevice[]> {
+    // `{ devices: [...] }` on the wire (same trap as `listVaultKeyRequests`):
+    // a bare-array read meant no computer ever saw a new one waiting to be approved.
+    const { data } = await this.request<PendingDevice[] | { devices?: PendingDevice[] }>(
+      "GET",
+      "/api/me/devices/pending",
+    );
+    const list = Array.isArray(data) ? data : data?.devices;
+    return Array.isArray(list) ? list : [];
+  }
+
+  /** The approval for this device, or null while none exists (404). */
+  async getDeviceKey(deviceId: string): Promise<string | null> {
+    try {
+      const { data } = await this.request<{ privWrapped?: string }>(
+        "GET",
+        `/api/me/devices/${encodeURIComponent(deviceId)}/key`,
+      );
+      return data?.privWrapped ?? null;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  async denyDevice(deviceId: string): Promise<void> {
+    await this.request("DELETE", `/api/me/devices/${encodeURIComponent(deviceId)}`);
+  }
+
   // ---- low-level request --------------------------------------------------
 
   private async request<T>(
     method: string,
     path: string,
-    opts: { body?: unknown; captureAuthToken?: boolean; query?: Record<string, string | undefined> } = {},
-  ): Promise<{ data: T; authToken: string | null }> {
+    opts: {
+      body?: unknown;
+      captureAuthToken?: boolean;
+      query?: Record<string, string | undefined>;
+      /**
+       * Abort the request after this many ms.
+       *
+       * Off by default — most calls are small and the caller has nothing better
+       * to do than wait. Set it where the SERVER's work is proportional to what
+       * we asked for, so a slow answer is a real possibility rather than a
+       * pathology: a host that accepts the connection and then takes minutes
+       * leaves the caller hanging, and for the access-check that means a pull
+       * that never finishes deciding whether to delete files.
+       */
+      timeoutMs?: number;
+      /** Extra headers (never logged). */
+      headers?: Record<string, string>;
+      /** Internal: this is the one retry after a `key_required` refusal. */
+      keyRetry?: boolean;
+      /** The keyed vault this request belongs to when the path does not say
+       *  (MCP token mint, a note's public link): carries `X-Baalda-VK`. */
+      vaultScope?: string | null;
+    } = {},
+  ): Promise<{ data: T; authToken: string | null; status: number }> {
     const url = new URL(this.baseUrl + path);
     if (opts.query) {
       for (const [k, v] of Object.entries(opts.query)) {
         if (v !== undefined) url.searchParams.set(k, v);
       }
+    }
+    // Every API call reports this build's version (see `withClientVersion`).
+    if (
+      path.startsWith("/api/") &&
+      !path.startsWith("/api/auth/") &&
+      !url.searchParams.has(CLIENT_VERSION_PARAM)
+    ) {
+      url.searchParams.set(CLIENT_VERSION_PARAM, CLIENT_VERSION);
     }
 
     const headers: Record<string, string> = {
@@ -444,18 +2084,38 @@ export class ApiClient {
       /* leave unset */
     }
     if (this.token) headers.Authorization = `Bearer ${this.token}`;
+    Object.assign(headers, this.vaultKeyHeaders(path, opts.vaultScope), opts.headers);
     let bodyInit: string | undefined;
     if (opts.body !== undefined) {
       headers["Content-Type"] = "application/json";
       bodyInit = JSON.stringify(opts.body);
     }
 
-    const res = await this.fetchImpl(url.toString(), { method, headers, body: bodyInit });
+    let controller: AbortController | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (opts.timeoutMs !== undefined) {
+      controller = new AbortController();
+      timer = setTimeout(() => controller?.abort(), opts.timeoutMs);
+    }
+    let res: Response;
+    let text: string;
+    // The timer covers the BODY too: a server that sends headers and then
+    // stalls mid-body otherwise hangs the caller exactly as if it never answered.
+    try {
+      res = await this.fetchImpl(url.toString(), {
+        method,
+        headers,
+        body: bodyInit,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      text = await res.text();
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
 
     // Better Auth returns the opaque session token in this header on sign-in/up.
     const authToken = opts.captureAuthToken ? res.headers.get("set-auth-token") : null;
 
-    const text = await res.text();
     let parsed: unknown = undefined;
     if (text) {
       try {
@@ -474,10 +2134,116 @@ export class ApiClient {
           ? String((parsed as { error?: unknown }).error)
           : undefined) ??
         `HTTP ${res.status}`;
+      if (res.status === 426) notifyClientOutdated(parsed);
+      // A keyed vault refused us for want of its key: fetch/verify the key and
+      // retry ONCE. Otherwise it stays an error, never an empty answer, so no
+      // caller can mistake it for an empty server (split-brain rule).
+      if (
+        res.status === 409 &&
+        !opts.keyRetry &&
+        (parsed as { code?: unknown } | undefined)?.code === KEY_REQUIRED_CODE
+      ) {
+        // A path that does not name its vault (`/api/notes/:id/versions`, Trash
+        // text, ...) learns it from the refusal, and the retry is scoped to it
+        // so the key header rides along.
+        const named = (parsed as { vaultId?: unknown } | undefined)?.vaultId;
+        const id = opts.vaultScope ?? vaultIdFromPath(path) ?? (typeof named === "string" && named ? named : null);
+        const handler = this.keyRequiredHandler;
+        if (id && handler && (await handler(id).catch(() => false))) {
+          return this.request<T>(method, path, { ...opts, vaultScope: id, keyRetry: true });
+        }
+      }
       throw new ApiError(res.status, msg, parsed);
     }
 
-    return { data: parsed as T, authToken };
+    // The status rides along because a couple of routes say something in it that
+    // the body does not: `POST /api/notes` answers 201 for a row it created and
+    // 200 for one it adopted, and only the first is provably empty on the
+    // server. Every other caller destructures `data` and never sees this.
+    return { data: parsed as T, authToken, status: res.status };
+  }
+
+  // ---- Reachability -------------------------------------------------------
+
+  /**
+   * Is there a Baalda server at this address? Resolves if yes, throws a
+   * {@link ServerCheckError} if no.
+   *
+   * The ONE probe in this file that fails OPEN, and it exists precisely because
+   * the other two don't. `getAuthMethods` and `getBillingConfig` are capability
+   * probes: they swallow every failure and answer "not configured", which is
+   * right for deciding whether to draw a button and useless for telling someone
+   * their server URL is wrong. Building the onboarding check on either of them
+   * would report "connected" for a typo'd hostname.
+   *
+   * Takes an explicit `baseUrl` because it runs BEFORE the URL is adopted —
+   * validating a candidate must not disturb the client's current base or its
+   * token. It also sends no `Authorization`: `/health` is public, and the point
+   * is to test the address, not the session.
+   *
+   * `AbortController` rather than a bare `fetch`: a host that accepts the TCP
+   * connection and then says nothing (a firewall, a hung proxy) would otherwise
+   * leave the Connect button spinning indefinitely.
+   */
+  async health(baseUrl?: string): Promise<void> {
+    const base = stripTrailingSlash((baseUrl ?? this.baseUrl).trim());
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${base}/health`, {
+        method: "GET",
+        headers: { Accept: "application/json", [ORIGIN_HEADER]: this.clientId },
+        signal: controller.signal,
+      });
+    } catch {
+      // A timeout, DNS failure, refused connection and a CSP block all land
+      // here, and the webview reports the last one as a bare `TypeError: Load
+      // failed` — so the message stays about the address rather than guessing.
+      throw new ServerCheckError("unreachable", UNREACHABLE_MESSAGE);
+    } finally {
+      clearTimeout(timer);
+    }
+    // A 5xx is the server's own, or a proxy in front of it saying the app is
+    // down — "check it's online" is the useful thing to say, not "wrong app".
+    if (res.status >= 500) throw new ServerCheckError("unreachable", UNREACHABLE_MESSAGE);
+    if (!res.ok) throw new ServerCheckError("not-baalda", NOT_BAALDA_MESSAGE);
+    const text = await res.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // 200 with HTML: something is there, it just isn't us.
+      throw new ServerCheckError("not-baalda", NOT_BAALDA_MESSAGE);
+    }
+    const ok =
+      !!parsed && typeof parsed === "object" && (parsed as { ok?: unknown }).ok === true;
+    if (!ok) throw new ServerCheckError("not-baalda", NOT_BAALDA_MESSAGE);
+  }
+
+  /**
+   * The server's `/health` body, parsed for capability detection
+   * (`lib/serverFeatures.ts`). Unlike {@link health} this never throws:
+   * any failure (timeout, network, 5xx, non-JSON, not Baalda) answers null,
+   * which the caller reads as "unknown", never as "outdated".
+   */
+  async getHealth(baseUrl?: string): Promise<ServerHealth | null> {
+    const base = stripTrailingSlash((baseUrl ?? this.baseUrl).trim());
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+    try {
+      const res = await this.fetchImpl(`${base}/health`, {
+        method: "GET",
+        headers: { Accept: "application/json", [ORIGIN_HEADER]: this.clientId },
+        signal: controller.signal,
+      });
+      if (!res.ok) return null;
+      return parseHealth(JSON.parse(await res.text()));
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // ---- Auth (Better Auth) -------------------------------------------------
@@ -532,14 +2298,25 @@ export class ApiClient {
 
   // ---- Google sign-in (social, via desktop loopback) ----------------------
 
-  /** Which sign-in methods the server offers (Google is config-gated). */
-  async getAuthMethods(): Promise<{ emailPassword: boolean; google: boolean }> {
+  /**
+   * Which sign-in methods the server offers (Google, password reset and invite
+   * email are all config-gated).
+   *
+   * Every field beyond `emailPassword` is read with `!!`, so an OLDER server
+   * that answers only `{ emailPassword, google }` reports the new capabilities
+   * as absent — which is the right answer for it, and the reason the UI hides
+   * "Forgot password?" rather than offering a route that silently does nothing.
+   */
+  async getAuthMethods(): Promise<AuthMethods> {
     try {
-      const { data } = await this.request<{ emailPassword: boolean; google: boolean }>(
-        "GET",
-        "/api/auth-methods",
-      );
-      return { emailPassword: data.emailPassword !== false, google: !!data.google };
+      const { data } = await this.request<Partial<AuthMethods>>("GET", "/api/auth-methods");
+      return {
+        emailPassword: data.emailPassword !== false,
+        google: !!data.google,
+        passwordReset: !!data.passwordReset,
+        invitationEmail: !!data.invitationEmail,
+        bugReport: !!data.bugReport,
+      };
     } catch {
       // Fails CLOSED, and deliberately so: an older/self-hosted server without
       // this endpoint should hide the Google button rather than offer a route
@@ -547,8 +2324,53 @@ export class ApiClient {
       // (server down, wrong URL, CSP blocking us) is indistinguishable here from
       // "Google not configured", so a hidden Google button is not proof the
       // server lacks it. Check /api/auth-methods with curl before believing it.
-      return { emailPassword: true, google: false };
+      return {
+        emailPassword: true,
+        google: false,
+        passwordReset: false,
+        invitationEmail: false,
+        bugReport: false,
+      };
     }
+  }
+
+  /**
+   * Ask the server to email a password-reset link — and learn what happened.
+   *
+   * Our own route, not Better Auth's `request-password-reset`: that one answers
+   * the same neutral sentence whether the address is unknown, the send failed
+   * or the mail went out. This one resolves only when the provider accepted the
+   * message, and otherwise throws an `ApiError` whose body carries `error`:
+   * `no_account` (404), `send_failed` (502), `too_many_requests` (429) or
+   * `email_not_configured` (400). `lib/resetFlow.ts` turns those into copy.
+   */
+  async requestPasswordReset(email: string): Promise<void> {
+    await this.request<unknown>("POST", "/api/password-reset/request", {
+      body: { email },
+    });
+  }
+
+  /**
+   * Email an invitation's link to its address. Resolves when the provider took
+   * the message; throws `ApiError` with body `error` = `send_failed` (502),
+   * `email_not_configured` (400) or `invitation_not_pending` (410). Called
+   * right after {@link inviteMember} — creating the invitation sends nothing by
+   * itself, precisely so the admin can be told whether the email went out.
+   */
+  async sendInvitationEmail(invitationId: string): Promise<void> {
+    await this.request<unknown>(
+      "POST",
+      `/api/invitations/${encodeURIComponent(invitationId)}/send`,
+    );
+  }
+
+  /** Re-send the sign-up confirmation email for the signed-in address. */
+  async sendVerificationEmail(email: string): Promise<void> {
+    // The server builds its own link and ignores callbackURL, but Better Auth's
+    // schema requires the field.
+    await this.request<unknown>("POST", "/api/auth/send-verification-email", {
+      body: { email, callbackURL: "/email-verified" },
+    });
   }
 
   /**
@@ -609,11 +2431,23 @@ export class ApiClient {
 
   // ---- Organizations (org plugin) -----------------------------------------
 
-  async createOrganization(input: { name: string; slug: string }): Promise<Organization> {
+  async createOrganization(input: {
+    name: string;
+    slug: string;
+    /** The vault icon to start with (`lib/vaultIcon.ts` wire format). */
+    logo?: string;
+  }): Promise<Organization> {
     const { data } = await this.request<Organization>("POST", "/api/auth/organization/create", {
       body: input,
     });
     return data;
+  }
+
+  /** Set (or with null, clear) a vault's icon. Owner/admin only (Better Auth). */
+  async updateOrganizationLogo(organizationId: string, logo: string | null): Promise<void> {
+    await this.request("POST", "/api/auth/organization/update", {
+      body: { organizationId, data: { logo } },
+    });
   }
 
   async listOrganizations(): Promise<Organization[]> {
@@ -664,8 +2498,54 @@ export class ApiClient {
     return Array.isArray(data) ? data : (data?.invitations ?? []);
   }
 
-  /** Invitations addressed to the signed-in user (invitee view). */
+  /** Kill a pending invitation (owner/admin). The link stops working at once. */
+  async cancelInvitation(invitationId: string): Promise<void> {
+    await this.request<unknown>("POST", "/api/auth/organization/cancel-invitation", {
+      body: { invitationId },
+    });
+  }
+
+  /**
+   * What an invitation id names — vault, inviter, invited address, status.
+   *
+   * Public on the server (the id is the capability), so this works signed out
+   * and on whatever server the app is currently pointed at. A bearer header
+   * still rides along when we have one; the route ignores it.
+   *
+   * Throws `ApiError` 404 for an id the server doesn't know, which is what the
+   * caller maps to "expired or already used" — an unknown id and a consumed
+   * one must stay indistinguishable.
+   */
+  async previewInvitation(invitationId: string): Promise<InvitationPreview> {
+    const { data } = await this.request<InvitationPreview>(
+      "GET",
+      `/api/invitations/${encodeURIComponent(invitationId)}/preview`,
+    );
+    return data;
+  }
+
+  /**
+   * Invitations addressed to the signed-in user (invitee view).
+   *
+   * Our own `/api/invitations/mine` FIRST, Better Auth's route only as a 404
+   * fallback for an older self-hosted server. Better Auth's
+   * `list-user-invitations` answers 403 for any user whose email isn't
+   * verified — which is every password sign-up — so the in-app invite inbox was
+   * silently empty for exactly the people who most needed it.
+   */
   async listUserInvitations(): Promise<Invitation[]> {
+    try {
+      const { data } = await this.request<{ invitations: Invitation[] } | Invitation[]>(
+        "GET",
+        "/api/invitations/mine",
+      );
+      return Array.isArray(data) ? data : (data?.invitations ?? []);
+    } catch (e) {
+      // Only a missing ROUTE falls back. A 403/500 from our own endpoint is a
+      // real failure and must not be papered over with a call that returns 403
+      // for the same user anyway.
+      if (!(e instanceof ApiError) || e.status !== 404) throw e;
+    }
     const { data } = await this.request<{ invitations: Invitation[] } | Invitation[]>(
       "GET",
       "/api/auth/organization/list-user-invitations",
@@ -712,15 +2592,83 @@ export class ApiClient {
    * cascades members/note-collections/folders/notes/shares and purges the FK-less
    * CRDT stores. Throws ApiError 403 if the caller isn't the owner.
    * (The vault's server identity is the Better Auth organization id.)
+   *
+   * A vault on Pro is cancelled at the provider FIRST, at the period end; if
+   * the provider refuses, nothing is deleted and this throws 502
+   * `subscription_cancel_failed` (#111). On success `subscription` says when
+   * the paid period runs out — until then it can be moved to another vault.
    */
-  async deleteRemoteVault(
-    organizationId: string,
-  ): Promise<{ deleted: boolean; vaults: number; docs: number }> {
-    const { data } = await this.request<{ deleted: boolean; vaults: number; docs: number }>(
+  async deleteRemoteVault(organizationId: string): Promise<VaultDeleteResult> {
+    const { data } = await this.request<VaultDeleteResult>(
       "DELETE",
       `/api/orgs/${encodeURIComponent(organizationId)}`,
     );
     return data;
+  }
+
+  /**
+   * What making this vault local only would destroy (owner only). Pure counting
+   * — nothing is changed. Throws ApiError 403 `owner_only` for anyone else and
+   * 404 `vault_not_found` for a vault that is already gone.
+   */
+  async getUnsyncPreview(organizationId: string): Promise<UnsyncPreview> {
+    const { data } = await this.request<UnsyncPreview>(
+      "GET",
+      `/api/orgs/${encodeURIComponent(organizationId)}/unsync-preview`,
+    );
+    return data;
+  }
+
+  /**
+   * Make a vault local only (owner only): the server deletes everything it
+   * holds for the vault — notes, files, history, shares, links, tokens — and
+   * the caller keeps its `.md` files on disk.
+   *
+   * `confirmName` must equal the vault's name; the server answers 409
+   * `name_mismatch` otherwise and destroys NOTHING. Same billing rule as
+   * `deleteRemoteVault`: a paid vault is cancelled at the provider first and a
+   * provider refusal aborts the whole thing with 502
+   * `subscription_cancel_failed`, so a throw here means the server copy is
+   * still intact — which is exactly why the caller must not touch this device
+   * until this resolves.
+   */
+  async unsyncVault(organizationId: string, confirmName: string): Promise<UnsyncResult> {
+    const { data } = await this.request<UnsyncResult>(
+      "POST",
+      `/api/orgs/${encodeURIComponent(organizationId)}/unsync`,
+      { body: { confirmName } },
+    );
+    return data;
+  }
+
+  /**
+   * Does this vault still exist, and are we in it? The one probe that can tell
+   * "the owner made it local only" apart from "it is another account's vault" —
+   * a folder stamped for an org we cannot see looks identical in both cases,
+   * and only the first one deserves the recovery banner.
+   *
+   * Never throws: every refusal becomes an {@link OrgStatus}, and an
+   * unreachable server answers `unknown` so the caller stays silent rather than
+   * accusing a perfectly good folder.
+   */
+  async getOrgStatus(organizationId: string): Promise<OrgStatus> {
+    try {
+      const { data } = await this.request<{ orgId: string; name: string; role: string }>(
+        "GET",
+        `/api/orgs/${encodeURIComponent(organizationId)}/status`,
+      );
+      return { kind: "member", orgId: data.orgId, name: data.name, role: data.role };
+    } catch (e) {
+      if (e instanceof ApiError) {
+        // The code is the contract, the status is the fallback — same rule as
+        // `blobErrorCode`, so an older server that sends a bare status still
+        // lands in the right branch.
+        const code = errorCodeOf(e.body);
+        if (code === "vault_not_found" || e.status === 404) return { kind: "vault-not-found" };
+        if (code === "not_a_member" || e.status === 403) return { kind: "not-a-member" };
+      }
+      return { kind: "unknown" };
+    }
   }
 
   /**
@@ -734,6 +2682,37 @@ export class ApiClient {
       "DELETE",
       `/api/orgs/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
     );
+  }
+
+  /**
+   * Leave a vault you don't own (#121). The server drops the membership, purges
+   * shares granted directly to you, unpins the vault from your sessions and
+   * force-closes your live sync sockets — the same teardown as being removed by
+   * an admin. Throws ApiError 409 `owner_cannot_leave` for the owner (their exit
+   * is deleteRemoteVault) and 404 when you aren't a member.
+   */
+  async leaveVault(organizationId: string): Promise<void> {
+    await this.request<{ left: boolean }>(
+      "POST",
+      `/api/orgs/${encodeURIComponent(organizationId)}/leave`,
+    );
+  }
+
+  /**
+   * Which of `orgIds` the signed-in user is still a member of. Raw answer;
+   * `lib/vault/membershipLost.ts` decides what counts as a removal (only
+   * `notMember`). Throws ApiError on any non-2xx, including 404 on a server
+   * without the route.
+   */
+  async membershipCheck(
+    orgIds: string[],
+  ): Promise<{ member: string[]; notMember: string[]; unknown: string[] }> {
+    const { data } = await this.request<{ member: string[]; notMember: string[]; unknown: string[] }>(
+      "POST",
+      "/api/orgs/membership-check",
+      { body: { orgIds } },
+    );
+    return data;
   }
 
   /**
@@ -776,13 +2755,32 @@ export class ApiClient {
   }
 
   /** Mint a new MCP token. The `token` field is the plaintext — shown once. */
-  async createMcpToken(name: string): Promise<McpTokenRow & { token: string }> {
+  /** `vaultId`: the open keyed vault, so the token is wrapped from birth. */
+  async createMcpToken(name: string, vaultId?: string | null): Promise<McpTokenRow & { token: string }> {
     const { data } = await this.request<McpTokenRow & { token: string }>(
       "POST",
       "/api/mcp/tokens",
-      { body: { name } },
+      { body: { name }, vaultScope: vaultId },
     );
     return data;
+  }
+
+  /** A connector consent waiting for this app (W3): who asks, for which vault. */
+  async getOAuthConsent(id: string): Promise<OAuthConsentRequest> {
+    const { data } = await this.request<OAuthConsentRequest>(
+      "GET",
+      `/api/oauth/consents/${encodeURIComponent(id)}`,
+    );
+    return data;
+  }
+
+  /** Finish a connector consent: `vkHeader` (`vaultId=<b64>` pairs) is sent
+   *  only as `X-Baalda-VK` and never logged. */
+  async completeOAuthConsent(id: string, vkHeader: string): Promise<void> {
+    await this.request("POST", `/api/oauth/consents/${encodeURIComponent(id)}/complete`, {
+      body: {},
+      headers: { [VAULT_KEY_HEADER]: vkHeader },
+    });
   }
 
   async revokeMcpToken(id: string): Promise<void> {
@@ -796,19 +2794,33 @@ export class ApiClient {
    * Repeated calls return the SAME url until it's revoked; gated server-side
    * like share management (owner/admin or the note's creator).
    */
-  async createPublicLink(docId: string): Promise<PublicLink> {
+  /** Email a bug report to this server's operator (`POST /api/bug-reports`). */
+  async sendBugReport(input: {
+    message: string;
+    details?: BugReportDetails;
+    /** A Loom (or any http/https) recording link. */
+    videoUrl?: string;
+    /** Files as base64; the server decides each type from its extension. */
+    attachments?: Array<{ name: string; data: string }>;
+  }): Promise<void> {
+    await this.request<unknown>("POST", "/api/bug-reports", { body: input });
+  }
+
+  async createPublicLink(docId: string, vaultId?: string | null): Promise<PublicLink> {
     const { data } = await this.request<PublicLink>(
       "POST",
       `/api/notes/${encodeURIComponent(docId)}/public-link`,
+      { vaultScope: vaultId },
     );
     return data;
   }
 
   /** The note's public link if one exists, else null. */
-  async getPublicLink(docId: string): Promise<PublicLink | null> {
+  async getPublicLink(docId: string, vaultId?: string | null): Promise<PublicLink | null> {
     const { data } = await this.request<{ link: PublicLink | null }>(
       "GET",
       `/api/notes/${encodeURIComponent(docId)}/public-link`,
+      { vaultScope: vaultId },
     );
     return data.link ?? null;
   }
@@ -831,12 +2843,30 @@ export class ApiClient {
    */
   async getBillingConfig(): Promise<BillingConfig> {
     try {
-      const { data } = await this.request<BillingConfig>("GET", "/api/billing/config");
-      if (!data || data.enabled !== true) return { enabled: false };
-      return { enabled: true, plans: data.plans, freeLimits: data.freeLimits };
+      return await this.probeBillingConfig();
     } catch {
       return { enabled: false };
     }
+  }
+
+  /**
+   * The same request as {@link getBillingConfig}, but a failure THROWS instead
+   * of reading as "disabled". For screens that state a verdict about billing
+   * (Account Settings → Plan & Billing): a network error, a restarting server
+   * or a 5xx is not an answer, so `classifyBillingConfigResult` in
+   * `lib/billing.ts` decides what the caught error means (404 ⇒ disabled).
+   */
+  async probeBillingConfig(): Promise<BillingConfig> {
+    const { data } = await this.request<BillingConfig>("GET", "/api/billing/config");
+    if (!data || data.enabled !== true) return { enabled: false };
+    return {
+      enabled: true,
+      model: data.model ?? "vault",
+      free: data.free,
+      team: data.team,
+      plans: data.plans,
+      freeLimits: data.freeLimits,
+    };
   }
 
   /** A vault's subscription state + seat usage (any member of the org). */
@@ -856,7 +2886,7 @@ export class ApiClient {
     const { data } = await this.request<{ url: string }>(
       "POST",
       `/api/billing/orgs/${encodeURIComponent(orgId)}/checkout`,
-      { body: { interval } },
+      { body: { interval, client: CHECKOUT_CLIENT } },
     );
     return data;
   }
@@ -867,6 +2897,155 @@ export class ApiClient {
       "POST",
       `/api/billing/orgs/${encodeURIComponent(orgId)}/portal`,
     );
+    return data;
+  }
+
+  /**
+   * Every vault the caller belongs to with its plan/seats/role, plus any
+   * subscription left behind by a deleted vault. One request rather than an
+   * N+1 over {@link getOrgBilling}: the server also reconciles stale rows
+   * against the provider while it is in there.
+   */
+  async getMyBilling(): Promise<MyBilling> {
+    const { data } = await this.request<MyBilling>("GET", "/api/billing/mine");
+    return data;
+  }
+
+  /**
+   * Cancel a vault's subscription (owner only; admins use the portal).
+   * `period_end` keeps the paid time and stops the next charge; `now` revokes
+   * immediately — which is what a subscription from an already-deleted vault
+   * wants, since there is no vault left to spend the rest of the period on.
+   */
+  async cancelSubscription(
+    orgId: string,
+    mode: "period_end" | "now",
+  ): Promise<OrgBilling> {
+    const { data } = await this.request<OrgBilling>(
+      "POST",
+      `/api/billing/orgs/${encodeURIComponent(orgId)}/cancel`,
+      { body: { mode } },
+    );
+    return data;
+  }
+
+  // ---- Team account billing (servers with `model: "team"`) ----------------
+
+  /** The caller's billing account: plan, seats, people who count, vaults. */
+  /** `refresh` asks the server to re-read the live subscription from the
+   *  provider once (throttled server-side); older servers ignore it. Only the
+   *  Plan & Billing mount and the checkout hand-back pass it. */
+  async getBillingAccount(opts: { orgId?: string; refresh?: boolean } = {}): Promise<MyBillingAccount> {
+    const params = new URLSearchParams();
+    if (opts.orgId) params.set("orgId", opts.orgId);
+    if (opts.refresh) params.set("refresh", "1");
+    const qs = params.toString();
+    const q = qs ? `?${qs}` : "";
+    const { data } = await this.request<MyBillingAccount>("GET", `/api/billing/account${q}`);
+    return data;
+  }
+
+  /** Per-vault usage and totals for the caller's account, or for the account
+   *  `orgId` is billed on (any member of that vault may read it). */
+  async getBillingUsage(opts: { orgId?: string } = {}): Promise<BillingUsage> {
+    const q = opts.orgId ? `?orgId=${encodeURIComponent(opts.orgId)}` : "";
+    const { data } = await this.request<BillingUsage>("GET", `/api/billing/account/usage${q}`);
+    return data;
+  }
+
+  /** What changing to `seats` would cost now and next period. */
+  async previewSeatChange(seats: number): Promise<SeatPreview> {
+    const { data } = await this.request<SeatPreview>(
+      "GET",
+      `/api/billing/account/seats/preview?seats=${encodeURIComponent(String(seats))}`,
+    );
+    return data;
+  }
+
+  /** Increase (immediate, prorated) or decrease (at period end) seats. */
+  async setSeats(seats: number): Promise<MyBillingAccount> {
+    const { data } = await this.request<MyBillingAccount>("PATCH", "/api/billing/account/seats", {
+      body: { seats },
+    });
+    return data;
+  }
+
+  /** Start a hosted Team checkout for the caller's account. */
+  async teamCheckout(input: {
+    seats: number;
+    interval: "month" | "year";
+    successUrl?: string;
+  }): Promise<{ url: string; checkoutId?: string }> {
+    const { data } = await this.request<{ url: string; checkoutId?: string }>(
+      "POST",
+      "/api/billing/account/checkout",
+      { body: { ...input, client: CHECKOUT_CLIENT } },
+    );
+    return data;
+  }
+
+  /** Ask the server to read a Team checkout back from the payment provider
+   *  and record its subscription if it has been paid, so the wait never
+   *  depends on a webhook. Answers the account. 404 on an older server
+   *  (no route) or a checkout that is not this account's. */
+  async reconcileTeamCheckout(checkoutId: string): Promise<MyBillingAccount> {
+    const { data } = await this.request<MyBillingAccount>(
+      "POST",
+      "/api/billing/account/reconcile",
+      { body: { checkoutId } },
+    );
+    return data;
+  }
+
+  /** Cancel the account's Team subscription at the period end. */
+  async accountCancel(): Promise<MyBillingAccount> {
+    const { data } = await this.request<MyBillingAccount>("POST", "/api/billing/account/cancel");
+    return data;
+  }
+
+  /** Undo a pending cancel. */
+  async accountResume(): Promise<MyBillingAccount> {
+    const { data } = await this.request<MyBillingAccount>("POST", "/api/billing/account/resume");
+    return data;
+  }
+
+  /** The provider's customer portal for the account. */
+  async accountPortalUrl(): Promise<{ url: string }> {
+    const { data } = await this.request<{ url: string }>("POST", "/api/billing/account/portal");
+    return data;
+  }
+
+  /** Attach a vault to another billing account the caller manages. */
+  async moveVault(orgId: string, toAccountId: string): Promise<{ moved: boolean }> {
+    const { data } = await this.request<{ moved: boolean }>(
+      "POST",
+      `/api/billing/orgs/${encodeURIComponent(orgId)}/move`,
+      { body: { toAccountId } },
+    );
+    return data;
+  }
+
+  /**
+   * @deprecated Per-vault subscriptions are gone on Team-model servers; use
+   * {@link moveVault}. Kept for older servers.
+   *
+   * Move a live subscription from one vault to another the caller owns. The
+   * source may be a deleted vault's tombstone, which is the whole point: it
+   * turns "I deleted the wrong vault" into a recoverable mistake instead of a
+   * refund request. Un-cancels at the provider when the source was set to
+   * cancel at the period end.
+   */
+  async transferSubscription(
+    sourceOrgId: string,
+    targetOrgId: string,
+  ): Promise<{ transferred: boolean; orgId: string; billing: OrgBilling }> {
+    const { data } = await this.request<{
+      transferred: boolean;
+      orgId: string;
+      billing: OrgBilling;
+    }>("POST", `/api/billing/orgs/${encodeURIComponent(sourceOrgId)}/transfer`, {
+      body: { targetOrgId },
+    });
     return data;
   }
 
@@ -910,7 +3089,33 @@ export class ApiClient {
       "GET",
       `/api/vaults/${encodeURIComponent(vaultId)}/access-tree`,
     );
-    return { folders: data.folders ?? [], notes: data.notes ?? [] };
+    return { folders: data.folders ?? [], notes: data.notes ?? [], files: data.files ?? [] };
+  }
+
+  /**
+   * The access-tree payload plus every row's mode for ONE person, in one
+   * request (`access-board` feature). `modes` holds one char per item in
+   * folders ++ notes ++ files order: `e` open, `v` readonly, `n` private,
+   * `m` mixed. Null when the server predates the route (404/405).
+   */
+  async getAccessBoard(vaultId: string, userId: string): Promise<AccessBoardResponse | null> {
+    try {
+      const { data } = await this.request<AccessBoardResponse>(
+        "GET",
+        `/api/vaults/${encodeURIComponent(vaultId)}/access-board?userId=${encodeURIComponent(userId)}`,
+      );
+      return {
+        folders: data.folders ?? [],
+        notes: data.notes ?? [],
+        files: data.files ?? [],
+        modes: typeof data.modes === "string" ? data.modes : "",
+        totals: data.totals,
+        complete: data.complete,
+      };
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 404 || error.status === 405)) return null;
+      throw error;
+    }
   }
 
   async listFolders(vaultId: string): Promise<RegisteredFolder[]> {
@@ -934,7 +3139,7 @@ export class ApiClient {
     const { data } = await this.request<{
       folders: RegisteredFolder[];
       tombstones?: string[];
-    }>("GET", "/api/folders", { query: { vaultId } });
+    }>("GET", "/api/folders", { query: { vaultId }, timeoutMs: REGISTRY_LISTING_TIMEOUT_MS });
     return {
       folders: data.folders ?? [],
       tombstones: Array.isArray(data.tombstones) ? data.tombstones : null,
@@ -969,6 +3174,57 @@ export class ApiClient {
     await this.request<unknown>("DELETE", `/api/folders/${encodeURIComponent(id)}`);
   }
 
+  /**
+   * Ask the server, per doc, whether the caller still has ANY access — the
+   * second opinion the inbound reconciler needs before it deletes files.
+   *
+   * `GET /api/notes` and the vault channel's `ready.revoked` are the same
+   * resolver read twice (`listReadableDocsInVault`), so they cannot corroborate
+   * each other: one regression inside it produces both an empty listing and a
+   * "these are revoked" announcement, which together are exactly the authority
+   * needed to wipe a member's disk. This route answers through
+   * `permissions/resolver.ts effectivePermission` instead — different SQL, a
+   * different walk — so a disagreement is detectable, and a disagreement means
+   * the file stays.
+   *
+   * Returns the subset that resolves to NO access. A throw means "no answer",
+   * and the caller's rule for that is to remove nothing.
+   */
+  async accessCheck(vaultId: string, docIds: string[]): Promise<string[]> {
+    const { data } = await this.request<{ none: string[] }>(
+      "POST",
+      `/api/vaults/${encodeURIComponent(vaultId)}/access-check`,
+      { body: { docIds }, timeoutMs: ACCESS_CHECK_TIMEOUT_MS },
+    );
+    return data.none ?? [];
+  }
+
+  /**
+   * Tell the server these notes are genuinely empty here — empty file AND empty
+   * local CRDT (#257) — so a contentless note WITHOUT that marker can be counted
+   * as an upload that never arrived. Informational only: the server stamps a
+   * marker and changes no content. At most {@link ACCESS_CHECK_MAX} ids (the
+   * server's `CONFIRM_EMPTY_MAX`, the same bound). Returns the ids it stamped.
+   */
+  async confirmEmptyNotes(vaultId: string, docIds: string[]): Promise<string[]> {
+    const { data } = await this.request<{ confirmed: string[] }>(
+      "POST",
+      `/api/vaults/${encodeURIComponent(vaultId)}/notes/confirm-empty`,
+      { body: { docIds } },
+    );
+    return data.confirmed ?? [];
+  }
+
+  /** The vault's readable tree binaries (`GET /api/files`), each with its
+   *  creator. The only listing that says who registered a file: the blob
+   *  listing carries no creator. */
+  async listFiles(vaultId: string): Promise<RegisteredFile[]> {
+    const { data } = await this.request<{ files: RegisteredFile[] }>("GET", "/api/files", {
+      query: { vaultId },
+    });
+    return data.files ?? [];
+  }
+
   async listNotes(vaultId: string): Promise<RegisteredNote[]> {
     const { data } = await this.request<{ notes: RegisteredNote[] }>("GET", "/api/notes", {
       query: { vaultId },
@@ -988,27 +3244,46 @@ export class ApiClient {
    */
   async listNoteRegistry(
     vaultId: string,
-  ): Promise<{ notes: RegisteredNote[]; tombstones: string[] | null }> {
-    const { data } = await this.request<{ notes: RegisteredNote[]; tombstones?: string[] }>(
-      "GET",
-      "/api/notes",
-      { query: { vaultId } },
-    );
+  ): Promise<{ notes: RegisteredNote[]; tombstones: string[] | null } & Partial<ListingVisibility>> {
+    const { data } = await this.request<{
+      notes: RegisteredNote[];
+      tombstones?: string[];
+      hiddenContent?: boolean;
+      canCreateRoot?: boolean;
+    }>("GET", "/api/notes", { query: { vaultId } });
     return {
       notes: data.notes ?? [],
       tombstones: Array.isArray(data.tombstones) ? data.tombstones : null,
+      ...listingVisibility(data),
     };
   }
 
+  /**
+   * Register one note. `created` distinguishes the two 2xx answers this route
+   * gives (201 a new row, 200 an existing one adopted by path/doc_id) — the
+   * single-note twin of the batch route's `status: "created" | "adopted"`, and
+   * the same question: a row the server just made holds no CRDT, so it can be
+   * seeded in bulk; an adopted one may hold a teammate's content.
+   *
+   * Optional on purpose: absent reads as "not known to be new", which is the
+   * safe direction — the caller simply does not announce it.
+   */
   async createNote(input: {
     vaultId: string;
     relPath: string;
     title?: string | null;
     folderId?: string | null;
     docId?: string;
-  }): Promise<RegisteredNote> {
-    const { data } = await this.request<RegisteredNote>("POST", "/api/notes", { body: input });
-    return data;
+    /** One-step create (`notes-with-state` servers): base64 Yjs state. */
+    state?: string;
+    textSha256?: string;
+  }): Promise<RegisteredNote & { created?: boolean } & SeedResultFields> {
+    const { data, status } = await this.request<RegisteredNote & SeedResultFields>(
+      "POST",
+      "/api/notes",
+      { body: input },
+    );
+    return { ...data, created: status === 201 };
   }
 
   /** Rename/move a note (rel_path/folder/title); doc_id is unchanged. */
@@ -1034,6 +3309,326 @@ export class ApiClient {
     await this.request<unknown>("DELETE", `/api/notes/${encodeURIComponent(id)}`);
   }
 
+  /**
+   * The vault's Trash: soft-deleted notes the caller can read, newest first,
+   * with who deleted each one and when the server will purge it.
+   * `truncated` means the server capped the list; the UI says so rather than
+   * implying the rows shown are all there is.
+   */
+  async listTrash(vaultId: string): Promise<TrashListing> {
+    const { data } = await this.request<Partial<TrashListing>>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/trash`,
+    );
+    return { items: data.items ?? [], truncated: data.truncated === true };
+  }
+
+  /**
+   * Undo a soft delete. The server may land it at a different path when the
+   * original is taken (`renamed: true`). 404 = unknown or not deleted, 403 = no
+   * permission; both surface as an `ApiError` for the caller to show inline.
+   */
+  /**
+   * The text of a note in the server's Trash, for a read-only preview.
+   * 404 `not_in_trash`, 410 `purged`, 403 without read access.
+   */
+  async trashContent(docId: string): Promise<TrashContent> {
+    const { data } = await this.request<TrashContent>(
+      "GET",
+      `/api/notes/${encodeURIComponent(docId)}/trash-content`,
+    );
+    return data;
+  }
+
+  async restoreNote(docId: string): Promise<RestoredNote> {
+    const { data } = await this.request<RestoredNote>(
+      "POST",
+      `/api/notes/${encodeURIComponent(docId)}/restore`,
+    );
+    return data;
+  }
+
+  /**
+   * Register a tree binary as a `files` row, so its blob has a doc_id the
+   * permission resolver understands.
+   *
+   * `id` is the LOCAL `files.id` (a uuid the SQLite index keeps stable per path
+   * across rebuilds), supplied the way `createNote` supplies a note's docId, so
+   * this device's index and the server name the same identity. `folderId` is
+   * deliberately not sent: the server resolves the parent from the path
+   * (`resolveParentFolder`), which is the rule that keeps `rel_path` and
+   * `folder_id` in agreement — a mismatch comes back as 400
+   * `path_folder_mismatch`.
+   */
+  async registerFile(input: {
+    vaultId: string;
+    id: string;
+    path: string;
+  }): Promise<RegisteredFile> {
+    // `/api/files`, not `/api/registry/files`: the registry router is mounted at
+    // `/api` (see the server's `http/app.ts`), exactly like `/api/notes` and
+    // `/api/folders` beside it.
+    const { data } = await this.request<RegisteredFile>("POST", "/api/files", {
+      body: { vaultId: input.vaultId, path: input.path, docId: input.id },
+    });
+    return data;
+  }
+
+  /**
+   * Delete a tree file — the `files` row and the blob that IS its bytes.
+   *
+   * Not the note's soft delete: a file owns no CRDT and `files` has no
+   * tombstone, so the server removes it outright (`DELETE /api/files/:id`).
+   * That is what takes it out of `GET /vaults/:id/blobs`, and therefore what
+   * stops the next attachment pass downloading it straight back onto the disk
+   * it was just deleted from.
+   *
+   * Idempotent by design at the other end: an id with no row answers 204, so a
+   * queue draining twice is not an error.
+   */
+  async deleteFile(id: string): Promise<void> {
+    await this.request<unknown>("DELETE", `/api/files/${encodeURIComponent(id)}`);
+  }
+
+  /**
+   * Delete one blob by id — the hidden `attachments/` store's half of the same
+   * job, where there is no `files` row to delete.
+   *
+   * `force` is deliberately NOT exposed as a default: without it the server
+   * answers 409 `blob_referenced` when a note still embeds those bytes, and
+   * that refusal is the point — an image a teammate's note shows must not
+   * vanish because one device tidied its `attachments/` folder.
+   */
+  async deleteBlob(id: string, opts: { force?: boolean } = {}): Promise<void> {
+    await this.request<unknown>("DELETE", `/api/blobs/${encodeURIComponent(id)}`, {
+      query: opts.force ? { force: "1" } : undefined,
+    });
+  }
+
+  // ---- Bulk sync engine (batch registry, batched push, bootstrap) ---------
+  //
+  // Every route here is NEW. A server that predates them answers 404, and a 404
+  // on any of them is terminal `server_too_old` — deliberately NOT the tri-state
+  // capability memo `blobIntentSupported` uses, which exists to degrade
+  // silently. Degrading silently here would put a 5,000-note vault back on the
+  // per-note path at 3.7 notes/second and call it success.
+
+  /**
+   * Register folders in bulk. No `parentId`: the server sorts by depth and
+   * resolves parents inside the request, which deletes the client's
+   * level-by-level loop.
+   */
+  async batchCreateFolders(
+    vaultId: string,
+    items: FolderBatchItem[],
+  ): Promise<FolderBatchResult[]> {
+    return this.bulk<{ results: FolderBatchResult[] }>(
+      `/api/vaults/${encodeURIComponent(vaultId)}/folders/batch`,
+      { items },
+    ).then((d) => d.results ?? []);
+  }
+
+  /** Register notes in bulk. `folderPath`, never `folderId` — see the type. */
+  async batchCreateNotes(
+    vaultId: string,
+    items: NoteBatchItem[],
+  ): Promise<NoteBatchResult[]> {
+    return this.bulk<{ results: NoteBatchResult[] }>(
+      `/api/vaults/${encodeURIComponent(vaultId)}/notes/batch`,
+      { items },
+    ).then((d) => d.results ?? []);
+  }
+
+  /** Register tree binaries (`files` rows) in bulk. */
+  async batchCreateFiles(
+    vaultId: string,
+    items: FileBatchItem[],
+  ): Promise<FileBatchResult[]> {
+    return this.bulk<{ results: FileBatchResult[] }>(
+      `/api/vaults/${encodeURIComponent(vaultId)}/files/batch`,
+      { items },
+    ).then((d) => d.results ?? []);
+  }
+
+  /**
+   * Push N docs' CRDT state in one request (base64 Yjs V1 per doc).
+   *
+   * The caller packs by BYTES as well as by count — see `BATCH_MAX_DOCS` /
+   * `BATCH_MAX_DECODED_BYTES` in `sync/pool.ts`, which mirror the server's
+   * limits; overshooting them is `batch_too_large`, not a truncated apply.
+   */
+  async batchPushDocs(vaultId: string, items: DocPushItem[]): Promise<DocPushResult[]> {
+    return this.bulk<{ results: DocPushResult[] }>(
+      `/api/vaults/${encodeURIComponent(vaultId)}/docs/batch?${CLIENT_VERSION_PARAM}=${encodeURIComponent(CLIENT_VERSION)}`,
+      { items },
+    ).then((d) => d.results ?? []);
+  }
+
+  /**
+   * Soft-delete N notes in one request — the batched twin of
+   * {@link ApiClient.deleteNote}, same write, same broadcast, one of each.
+   *
+   * Chunking is the CALLER's (`registry.deletePaths`, at `BATCH_MAX_NOTES`):
+   * this method sends exactly what it is given, so an over-long list comes back
+   * as `batch_too_large` rather than being silently truncated here. The answer
+   * is per item, in request order, and a 404 on the route is the usual terminal
+   * `server_too_old` — a server that predates it still has the per-note DELETE.
+   */
+  async deleteNotesBatch(vaultId: string, docIds: string[]): Promise<NoteDeleteResult[]> {
+    return this.bulk<{ results: NoteDeleteResult[] }>(
+      `/api/vaults/${encodeURIComponent(vaultId)}/notes/delete-batch`,
+      { docIds },
+    ).then((d) => d.results ?? []);
+  }
+
+  /**
+   * Open a bootstrap session: the server takes one snapshot of what this member
+   * may read and pages it out from a cursor.
+   *
+   * `have` is the docIds this device already holds CRDT state for — the server
+   * subtracts them from the download set, so a second device with most of the
+   * vault pays for the difference and not for the vault.
+   */
+  async createBootstrapSession(
+    vaultId: string,
+    have: string[] = [],
+    /** `bootstrap-only` servers: exactly these doc ids (HTTP pull-then-merge). */
+    only?: string[],
+  ): Promise<BootstrapSession> {
+    const body: { have?: string[]; only?: string[] } = {};
+    if (have.length > 0) body.have = have;
+    if (only) body.only = only;
+    const data = await this.bulk<BootstrapSession>(
+      `/api/vaults/${encodeURIComponent(vaultId)}/bootstrap`,
+      body,
+    );
+    return {
+      sessionId: data.sessionId,
+      docs: data.docs ?? 0,
+      bytes: data.bytes ?? 0,
+      emptyDocs: data.emptyDocs ?? [],
+      emptyTruncated: data.emptyTruncated === true,
+      expiresAt: data.expiresAt ?? "",
+    };
+  }
+
+  /**
+   * Fetch one page of a bootstrap session: gzip binary, decoded by
+   * `sync/bootstrapCodec.ts`.
+   *
+   * Bypasses {@link ApiClient.request} on purpose — the body is bytes, not JSON
+   * — and is modelled on {@link ApiClient.downloadBlob}/{@link
+   * ApiClient.downloadBytesFrom}. The server sends gzip without Content-Encoding,
+   * so inflate explicitly. Accept already-decoded pages from older transports.
+   *
+   * Three statuses carry meaning rather than failure: 410 `session_expired`
+   * (the caller re-POSTs with a fresh `have`), 503 `bootstrap_busy` with a
+   * `Retry-After` (the server's bootstrap semaphore is full), and 404
+   * `server_too_old`.
+   */
+  async fetchBootstrapPage(
+    vaultId: string,
+    sessionId: string,
+    opts: { cursor?: number; maxBytes?: number } = {},
+  ): Promise<BootstrapPageResponse> {
+    const url = new URL(
+      `${this.baseUrl}/api/vaults/${encodeURIComponent(vaultId)}/bootstrap/${encodeURIComponent(sessionId)}`,
+    );
+    if (opts.cursor !== undefined) url.searchParams.set("cursor", String(opts.cursor));
+    if (opts.maxBytes !== undefined) url.searchParams.set("maxBytes", String(opts.maxBytes));
+    const res = await this.fetchImpl(withClientVersion(url.toString()), {
+      method: "GET",
+      headers: { ...this.baseHeaders(url.toString()), [ORIGIN_HEADER]: this.clientId },
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      let parsed: unknown = text;
+      try {
+        parsed = text ? JSON.parse(text) : undefined;
+      } catch {
+        /* a plain-text body is fine; `bulkCodeFor` falls back to the status */
+      }
+      throw new BulkApiError(
+        res.status,
+        bulkCodeFor(res.status, parsed),
+        text || `HTTP ${res.status}`,
+        parsed,
+        retryAfterMs(res.headers.get("retry-after")),
+      );
+    }
+    const cursorHeader = res.headers.get("x-baalda-cursor");
+    let body = new Uint8Array(await res.arrayBuffer());
+    if (body[0] === 0x1f && body[1] === 0x8b) {
+      const inflated = new Blob([body]).stream().pipeThrough(new DecompressionStream("gzip"));
+      body = new Uint8Array(await new Response(inflated).arrayBuffer());
+    }
+    return {
+      bytes: body,
+      // ABSENT means drained. An empty string is not a cursor either.
+      nextCursor: cursorHeader ? Number(cursorHeader) : null,
+      docs: numHeader(res.headers.get("x-baalda-docs")),
+      uncompressedBytes: numHeader(res.headers.get("x-baalda-bytes")),
+    };
+  }
+
+  /** POST a bulk route, re-typing any refusal as a {@link BulkApiError}. */
+  private async bulk<T>(path: string, body: unknown): Promise<T> {
+    try {
+      const { data } = await this.request<T>("POST", path, { body });
+      return data;
+    } catch (e) {
+      throw asBulkError(e);
+    }
+  }
+
+  /**
+   * The registry pull's note listing, following the server's keyset pages.
+   *
+   * Callers are unchanged: this answers exactly what {@link listNoteRegistry}
+   * does. `limit` is what asks a NEW server to page; a server that predates
+   * pagination ignores it and answers the whole vault with no `nextAfter`, which
+   * is the single-page case below — so there is no capability probe and no
+   * fallback path to get wrong.
+   *
+   * `tombstones` ride the LAST page only (that is what keeps the "one snapshot,
+   * no precedence rule" property of the unpaged listing), so they are taken from
+   * whichever response ended the loop, and `null` still means "the server did not
+   * answer the question" rather than "nothing is deleted".
+   */
+  async listNoteRegistryPaged(
+    vaultId: string,
+    opts: { limit?: number } = {},
+  ): Promise<{ notes: RegisteredNote[]; tombstones: string[] | null } & Partial<ListingVisibility>> {
+    const limit = opts.limit ?? REGISTRY_PAGE_LIMIT;
+    const notes: RegisteredNote[] = [];
+    let tombstones: string[] | null = null;
+    let visibility: Partial<ListingVisibility> = {};
+    let after: string | undefined;
+    // Bounded so a server that keeps answering the same `nextAfter` cannot spin
+    // this loop forever; 1000 pages is 1,000,000 notes at the default limit.
+    for (let page = 0; page < 1000; page++) {
+      const { data } = await this.request<{
+        notes: RegisteredNote[];
+        tombstones?: string[];
+        nextAfter?: string | null;
+        hiddenContent?: boolean;
+        canCreateRoot?: boolean;
+      }>("GET", "/api/notes", {
+        query: { vaultId, limit: String(limit), after },
+        timeoutMs: REGISTRY_LISTING_TIMEOUT_MS,
+      });
+      notes.push(...(data.notes ?? []));
+      tombstones = Array.isArray(data.tombstones) ? data.tombstones : null;
+      visibility = listingVisibility(data);
+      const next = typeof data.nextAfter === "string" ? data.nextAfter : null;
+      // No cursor ⇒ the last (or only) page. A cursor that did not ADVANCE is a
+      // server bug; stopping is strictly better than looping on it.
+      if (!next || next === after) return { notes, tombstones, ...visibility };
+      after = next;
+    }
+    return { notes, tombstones, ...visibility };
+  }
+
   // ---- Versioning ---------------------------------------------------------
 
   /** A note's stored versions, newest first (no content). Needs `view`. */
@@ -1043,6 +3638,55 @@ export class ApiClient {
       `/api/notes/${encodeURIComponent(docId)}/versions`,
     );
     return data.versions ?? [];
+  }
+
+  /**
+   * `pre-shrink` versions (an update that left at most 20% of a note) on notes the
+   * caller can read, deleted ones included, newest first. `afterChars` is the
+   * note's CURRENT length (`afterIsCurrent`): the capture keeps only the before.
+   */
+  async listShrinkEvents(vaultId: string, since?: string, limit?: number): Promise<ShrinkEventListing> {
+    const q = new URLSearchParams();
+    if (since) q.set("since", since);
+    if (limit != null) q.set("limit", String(limit));
+    const qs = q.toString();
+    const { data } = await this.request<ShrinkEventListing>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/shrink-events${qs ? `?${qs}` : ""}`,
+    );
+    return { items: data.items ?? [], truncated: !!data.truncated, afterIsCurrent: data.afterIsCurrent ?? true };
+  }
+
+  /**
+   * Invitations in this vault that expired unaccepted (#268): all of them for
+   * an owner/admin, only the caller's own otherwise. A Resend answers one.
+   */
+  async listInvitationExpiries(vaultId: string): Promise<InvitationExpiry[]> {
+    const { data } = await this.request<{ items?: InvitationExpiry[] }>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/invitation-expiries`,
+    );
+    return data.items ?? [];
+  }
+
+  /** Sync pauses (shrink brake holds) in this vault since `since`. An older
+   *  server without the route answers 404; callers treat that as none. */
+  async listShrinkBrakes(vaultId: string, since?: string): Promise<ShrinkBrakeListing> {
+    const qs = since ? `?${new URLSearchParams({ since }).toString()}` : "";
+    const { data } = await this.request<ShrinkBrakeListing>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/shrink-brakes${qs}`,
+    );
+    return { items: data.items ?? [], canRelease: data.canRelease === true };
+  }
+
+  /** Owner/admin: lift a member's sync pause early. Their held edits then
+   *  arrive like any edit (each sharp shrink still versioned first). */
+  async releaseShrinkBrake(vaultId: string, userId: string): Promise<void> {
+    await this.request(
+      "POST",
+      `/api/vaults/${encodeURIComponent(vaultId)}/shrink-brake/${encodeURIComponent(userId)}/release`,
+    );
   }
 
   /** One version *with* its markdown — the preview/revert payload. */
@@ -1112,17 +3756,18 @@ export class ApiClient {
     return data;
   }
 
-  /** A note collection's checkpoints, newest first (any vault member). */
-  async listCheckpoints(vaultId: string): Promise<VaultCheckpoint[]> {
-    const { data } = await this.request<{ checkpoints: VaultCheckpoint[] }>(
-      "GET",
-      `/api/vaults/${encodeURIComponent(vaultId)}/checkpoints`,
-    );
-    return data.checkpoints ?? [];
+  /** A note collection's checkpoints, newest first, plus its cadence (any vault member). */
+  async listCheckpoints(vaultId: string): Promise<CheckpointList> {
+    const { data } = await this.request<{
+      checkpoints?: VaultCheckpoint[];
+      schedule?: CheckpointSchedule;
+    }>("GET", `/api/vaults/${encodeURIComponent(vaultId)}/checkpoints`);
+    return { checkpoints: data.checkpoints ?? [], schedule: data.schedule ?? null };
   }
 
   /** Take a manual checkpoint (owner/admin). Throws ApiError(409) while another
-   *  checkpoint/revert holds the vault's lock. */
+   *  checkpoint/revert holds the vault's lock, and ApiError(429
+   *  `checkpoint_limit`) when the vault's manual window has not rolled yet. */
   async createCheckpoint(vaultId: string, label?: string): Promise<VaultCheckpoint> {
     const { data } = await this.request<VaultCheckpoint>(
       "POST",
@@ -1173,7 +3818,7 @@ export class ApiClient {
     /** Required for user shares; ignored for org-wide grants/locks. */
     principalId?: string;
     principalType?: "user" | "org";
-    permission: Permission | "locked" | "denied";
+    permission: Permission | "readonly" | "locked" | "denied";
   }): Promise<Share> {
     const { data } = await this.request<Share>("POST", "/api/shares", { body: input });
     return data;
@@ -1181,6 +3826,354 @@ export class ApiClient {
 
   async revokeShare(shareId: string): Promise<void> {
     await this.request<unknown>("DELETE", `/api/shares/${encodeURIComponent(shareId)}`);
+  }
+
+  /**
+   * Back to the vault default for one member: deletes every per-user share row
+   * of theirs in the org (vault and items). Owner/admin only; the server kicks
+   * affected sockets and refreshes ACLs.
+   */
+  async resetMemberAccess(orgId: string, userId: string): Promise<{ removed: number; disconnectedDocs: number }> {
+    const { data } = await this.request<{ removed: number; disconnectedDocs: number }>(
+      "DELETE",
+      `/api/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}/shares`,
+    );
+    return data;
+  }
+
+  /**
+   * The vault's team access in one shot: the vault-wide mode plus every
+   * per-item org row underneath it. Owner/admin only.
+   */
+  async getTeamAccess(orgId: string): Promise<TeamAccess> {
+    const { data } = await this.request<TeamAccess>(
+      "GET",
+      `/api/orgs/${encodeURIComponent(orgId)}/team-access`,
+    );
+    const mode = data.mode ?? "private";
+    return {
+      mode,
+      posture: data.posture ?? (mode === "open" ? "edit" : mode === "readonly" ? "view" : "sealed"),
+      grantId: data.grantId ?? null,
+      overrides: data.overrides ?? [],
+    };
+  }
+
+  /** The vault's appearance defaults for everyone (`settings` keys optional). */
+  async getVaultAppearance(orgId: string): Promise<VaultAppearanceResponse> {
+    const { data } = await this.request<VaultAppearanceResponse>(
+      "GET",
+      `/api/orgs/${encodeURIComponent(orgId)}/appearance`,
+    );
+    return {
+      settings: parseVaultAppearanceSettings(data?.settings),
+      updatedAt: data?.updatedAt ?? null,
+      updatedBy: data?.updatedBy ?? null,
+    };
+  }
+
+  async toggleVaultPin(orgId: string, pin: PinnedItem): Promise<VaultAppearanceResponse> {
+    const { data } = await this.request<VaultAppearanceResponse>("PATCH", `/api/orgs/${encodeURIComponent(orgId)}/appearance`, { body: { togglePin: pin } });
+    return { ...data, settings: parseVaultAppearanceSettings(data.settings) };
+  }
+
+  /** Change only the supplied shared settings; the server checks owner/admin. */
+  async patchVaultAppearance(orgId: string, settings: VaultAppearanceSettings): Promise<VaultAppearanceResponse> {
+    const { data } = await this.request<VaultAppearanceResponse>("PATCH", `/api/orgs/${encodeURIComponent(orgId)}/appearance`, { body: { settings } });
+    return { ...data, settings: parseVaultAppearanceSettings(data.settings) };
+  }
+
+  /** Replace the vault's appearance defaults (owner/admin). */
+  async putVaultAppearance(orgId: string, settings: VaultAppearanceSettings): Promise<VaultAppearanceResponse> {
+    const { data } = await this.request<VaultAppearanceResponse>(
+      "PUT",
+      `/api/orgs/${encodeURIComponent(orgId)}/appearance`,
+      { body: { settings } },
+    );
+    return {
+      settings: parseVaultAppearanceSettings(data?.settings ?? settings),
+      updatedAt: data?.updatedAt ?? null,
+      updatedBy: data?.updatedBy ?? null,
+    };
+  }
+
+  // ---- Skills (docs/SKILLS.md §3.3) --------------------------------------
+
+  /** Every vault this user belongs to on this server, with the skills to install. */
+  async getSkillsManifest(): Promise<SkillsManifest> {
+    return (await this.request<SkillsManifest>("GET", "/api/skills/manifest", { timeoutMs: 30_000 })).data;
+  }
+
+  async listSkills(orgId: string): Promise<SkillsCatalog> {
+    return (await this.request<SkillsCatalog>("GET", skillsBase(orgId))).data;
+  }
+
+  /** Owner/admin. Without `files` the server seeds a default SKILL.md. */
+  async createSkill(orgId: string, name: string, files?: SkillFileInput[], source?: SkillOrigin): Promise<SkillDetail> {
+    return (await this.request<SkillDetail>("POST", skillsBase(orgId), {
+      body: { name, ...(files ? { files } : {}), ...(source ? { source } : {}) }, timeoutMs: 60_000,
+    })).data;
+  }
+
+  async getSkill(orgId: string, skillId: string): Promise<SkillDetail> {
+    return (await this.request<SkillDetail>("GET", skillPath(orgId, skillId))).data;
+  }
+
+  async patchSkill(
+    orgId: string,
+    skillId: string,
+    change: { delivery?: SkillDelivery; pinnedVersion?: number | null; source?: SkillOrigin | null },
+  ): Promise<SkillSummary> {
+    return (await this.request<SkillSummary>("PATCH", skillPath(orgId, skillId), { body: change })).data;
+  }
+
+  /** A skill's Shared with list: the Everyone row and every member's level (owners/admins). */
+  async getSkillAccess(orgId: string, skillId: string): Promise<SkillAccessList> {
+    return (await this.request<SkillAccessList>("GET", `${skillPath(orgId, skillId)}/access`)).data;
+  }
+
+  /** The Everyone row and/or per-person levels in one write; `level: null` = back to Everyone. */
+  async putSkillAccess(
+    orgId: string,
+    skillId: string,
+    change: { everyone?: SkillAccessLevel; people?: { userId: string; level: SkillAccessLevel | null }[] },
+  ): Promise<SkillAccessList> {
+    return (await this.request<SkillAccessList>("PUT", `${skillPath(orgId, skillId)}/access`, { body: change })).data;
+  }
+
+  /** One person's level for every skill (their profile's Skills tab). */
+  async getMemberSkills(orgId: string, userId: string): Promise<MemberSkillAccess[]> {
+    const path = `/api/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}/skills`;
+    return (await this.request<{ skills: MemberSkillAccess[] }>("GET", path)).data.skills;
+  }
+
+  async deleteSkill(orgId: string, skillId: string): Promise<void> {
+    await this.request("DELETE", skillPath(orgId, skillId));
+  }
+
+  async getSkillDraft(orgId: string, skillId: string): Promise<SkillDraft> {
+    return (await this.request<SkillDraft>("GET", `${skillPath(orgId, skillId)}/draft`, { timeoutMs: 60_000 })).data;
+  }
+
+  /** Replace every draft file. 409 `stale_draft` when `baseRevision` is behind.
+   *  `source` moves with the files (a marketplace "Pull update"); omitted keeps it. */
+  async putSkillDraft(
+    orgId: string,
+    skillId: string,
+    baseRevision: number,
+    files: SkillFileInput[],
+    source?: SkillOrigin | null,
+  ): Promise<SkillDraft> {
+    return (await this.request<SkillDraft>("PUT", `${skillPath(orgId, skillId)}/draft`, {
+      body: { baseRevision, files, ...(source !== undefined ? { source } : {}) }, timeoutMs: 60_000,
+    })).data;
+  }
+
+  async patchSkillDraft(
+    orgId: string,
+    skillId: string,
+    baseRevision: number,
+    change: { upsert?: SkillFileInput[]; remove?: string[] },
+  ): Promise<SkillDraft> {
+    return (await this.request<SkillDraft>("PATCH", `${skillPath(orgId, skillId)}/draft`, {
+      body: { baseRevision, ...change }, timeoutMs: 60_000,
+    })).data;
+  }
+
+  /** Draft := a published version ("Restore to draft"). */
+  async resetSkillDraft(orgId: string, skillId: string, baseRevision: number, version: number): Promise<SkillDraft> {
+    return (await this.request<SkillDraft>("POST", `${skillPath(orgId, skillId)}/draft/reset`, {
+      body: { baseRevision, version },
+    })).data;
+  }
+
+  async publishSkill(orgId: string, skillId: string, baseRevision: number, notes?: string): Promise<SkillVersionSummary> {
+    return (await this.request<SkillVersionSummary>("POST", `${skillPath(orgId, skillId)}/publish`, {
+      body: notes ? { baseRevision, notes } : { baseRevision }, timeoutMs: 60_000,
+    })).data;
+  }
+
+  /** One published version with its files' contents. */
+  async getSkillVersion(orgId: string, skillId: string, version: number): Promise<SkillVersionWithFiles> {
+    return (await this.request<SkillVersionWithFiles>(
+      "GET",
+      `${skillPath(orgId, skillId)}/versions/${encodeURIComponent(String(version))}`,
+      { timeoutMs: 60_000 },
+    )).data;
+  }
+
+  /** GitHub marketplaces this vault imports skills from, oldest first. */
+  async listSkillSources(orgId: string): Promise<SkillSource[]> {
+    const { data } = await this.request<{ sources: SkillSource[] }>(
+      "GET",
+      `/api/orgs/${encodeURIComponent(orgId)}/skill-sources`,
+    );
+    return data?.sources ?? [];
+  }
+
+  /** Owner/admin. 409 `skill_source_exists` for the same repo + ref. */
+  async addSkillSource(orgId: string, repo: string, ref?: string | null, label?: string | null): Promise<SkillSource> {
+    return (await this.request<SkillSource>("POST", `/api/orgs/${encodeURIComponent(orgId)}/skill-sources`, {
+      body: { repo, ...(ref ? { ref } : {}), ...(label ? { label } : {}) },
+    })).data;
+  }
+
+  async removeSkillSource(orgId: string, sourceId: string): Promise<void> {
+    await this.request(
+      "DELETE",
+      `/api/orgs/${encodeURIComponent(orgId)}/skill-sources/${encodeURIComponent(sourceId)}`,
+    );
+  }
+
+  /** Members, pending invitations and (for owners/admins) each person's
+   * vault-wide access level, in one request. */
+  async getMembersOverview(orgId: string): Promise<MembersOverview> {
+    const { data } = await this.request<MembersOverview>(
+      "GET",
+      `/api/orgs/${encodeURIComponent(orgId)}/members/overview`,
+    );
+    const members = data.members ?? [];
+    // Teach the shared avatar directory each member's picture, so surfaces
+    // that only carry an id (presence, version rows) draw the same face.
+    for (const m of members) rememberAvatarImage(m.userId, m.image ?? null);
+    return {
+      members,
+      invitations: data.invitations ?? [],
+      canManage: data.canManage === true,
+    };
+  }
+
+  /** One member's recent activity in this vault, newest first. */
+  async getMemberActivity(orgId: string, userId: string, limit = 50): Promise<MemberActivityEvent[]> {
+    const { data } = await this.request<{ events: MemberActivityEvent[] }>(
+      "GET",
+      `/api/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}/activity?limit=${limit}`,
+    );
+    return data.events ?? [];
+  }
+
+  /** Invite several addresses at once, each carrying a role and an access level.
+   * A 402 `member_limit_reached` throws like {@link inviteMember}. */
+  async inviteMany(orgId: string, input: InviteManyInput, vkBase64?: string): Promise<InviteManyResult[]> {
+    const { data } = await this.request<{ results: InviteManyResult[] }>(
+      "POST",
+      `/api/orgs/${encodeURIComponent(orgId)}/invitations`,
+      { body: input, headers: input.vaultKeys && vkBase64 ? { [VAULT_KEY_HEADER]: vkBase64 } : undefined },
+    );
+    return data.results ?? [];
+  }
+
+  /** B2: the vault key sealed to an invitee's existing account key. */
+  async putInviteWrap(
+    vaultId: string,
+    invitationId: string,
+    body: { sealedVk: string; publicKey: string; generation: number },
+    vkBase64: string,
+  ): Promise<void> {
+    await this.request(
+      "PUT",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/invite-wraps/${encodeURIComponent(invitationId)}`,
+      { body, headers: { [VAULT_KEY_HEADER]: vkBase64 } },
+    );
+  }
+
+  /** B4: `{ wraps: [...] }` of invitations to the caller for this vault. */
+  async getInviteWraps(vaultId: string): Promise<InviteWrap[]> {
+    const { data } = await this.request<{ wraps?: InviteWrap[] }>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/invite-wrap`,
+    );
+    return Array.isArray(data?.wraps) ? data.wraps : [];
+  }
+
+  /** C: the admin's join wrap; `stale-code` when the org's code moved on (409). */
+  async putJoinWrap(
+    vaultId: string,
+    body: { secretHash: string; wrappedVk: string; generation: number; code: string },
+    vkBase64: string,
+  ): Promise<"stored" | "stale-code"> {
+    try {
+      await this.request("PUT", `/api/vaults/${encodeURIComponent(vaultId)}/keys/join-wraps`, {
+        body,
+        headers: { [VAULT_KEY_HEADER]: vkBase64 },
+      });
+      return "stored";
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409 && errorCodeOf(e.body) === "stale_code") return "stale-code";
+      throw e;
+    }
+  }
+
+  /** C: `{ wrap: {...} | null }` for the joiner's secret hash. */
+  async getJoinWrap(vaultId: string, secretHashHex: string): Promise<JoinWrap | null> {
+    const { data } = await this.request<{ wrap?: JoinWrap | null }>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/keys/join-wrap?h=${encodeURIComponent(secretHashHex)}`,
+    );
+    const w = data?.wrap;
+    return w && typeof w.wrappedVk === "string" && typeof w.generation === "number" ? w : null;
+  }
+
+  /**
+   * Set the mode for the WHOLE vault — every folder and note.
+   *
+   * The server does this transactionally: it deletes every per-item org row
+   * first, then writes the new vault row. That is the point of the endpoint.
+   * Doing it client-side as revoke-then-create left the per-item rows standing,
+   * so "set the entire vault to Shared" quietly skipped everything a folder had
+   * overridden. Per-user rows are untouched: people shared with by name keep
+   * their access.
+   */
+  async setTeamAccess(orgId: string, mode: TeamAccessMode): Promise<TeamAccessResult> {
+    const { data } = await this.request<TeamAccessResult>(
+      "PUT",
+      `/api/orgs/${encodeURIComponent(orgId)}/team-access`,
+      { body: { mode } },
+    );
+    return {
+      mode: data.mode ?? mode,
+      cleared: data.cleared ?? 0,
+      disconnectedDocs: data.disconnectedDocs ?? 0,
+      postureChanged: data.postureChanged ?? true,
+    };
+  }
+
+  /** What future members may see when they join. Existing members are unchanged. */
+  async getAccessDefault(orgId: string): Promise<AccessDefault> {
+    const { data } = await this.request<AccessDefault>(
+      "GET",
+      `/api/orgs/${encodeURIComponent(orgId)}/access-default`,
+    );
+    return { mode: data.mode ?? "private" };
+  }
+
+  async setAccessDefault(orgId: string, mode: TeamAccessMode): Promise<AccessDefault> {
+    const { data } = await this.request<AccessDefault>(
+      "PUT",
+      `/api/orgs/${encodeURIComponent(orgId)}/access-default`,
+      { body: { mode } },
+    );
+    return { mode: data.mode ?? mode };
+  }
+
+  /** Apply one access mode to one or more resource roots in a single transaction. */
+  async setBulkAccess(
+    orgId: string,
+    input: BulkAccessInput,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<BulkAccessResult> {
+    const { data } = await this.request<BulkAccessResult>(
+      "POST",
+      `/api/orgs/${encodeURIComponent(orgId)}/access/bulk`,
+      { body: input, timeoutMs: opts.timeoutMs },
+    );
+    return {
+      mode: data.mode ?? input.mode,
+      resourcesChanged: data.resourcesChanged ?? 0,
+      overridesCleared: data.overridesCleared ?? 0,
+      membersAffected: data.membersAffected ?? 0,
+      disconnectedDocs: data.disconnectedDocs ?? 0,
+    };
   }
 
   /** Resolve every member's effective access to a resource (the "who can access"
@@ -1193,6 +4186,40 @@ export class ApiClient {
       query: { resourceType, resourceId },
     });
     return { members: data.members ?? [] };
+  }
+
+  /** Resolve selected people's effective access across compact resource roots.
+   * The server expands folder/vault descendants and bounds resolver concurrency. */
+  async resolveAccessSummary(
+    orgId: string,
+    resources: BulkAccessResource[],
+    userIds: string[],
+  ): Promise<AccessSummary> {
+    const { data } = await this.request<AccessSummary>(
+      "POST",
+      `/api/orgs/${encodeURIComponent(orgId)}/access/summary`,
+      { body: { resources, userIds } },
+    );
+    return data;
+  }
+
+  /** {@link resolveAccessSummary} for many groups of roots in one request —
+   * one per visible Access panel row. The server shares one access index
+   * across them. Throws ApiError(404) on a server that predates the route. */
+  async resolveAccessSummaries(
+    orgId: string,
+    groups: BulkAccessResource[][],
+    userIds: string[],
+  ): Promise<AccessSummary["mode"][]> {
+    const { data } = await this.request<{ modes: AccessSummary["mode"][] }>(
+      "POST",
+      `/api/orgs/${encodeURIComponent(orgId)}/access/summaries`,
+      { body: { groups, userIds } },
+    );
+    if (!Array.isArray(data.modes) || data.modes.length !== groups.length) {
+      throw new Error("Access summaries did not match the request");
+    }
+    return data.modes;
   }
 
   /** All locks in a vault (readable by any vault member — drives lock badges). */
@@ -1213,9 +4240,13 @@ export class ApiClient {
   // ---- Sync token ---------------------------------------------------------
 
   /** Mint a per-doc sync JWT. Throws ApiError(403) when the user has no access. */
-  async syncToken(docId: string): Promise<SyncTokenResponse> {
+  async syncToken(docId: string, vaultId?: string): Promise<SyncTokenResponse> {
     const { data } = await this.request<SyncTokenResponse>("POST", "/api/sync-token", {
       body: { docId },
+      query: { [CLIENT_VERSION_PARAM]: CLIENT_VERSION },
+      // A keyed vault's key, when held, rides as `X-Baalda-VK`: on its own it
+      // proves a vault-key build to the server's keyed-vault gate.
+      vaultScope: vaultId ?? null,
     });
     return data;
   }
@@ -1226,7 +4257,9 @@ export class ApiClient {
     const { data } = await this.request<VaultSyncTokenResponse>(
       "POST",
       "/api/vault-sync-token",
-      { body: { vaultId } },
+      // `vaultScope`: a keyed vault's key rides as `X-Baalda-VK`, which on its
+      // own proves a vault-key build to the server's keyed-vault gate.
+      { body: { vaultId }, query: { [CLIENT_VERSION_PARAM]: CLIENT_VERSION }, vaultScope: vaultId },
     );
     return data;
   }
@@ -1234,8 +4267,8 @@ export class ApiClient {
   // ---- Attachment blobs (Phase 3 blob store, spec 02 §2/§5A) --------------
 
   /** Common headers (Origin + bearer) shared by the binary blob endpoints. */
-  private baseHeaders(): Record<string, string> {
-    const headers: Record<string, string> = {};
+  private baseHeaders(forUrl?: string): Record<string, string> {
+    const headers: Record<string, string> = forUrl ? this.vaultKeyHeaders(pathOf(forUrl)) : {};
     try {
       headers.Origin = new URL(this.baseUrl).origin;
     } catch {
@@ -1254,6 +4287,29 @@ export class ApiClient {
     return data.blobs ?? [];
   }
 
+  /** Ids of tree files this vault deleted (`file_tombstones`), newest first. */
+  async listFileTombstones(vaultId: string): Promise<string[]> {
+    const { data } = await this.request<{ ids: string[] }>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/file-tombstones`,
+    );
+    return Array.isArray(data.ids) ? data.ids : [];
+  }
+
+  /** How many attachment/file bytes this vault stores on the server. */
+  async vaultStorage(vaultId: string): Promise<VaultStorageUsage> {
+    const { data } = await this.request<VaultStorageUsage>(
+      "GET",
+      `/api/vaults/${encodeURIComponent(vaultId)}/storage`,
+    );
+    return {
+      usedBytes: Number(data.usedBytes ?? 0),
+      pendingBytes: Number(data.pendingBytes ?? 0),
+      blobCount: Number(data.blobCount ?? 0),
+      limitBytes: data.limitBytes == null ? null : Number(data.limitBytes),
+    };
+  }
+
   /** Upload raw bytes as a vault attachment; server dedupes by sha256. */
   async uploadBlob(input: {
     vaultId: string;
@@ -1261,16 +4317,32 @@ export class ApiClient {
     bytes: Uint8Array;
     mime?: string;
     fileName?: string;
+    /** The `files` row this blob's bytes belong to (tree binaries only) —
+     *  stored as `blobs.doc_id` so the ACL resolves the file, not its path. */
+    docId?: string | null;
+    /** The sha this device last agreed with the server on for `docId`. The
+     *  server answers 409 `stale_base` when the file has moved on since. */
+    baseSha?: string | null;
   }): Promise<BlobMeta> {
-    const headers = this.baseHeaders();
+    const headers = this.baseHeaders(`/api/vaults/${encodeURIComponent(input.vaultId)}/blobs`);
     headers["Content-Type"] = input.mime ?? "application/octet-stream";
     headers["x-rel-path"] = input.relPath;
     if (input.fileName) headers["x-file-name"] = input.fileName;
+    // A header rather than a body field, because the body IS the file here. An
+    // older server ignores it and falls back to the path heuristic.
+    if (input.docId) headers["x-doc-id"] = input.docId;
 
     // Copy into a fresh ArrayBuffer so the fetch body is a clean BodyInit.
     const buf = input.bytes.slice().buffer;
     const res = await this.fetchImpl(
-      `${this.baseUrl}/api/vaults/${encodeURIComponent(input.vaultId)}/blobs`,
+      // `baseSha` rides the query, not a header: a server that predates it
+      // would refuse an unknown header at the CORS preflight and fail the
+      // upload outright, while an unknown query parameter is simply ignored.
+      withClientVersion(
+        `${this.baseUrl}/api/vaults/${encodeURIComponent(input.vaultId)}/blobs${
+          input.docId && input.baseSha ? `?baseSha=${encodeURIComponent(input.baseSha)}` : ""
+        }`,
+      ),
       { method: "POST", headers, body: buf },
     );
     const text = await res.text();
@@ -1282,9 +4354,278 @@ export class ApiClient {
     return parsed as unknown as BlobMeta;
   }
 
+  /**
+   * Headers that prove who we are on a blob route we host ourselves.
+   *
+   * Public because the attachment sync has to decide, per download, whether the
+   * URL it was handed is ours (bearer REQUIRED) or a third-party presign
+   * (bearer FORBIDDEN — S3 rejects a request that carries both a signature and
+   * an `Authorization` header). The decision lives in `sync/attachments.ts`
+   * where it is tested; this just supplies the header when the answer is "ours".
+   */
+  authHeaders(): Record<string, string> {
+    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
+  }
+
+  /** Whether this server is known to speak the intent flow (null = unasked). */
+  supportsBlobIntent(): boolean | null {
+    return this.blobIntentSupported;
+  }
+
+  /**
+   * Announce an upload: what the bytes are, where they belong, how big.
+   *
+   * The server answers either "already have them" (`deduped`, zero bytes move —
+   * which is the whole reason this exists: the legacy route learned that only
+   * AFTER a new device re-uploaded every attachment in full) or a URL to PUT
+   * them to, for BOTH storage providers. A 404 means this server predates the
+   * flow: remembered per server URL so exactly one upload pays for the probe.
+   */
+  async createBlobIntent(
+    vaultId: string,
+    meta: {
+      sha256: string;
+      size: number;
+      mime: string;
+      relPath: string;
+      filename?: string | null;
+      /** The `files` row these bytes belong to — see {@link registerFile}. The
+       *  server stores it as `blobs.doc_id`; an older one ignores it. */
+      docId?: string | null;
+      /** See {@link uploadBlob}'s `baseSha`: 409 `stale_base` when the doc's
+       *  current bytes are not the ones this edit started from. */
+      baseSha?: string | null;
+      /** One-step upload (`files-with-bytes`): register the `files` row with
+       *  these bytes instead of a separate `POST /api/files` first. */
+      register?: BlobIntentRegister;
+    },
+  ): Promise<BlobIntent> {
+    if (this.blobIntentSupported === false) {
+      // Known-legacy server: answer the way it would, without the round trip.
+      throw new BlobTransportError(404, "not_found", "server has no blob intent route");
+    }
+    try {
+      const { data } = await this.request<BlobIntent>(
+        "POST",
+        `/api/vaults/${encodeURIComponent(vaultId)}/blobs/intent`,
+        { body: meta },
+      );
+      this.blobIntentSupported = true;
+      return data;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) this.blobIntentSupported = false;
+      throw asBlobError(e);
+    }
+  }
+
+  /**
+   * Finish an upload: the server checks what landed and promotes the row to
+   * `ready`. Idempotent, so a retry after a dropped response is safe.
+   *
+   * `completeUrl` comes from the intent and is absolute — the server owns the
+   * path, and a multipart flow may point it elsewhere entirely.
+   */
+  async completeBlob(
+    completeUrl: string,
+    body: BlobCompleteBody = {},
+  ): Promise<BlobMeta & { file?: OneStepFileRow }> {
+    return (
+      (await this.requestAbsolute<BlobMeta & { file?: OneStepFileRow }>("POST", completeUrl, body)) ??
+      ({} as BlobMeta)
+    );
+  }
+
+  /** Fresh presigned URLs for parts whose own presign expired mid-upload. */
+  async requestBlobParts(
+    partsUrl: string,
+    partNumbers: number[],
+  ): Promise<{ parts: BlobUploadPart[]; expiresAt?: number }> {
+    const data = await this.requestAbsolute<{ parts: BlobUploadPart[]; expiresAt?: number }>(
+      "POST",
+      partsUrl,
+      { partNumbers },
+    );
+    return { parts: data?.parts ?? [], expiresAt: data?.expiresAt };
+  }
+
+  /**
+   * Where to GET this blob's bytes right now.
+   *
+   * A JSON URL rather than following `GET /api/blobs/:id`'s 302: reqwest
+   * forwards `Authorization` across a redirect and S3 rejects a presign that
+   * arrives with one, so the desktop asks first and then fetches with a client
+   * that carries exactly the headers `direct` calls for. 404 = a server that
+   * predates this; the caller falls back to {@link downloadBlob}.
+   */
+  async blobDownloadUrl(blobId: string, vaultId?: string | null): Promise<BlobDownloadTarget> {
+    if (this.blobUrlSupported === false) {
+      throw new BlobTransportError(404, "not_found", "server has no blob url route");
+    }
+    try {
+      // The path does not name the vault: scope it so a keyed vault's key rides
+      // on the first request instead of after a `key_required` refusal.
+      const { data } = await this.request<BlobDownloadTarget>(
+        "GET",
+        `/api/blobs/${encodeURIComponent(blobId)}/url`,
+        { vaultScope: vaultId },
+      );
+      this.blobUrlSupported = true;
+      // Not `direct`: the bytes come from this server's own route, which a keyed
+      // vault answers `426` without the client version (`withClientVersion`).
+      return data.direct ? data : { ...data, url: withClientVersion(data.url) };
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) this.blobUrlSupported = false;
+      throw asBlobError(e);
+    }
+  }
+
+  /** Whether this server is known to accept extracted text (null = unasked). */
+  supportsBlobText(): boolean | null {
+    return this.blobTextSupported;
+  }
+
+  /**
+   * Hand the server the plain text Rust already extracted from a blob, so the
+   * team's search can find a `.docx` by what is inside it.
+   *
+   * Ranking fuel and snippets only — never served as content, never an
+   * authorization input, and re-derivable from the bytes, which is what makes a
+   * CLIENT-supplied extraction acceptable: a member who can upload the file can
+   * already write any words they like into a note. The server caps the body at
+   * 1 MB (413) and answers 409 when the blob's own sha does not match the one
+   * this text describes, so a racing re-upload cannot attach stale words to new
+   * bytes.
+   *
+   * 404 disables it for the whole session (remembered per server URL like
+   * {@link createBlobIntent}'s probe): it means either a server that predates
+   * the route or a blob it has forgotten, and neither is worth a retry per
+   * file.
+   */
+  async uploadBlobText(
+    vaultId: string,
+    blobId: string,
+    body: {
+      chars: number;
+      content: string;
+      source: "client";
+      docId?: string | null;
+      sha256: string;
+    },
+  ): Promise<void> {
+    if (this.blobTextSupported === false) {
+      throw new BlobTransportError(404, "not_found", "server has no blob text route");
+    }
+    try {
+      await this.request<unknown>(
+        "PUT",
+        `/api/vaults/${encodeURIComponent(vaultId)}/blobs/${encodeURIComponent(blobId)}/text`,
+        { body },
+      );
+      this.blobTextSupported = true;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) this.blobTextSupported = false;
+      throw asBlobError(e);
+    }
+  }
+
+  /**
+   * PUT raw bytes at a presigned URL from the WEBVIEW — the fallback for when
+   * the Rust streaming command is unavailable (tests, or a build without it).
+   *
+   * Sends `headers` and nothing else. No bearer, ever: `direct: true` is a
+   * third-party presign that rejects one, and `direct: false` is our own route
+   * whose `?t=` query IS the credential. Note the webview's own limits — the
+   * body lives in the JS heap and the bucket needs CORS — which is exactly why
+   * Rust is the primary path.
+   */
+  async uploadBytesTo(input: {
+    url: string;
+    method?: string;
+    headers?: Record<string, string>;
+    bytes: Uint8Array;
+  }): Promise<{ status: number; etag: string | null }> {
+    const res = await this.fetchImpl(input.url, {
+      method: input.method ?? "PUT",
+      headers: { ...(input.headers ?? {}) },
+      body: input.bytes.slice().buffer,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new BlobTransportError(res.status, null, text || `HTTP ${res.status}`);
+    }
+    return { status: res.status, etag: res.headers.get("etag") };
+  }
+
+  /** GET bytes from an arbitrary (possibly presigned) URL — webview fallback. */
+  async downloadBytesFrom(
+    url: string,
+    headers: Record<string, string> = {},
+  ): Promise<Uint8Array> {
+    const res = await this.fetchImpl(url, { method: "GET", headers: { ...headers } });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new BlobTransportError(res.status, null, text || `HTTP ${res.status}`);
+    }
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /**
+   * JSON round trip to an ABSOLUTE url the server handed us (complete, parts).
+   *
+   * The bearer goes only to our own origin; a `completeUrl` pointing anywhere
+   * else gets the body and nothing to replay. Same-origin is the test because
+   * these URLs are minted by the server we are already authenticated to.
+   */
+  private async requestAbsolute<T>(
+    method: string,
+    url: string,
+    body: unknown,
+  ): Promise<T | null> {
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      [ORIGIN_HEADER]: this.clientId,
+    };
+    const own = this.isOwnOrigin(url);
+    if (own) {
+      try {
+        headers.Origin = new URL(this.baseUrl).origin;
+      } catch {
+        /* leave unset */
+      }
+      if (this.token) headers.Authorization = `Bearer ${this.token}`;
+      Object.assign(headers, this.vaultKeyHeaders(pathOf(url)));
+    }
+    const target = own ? withClientVersion(url) : url;
+    const res = await this.fetchImpl(target, { method, headers, body: JSON.stringify(body) });
+    const text = await res.text();
+    let parsed: unknown = undefined;
+    if (text) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = text;
+      }
+    }
+    if (!res.ok) {
+      const code = errorCodeOf(parsed);
+      throw new BlobTransportError(res.status, code, code ?? `HTTP ${res.status}`, parsed);
+    }
+    return (parsed ?? null) as T | null;
+  }
+
+  /** Is this absolute URL served by the server we hold a session for? */
+  private isOwnOrigin(url: string): boolean {
+    try {
+      return new URL(url).origin === new URL(this.baseUrl).origin;
+    } catch {
+      return false;
+    }
+  }
+
   /** Download an attachment's bytes by blob id. */
   async downloadBlob(id: string): Promise<Uint8Array> {
-    const res = await this.fetchImpl(`${this.baseUrl}/api/blobs/${encodeURIComponent(id)}`, {
+    const res = await this.fetchImpl(withClientVersion(`${this.baseUrl}/api/blobs/${encodeURIComponent(id)}`), {
       method: "GET",
       headers: this.baseHeaders(),
     });
@@ -1296,11 +4637,36 @@ export class ApiClient {
   }
 }
 
+/** Re-type a failed blob call so callers can branch on the server's `code`. */
+function asBlobError(e: unknown): unknown {
+  if (e instanceof BlobTransportError) return e;
+  if (e instanceof ApiError) {
+    return new BlobTransportError(e.status, errorCodeOf(e.body), e.message, e.body);
+  }
+  return e;
+}
+
 function stripTrailingSlash(url: string): string {
   return url.replace(/\/+$/, "");
 }
 
 /** Normalize snake/camel doc-id/vault-id fields the server may return. */
+function skillsBase(orgId: string): string {
+  return `/api/orgs/${encodeURIComponent(orgId)}/skills`;
+}
+function skillPath(orgId: string, skillId: string): string {
+  return `${skillsBase(orgId)}/${encodeURIComponent(skillId)}`;
+}
+
+/** The `error` code of a skills refusal (`stale_draft`, `invalid_skill` …), or null. */
+export function skillErrorCode(e: unknown): string | null {
+  if (!(e instanceof ApiError)) return null;
+  const b = e.body;
+  return b && typeof b === "object" && typeof (b as { error?: unknown }).error === "string"
+    ? (b as { error: string }).error
+    : null;
+}
+
 export function noteDocId(n: RegisteredNote): string {
   return n.docId ?? n.doc_id ?? n.id;
 }
@@ -1309,6 +4675,10 @@ export function noteVaultId(n: RegisteredNote): string | undefined {
 }
 export function noteRelPath(n: RegisteredNote): string | undefined {
   return n.relPath ?? n.rel_path;
+}
+/** Who created the note, or null when the server didn't say. */
+export function noteCreatedBy(n: RegisteredNote): string | null {
+  return n.createdBy ?? n.created_by ?? null;
 }
 /**
  * The note's last-edit stamp, or null when it has never been edited (or the
@@ -1337,9 +4707,15 @@ export function sharePrincipalId(s: Share): string {
 export function sharePrincipalType(s: Share): "user" | "org" {
   return s.principalType ?? s.principal_type ?? "user";
 }
-export function shareResourceType(s: Share): "folder" | "file" {
+export function shareResourceType(s: Share): "folder" | "file" | "vault" {
   return s.resourceType ?? s.resource_type ?? "file";
 }
 export function shareResourceId(s: Share): string {
   return s.resourceId ?? s.resource_id ?? "";
+}
+
+export interface VaultAppearanceResponse {
+  settings: VaultAppearanceSettings;
+  updatedAt: string | null;
+  updatedBy: string | null;
 }

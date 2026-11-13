@@ -17,27 +17,129 @@ pub const DENIED_DIRS: &[&str] = &["node_modules", "dist", "build", "target", "v
 
 /// Allowlist of file extensions the vault surfaces + syncs (lowercase, no dot).
 /// Everything else — source code, lockfiles, binaries — is ignored, so importing
-/// a real project directory can't dump junk into the vault.
+/// a real project directory can't dump junk into the vault. That flood guard is
+/// why `js`/`ts`/`css`/`java` are absent even though the app can open them.
+///
+/// ONE CONTRACT with the TS side, like `parse.rs TAG_RE` ↔ the editor's `#tag`
+/// rule: this list and `SURFACED_EXTS` in `src/lib/formats.ts` are the same set.
+/// Change one, change both — `src/lib/__tests__/formatsLockstep.test.ts` reads
+/// this file and fails otherwise.
 pub const ALLOWED_EXTS: &[&str] = &[
     // notes / text
-    "md", "markdown", "mdx", "txt", "html", "htm", "canvas",
+    "md", "markdown", "mdx", "txt", "html", "htm", "canvas", "url", "webloc",
     // images
-    "png", "jpg", "jpeg", "gif", "webp", "svg", "avif",
+    "png", "jpg", "jpeg", "jfif", "gif", "webp", "svg", "bmp", "ico", "avif", "heic", "heif",
+    "tiff", "tif",
     // documents
-    "pdf",
+    "pdf", "docx", "xlsx", "xlsm", "pptx",
+    // video / audio
+    "mp4", "m4v", "mov", "webm", "mp3", "wav", "m4a", "ogg", "aac", "flac",
+    // tabular / structured data
+    "csv", "tsv", "json", "yaml", "yml", "toml", "xml", "py", "rs", "go", "sh", "sql",
+    // archives
+    "zip",
 ];
+
+/// The CRDT note family: the only extensions that become server `notes` and ride
+/// the md↔CRDT bridge. Everything else in `ALLOWED_EXTS` surfaces in the tree but
+/// syncs as an attachment. Mirrors `NOTE_EXTS` in `src/lib/formats.ts`,
+/// `src/lib/sync/registry.ts` and `src/lib/sync/inbound.ts` (same lockstep test).
+pub const NOTE_EXTS: &[&str] = &["md", "markdown", "mdx", "txt", "html", "htm", "canvas", "url", "webloc"];
+
+/// Name prefixes of the lock and owner files other apps leave NEXT TO a file
+/// they hold open (#265). They are not the user's files: Word, Excel and
+/// PowerPoint write `~$Report.docx` beside an open `Report.docx` (with an
+/// extension the vault surfaces, so the allowlist alone lets it through) and
+/// remove it on close; LibreOffice writes `.~lock.Report.docx#`, which the dot
+/// rule already covers but is listed so the contract names it. Synced, each one
+/// was a server row, an upload attempt, a delete and a tombstone, and a ghost
+/// file appearing and vanishing in every teammate's sidebar.
+///
+/// ONE CONTRACT with `TRANSIENT_PREFIXES` in `src/lib/formats.ts` (pinned by
+/// `formatsLockstep.test.ts`) and the server's `registry/transient.ts`.
+pub const TRANSIENT_PREFIXES: &[&str] = &["~$", ".~lock."];
+
+/// True for an app's transient lock/temp file (see [`TRANSIENT_PREFIXES`]),
+/// plus the `~*.tmp` family Office writes while saving (`~WRL0001.tmp`,
+/// `~WRD0003.tmp`). `tmp` is not in `ALLOWED_EXTS`, so that half is
+/// belt-and-braces: it keeps the rule true if the allowlist ever grows one.
+///
+/// Deliberately narrow, because an ignored name drops out of the tree, the
+/// index and every sync pass: a prefix only counts on a surfaced NON-NOTE file
+/// (the only thing an owner file ever shadows), so a note or a folder somebody
+/// happened to name `~$…` keeps syncing exactly as before, and a user's own
+/// `~notes.md` is theirs. Nothing is ever deleted because of this rule — an
+/// already-registered lock file simply stops being re-uploaded.
+pub fn is_transient_name(name: &str) -> bool {
+    if TRANSIENT_PREFIXES.iter().any(|p| name.starts_with(p))
+        && is_allowed_file(name)
+        && !is_note_file(name)
+    {
+        return true;
+    }
+    name.starts_with('~') && name.len() > 5 && name.to_ascii_lowercase().ends_with(".tmp")
+}
 
 /// True if a directory/file name should be skipped by the tree walk & watcher.
 pub fn is_ignored_name(name: &str) -> bool {
-    name.starts_with('.') || IGNORED_DIRS.contains(&name) || DENIED_DIRS.contains(&name)
+    name.starts_with('.')
+        || IGNORED_DIRS.contains(&name)
+        || DENIED_DIRS.contains(&name)
+        || is_transient_name(name)
 }
 
 /// True if a file (by name) is an allowed, surfaceable type per `ALLOWED_EXTS`.
 /// Files with no extension, or an extension not on the list, are not surfaced.
 pub fn is_allowed_file(name: &str) -> bool {
+    has_ext_in(name, ALLOWED_EXTS)
+}
+
+/// True if a file (by name) belongs to the CRDT note family (`NOTE_EXTS`).
+pub fn is_note_file(name: &str) -> bool {
+    has_ext_in(name, NOTE_EXTS)
+}
+
+/// Does the vault-root `attachments/` store feed the FILE index (`files` /
+/// `files_fts`)?
+///
+/// **No, deliberately.** Those files are content-addressed
+/// (`attachments/<16 hex>.png`), hidden from the sidebar, and reachable only
+/// through the note that embeds them — so a search hit on one would name a file
+/// the user cannot see, cannot locate and cannot open from the result. The note
+/// that embeds it is the hit they actually want, and that one is indexed. Flip
+/// this to `true` only alongside a way to show "used by <note>" on the hit.
+pub const INDEX_ATTACHMENTS: bool = false;
+
+/// The vault-root directory holding content-addressed attachments. Mirrors
+/// `attachments.rs ensure_attachment_rel` and `stats.rs ATTACHMENTS_DIR`.
+const ATTACHMENTS_PREFIX: &str = "attachments/";
+
+/// True if a vault-relative path is a tree-visible binary the FILE index covers:
+/// surfaced by `ALLOWED_EXTS`, outside the note family, and not somewhere the
+/// walk ignores. The single authority for "does this get a `files` row",
+/// shared by `Index::rebuild` and the watcher's `plan_batch` so the open-time
+/// reconcile and the live path can never disagree about the set.
+///
+/// Note what this does NOT ask: whether the file exists. Callers that need that
+/// (both of them) already have the answer from the walk or the existence check
+/// that decides modified-vs-removed.
+pub fn is_indexable_file(rel: &str) -> bool {
+    if rel.is_empty() || rel_path_is_ignored(rel) {
+        return false;
+    }
+    if !INDEX_ATTACHMENTS && rel.starts_with(ATTACHMENTS_PREFIX) {
+        return false;
+    }
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    is_allowed_file(name) && !is_note_file(name)
+}
+
+/// Shared extension test: split at the LAST dot and require both halves, so a
+/// dotfile (`.gitignore`) has no extension and never matches.
+fn has_ext_in(name: &str, exts: &[&str]) -> bool {
     match name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
-            ALLOWED_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+            exts.contains(&ext.to_ascii_lowercase().as_str())
         }
         _ => false,
     }
@@ -54,7 +156,9 @@ pub fn is_vault(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    const NOTE_EXTS: &[&str] = &["md", "markdown", "mdx"];
+    // Deliberately narrower than `NOTE_EXTS`: a folder of .txt/.html is not by
+    // itself evidence that someone already uses it as a vault.
+    const VAULT_MARKER_EXTS: &[&str] = &["md", "markdown", "mdx"];
     for entry in entries.flatten() {
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
@@ -62,7 +166,7 @@ pub fn is_vault(dir: &Path) -> bool {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if let Some((stem, ext)) = name.rsplit_once('.') {
-            if !stem.is_empty() && NOTE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+            if !stem.is_empty() && VAULT_MARKER_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
                 return true;
             }
         }
@@ -104,6 +208,90 @@ pub fn resolve_in_vault(vault: &Path, rel: &str) -> AppResult<PathBuf> {
         return Err(AppError::new("resolved path escapes the vault"));
     }
     Ok(normalized)
+}
+
+/// What sits at a path, WITHOUT following a symbolic link at it (#216).
+///
+/// The tree walk and the index both skip links (`DirEntry::file_type()` /
+/// WalkDir with `follow_links` off), so every check that decides whether a note
+/// is still there must agree with them: a link at a note path is NOT the note.
+/// `Path::exists()` / `is_file()` follow links and used to answer "present" for
+/// a path the sidebar and the registry saw as gone, which kept a stale doc id
+/// mapped and live beside the real file's new identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathState {
+    Missing,
+    Regular,
+    Symlink,
+    Dir,
+}
+
+impl PathState {
+    /// Identity checks treat a link exactly like nothing: Baalda never syncs
+    /// through links.
+    pub fn is_absent(self) -> bool {
+        matches!(self, PathState::Missing | PathState::Symlink)
+    }
+}
+
+/// The state of the LAST component of `abs`, on `symlink_metadata`. A dangling
+/// link is `Symlink`, not `Missing`. Anything else that is neither a link nor a
+/// folder (a socket, a fifo) reads as `Regular`.
+pub fn path_state(abs: &Path) -> PathState {
+    match std::fs::symlink_metadata(abs) {
+        Ok(m) if m.file_type().is_symlink() => PathState::Symlink,
+        Ok(m) if m.is_dir() => PathState::Dir,
+        Ok(_) => PathState::Regular,
+        Err(_) => PathState::Missing,
+    }
+}
+
+/// [`path_state`] for a vault-relative path, where a link in ANY component
+/// below the vault root also counts: with `Old -> Business/Old`, `Old/n.md` is
+/// `Symlink`, because `symlink_metadata` only declines to follow the FINAL
+/// component and would report the real file behind the folder link as
+/// `Regular`. The walk never descends into `Old`, so the identity checks must
+/// not either. The vault root itself is not inspected (a vault opened through a
+/// link is still a vault). A missing or non-folder ancestor is `Missing`.
+pub fn vault_path_state(vault: &Path, rel: &str) -> PathState {
+    let segs: Vec<&str> = rel
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if segs.is_empty() {
+        return path_state(vault);
+    }
+    let mut cur = vault.to_path_buf();
+    for (i, seg) in segs.iter().enumerate() {
+        cur.push(seg);
+        let st = path_state(&cur);
+        if i + 1 == segs.len() {
+            return st;
+        }
+        match st {
+            PathState::Dir => {}
+            PathState::Symlink => return PathState::Symlink,
+            PathState::Missing | PathState::Regular => return PathState::Missing,
+        }
+    }
+    PathState::Missing
+}
+
+/// Refuse a write whose vault root is no longer a folder (#221).
+///
+/// Every write path below creates missing parent folders, which is right inside
+/// a vault and exactly wrong when the vault itself moved, was renamed or its
+/// drive unmounted while the app was open: a late egest, placeholder or
+/// download would quietly re-create the OLD folder with a stray file in it.
+/// Follows links, like the watcher's root check.
+pub fn require_vault_root(vault: &Path) -> AppResult<()> {
+    if vault.is_dir() {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "the vault folder is missing: it moved, was renamed or its drive was unmounted",
+        ))
+    }
 }
 
 /// Lexical normalization (collapse `.` / `..`) without filesystem access.
@@ -162,6 +350,30 @@ mod tests {
     }
 
     #[test]
+    fn ignores_office_and_editor_lock_files() {
+        // Office owner files carry a surfaced extension: the allowlist alone
+        // would sync them (#265).
+        assert!(is_ignored_name("~$Report.docx"));
+        assert!(is_ignored_name("~$dget.xlsx"));
+        assert!(is_ignored_name("~$eck.pptx"));
+        assert!(is_ignored_name("~WRL0001.tmp"));
+        assert!(is_ignored_name("~WRD0003.TMP"));
+        assert!(is_ignored_name(".~lock.Report.docx#"));
+        assert!(rel_path_is_ignored("Team/Docs/~$Report.docx"));
+        assert!(!is_indexable_file("Team/~$Report.docx"));
+        // Narrow on purpose: a note or folder named like one keeps syncing.
+        assert!(!is_ignored_name("~$draft.md"));
+        assert!(!is_ignored_name("~$Archive"));
+        assert!(!rel_path_is_ignored("~$Archive/notes.md"));
+        // A user's own tilde-named files are theirs.
+        assert!(!is_ignored_name("~notes.md"));
+        assert!(!is_ignored_name("~.tmp"));
+        assert!(!is_ignored_name("Report~$.docx"));
+        assert!(!is_ignored_name("~é.md"));
+        assert!(!rel_path_is_ignored("Team/Report.docx"));
+    }
+
+    #[test]
     fn ignores_dotfolders_and_context_dirs() {
         assert!(is_ignored_name(".context"));
         assert!(is_ignored_name(".git"));
@@ -181,14 +393,72 @@ mod tests {
         assert!(!is_ignored_name("Projects")); // real folders still walked
     }
 
+    /// The allow-list is one contract with `SURFACED_EXTS` in
+    /// `src/lib/formats.ts` — see `formatsLockstep.test.ts`. Source code stays
+    /// off it on purpose: the app can OPEN a `.js`, it just refuses to flood the
+    /// sidebar with a project's worth of them.
     #[test]
-    fn allowlist_accepts_notes_images_pdf_only() {
-        for ok in ["note.md", "a.markdown", "b.MDX", "readme.txt", "page.html", "img.png", "p.JPG", "doc.pdf"] {
+    fn allowlist_matches_the_format_registry() {
+        for ok in [
+            "note.md", "a.markdown", "b.MDX", "readme.txt", "page.html", "board.canvas",
+            "img.png", "p.JPG", "icon.svg", "shot.HEIC", "scan.tiff",
+            "doc.pdf", "report.docx", "sheet.xlsx", "macro.xlsm", "deck.pptx",
+            "clip.mp4", "cut.mov", "talk.mp3", "take.m4a",
+            "data.csv", "tab.tsv", "map.json", "notes.yaml", "conf.toml", "feed.xml",
+            "run.py", "lib.rs", "main.go", "setup.sh", "q.sql",
+            "bundle.zip",
+        ] {
             assert!(is_allowed_file(ok), "{ok} should be allowed");
         }
-        for no in ["script.js", "types.d.ts", "styles.css", "data.json", "Makefile", "LICENSE", "bundle.min.js"] {
+        for no in ["script.js", "types.d.ts", "styles.css", "Makefile", "LICENSE", "bundle.min.js"] {
             assert!(!is_allowed_file(no), "{no} should be rejected");
         }
+    }
+
+    /// Only the note family joins the CRDT bridge; everything else surfaced by
+    /// `ALLOWED_EXTS` syncs as an attachment.
+    #[test]
+    fn note_family_is_narrower_than_the_allowlist() {
+        for ok in ["note.md", "a.MARKDOWN", "b.mdx", "readme.txt", "page.html", "p.htm", "board.canvas"] {
+            assert!(is_note_file(ok), "{ok} should be a note");
+            assert!(is_allowed_file(ok), "{ok} should also be surfaced");
+        }
+        for no in ["img.png", "doc.pdf", "clip.mp4", "sheet.xlsx", "data.csv", ".gitignore", "Makefile"] {
+            assert!(!is_note_file(no), "{no} should not be a note");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_state_sees_links_without_following_them() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let v = tmp.path();
+        std::fs::create_dir_all(v.join("Business/Old")).unwrap();
+        std::fs::write(v.join("Business/Old/n.md"), "real").unwrap();
+        std::fs::write(v.join("real.md"), "x").unwrap();
+        symlink(v.join("real.md"), v.join("link.md")).unwrap();
+        symlink(v.join("Business/Old"), v.join("Old")).unwrap();
+        symlink(v.join("nowhere.md"), v.join("dangling.md")).unwrap();
+
+        assert_eq!(path_state(&v.join("real.md")), PathState::Regular);
+        assert_eq!(path_state(&v.join("link.md")), PathState::Symlink);
+        assert_eq!(path_state(&v.join("Old")), PathState::Symlink);
+        assert_eq!(path_state(&v.join("dangling.md")), PathState::Symlink);
+        assert_eq!(path_state(&v.join("Business")), PathState::Dir);
+        assert_eq!(path_state(&v.join("absent.md")), PathState::Missing);
+
+        // Through a folder link the leaf alone looks regular; the vault-aware
+        // check does not.
+        assert_eq!(path_state(&v.join("Old/n.md")), PathState::Regular);
+        assert_eq!(vault_path_state(v, "Old/n.md"), PathState::Symlink);
+        assert_eq!(vault_path_state(v, "Business/Old/n.md"), PathState::Regular);
+        assert_eq!(vault_path_state(v, "link.md"), PathState::Symlink);
+        assert_eq!(vault_path_state(v, "dangling.md"), PathState::Symlink);
+        assert_eq!(vault_path_state(v, "Nope/n.md"), PathState::Missing);
+        assert_eq!(vault_path_state(v, "real.md/n.md"), PathState::Missing);
+        assert!(PathState::Symlink.is_absent() && PathState::Missing.is_absent());
+        assert!(!PathState::Regular.is_absent() && !PathState::Dir.is_absent());
     }
 
     #[test]

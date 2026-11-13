@@ -1,8 +1,10 @@
 import type pg from "pg";
 import { pool as defaultPool } from "../db/pool.js";
 import { orgRole } from "../permissions/lookup.js";
-import { auth } from "../auth/auth.js";
+import { vaultKeysEnabled } from "../crypto/config.js";
 import type { McpAuth } from "./tokens.js";
+import { bearerFrom, findAccessRow, hashRowInPlace } from "./oauth-token-hash.js";
+import { grantOrg, resolveGrantKeys } from "./oauth-grant-keys.js";
 
 /**
  * The OAuth half of MCP auth (migration 007 + the Better Auth `mcp` plugin).
@@ -37,51 +39,47 @@ export async function setVaultBinding(
   );
 }
 
-/** The vault bound to (client, user), or null if none was recorded. */
-async function getVaultBinding(
-  clientId: string,
-  userId: string,
-  db: Queryable = defaultPool,
-): Promise<string | null> {
-  const { rows } = await db.query<{ organization_id: string }>(
-    "SELECT organization_id FROM mcp_oauth_vault WHERE client_id = $1 AND user_id = $2",
-    [clientId, userId],
-  );
-  return rows[0]?.organization_id ?? null;
-}
+// The vault a grant acts on (binding, else the user's sole vault) lives in
+// oauth-grant-keys.ts `grantOrg`, shared with the token endpoint's rewrap.
 
-/** Fallback when no binding exists: the user's sole vault, else null. */
-async function soleVault(
-  userId: string,
-  db: Queryable = defaultPool,
-): Promise<string | null> {
-  const { rows } = await db.query<{ organizationId: string }>(
-    `SELECT "organizationId" FROM member WHERE "userId" = $1`,
-    [userId],
-  );
-  return rows.length === 1 ? rows[0].organizationId : null;
-}
+/** Why an OAuth bearer did not resolve: signed in, but no vault chosen. */
+export type OAuthMcpFailure = "no_vault_selected" | null;
 
 /**
  * Resolve an incoming request carrying an OAuth `Authorization: Bearer` access
  * token to an `McpAuth`, or null if the token is missing/invalid/expired, no
  * vault can be determined, or the user is no longer a member of it
  * (membership can be revoked out from under a live token — re-checked here,
- * exactly like verifyMcpToken does for mcp_ tokens).
+ * exactly like verifyMcpToken does for mcp_ tokens). `onFailure` learns when
+ * the token itself was valid but no vault was bound, so the 401 can say so.
  */
 export async function resolveOAuthMcpAuth(
   headers: Headers,
   db: Queryable = defaultPool,
+  onFailure?: (reason: OAuthMcpFailure) => void,
 ): Promise<McpAuth | null> {
-  const session = await auth.api.getMcpSession({ headers });
+  // Better Auth's getMcpSession matched the bearer verbatim; tokens are now
+  // stored as hashes (lazily), so the lookup accepts either stored form.
+  const bearer = bearerFrom(headers);
+  if (!bearer) return null;
+  const session = await findAccessRow(db, bearer);
   if (!session?.userId || !session.clientId) return null;
+  if (session.legacyPlaintext) {
+    hashRowInPlace(db, session.id).catch(() => {}); // lazy; a plaintext row still resolves
+  }
 
-  const organizationId =
-    (await getVaultBinding(session.clientId, session.userId, db)) ??
-    (await soleVault(session.userId, db));
-  if (!organizationId) return null;
+  const organizationId = await grantOrg(session.clientId, session.userId, db);
+  if (!organizationId) {
+    onFailure?.("no_vault_selected");
+    return null;
+  }
 
   if (!(await orgRole(organizationId, session.userId, db))) return null;
 
-  return { userId: session.userId, organizationId };
+  const out: McpAuth = { userId: session.userId, organizationId, oauthClientId: session.clientId };
+  if (vaultKeysEnabled()) {
+    const keys = await resolveGrantKeys(bearer, session, organizationId, db);
+    if (keys.size > 0) out.vaultKeys = keys;
+  }
+  return out;
 }

@@ -5,6 +5,7 @@
 use crate::index::Index;
 use crate::oauth::OauthResult;
 use crate::watcher::VaultWatcher;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,19 @@ pub struct AppState {
     /// receiver here; `google_oauth_await` takes it out and blocks on it. Its
     /// own mutex so it never contends with the vault/index lock.
     pub oauth_rx: Mutex<Option<Receiver<OauthResult>>>,
+    /// The parsed app `config.json`, cached after its first read.
+    ///
+    /// Its OWN mutex, deliberately: a config read must never queue behind the
+    /// vault/index lock, which the background rebuild holds for the whole of a
+    /// vault open. `None` means "not loaded yet"; `write_config` replaces the
+    /// cached value rather than invalidating it, so the next read never touches
+    /// the disk. Correct only while this process is the sole writer of the file,
+    /// which it is (single-instance plugin) — a future "reload settings from
+    /// disk" would have to clear this.
+    pub config: Mutex<Option<crate::commands::AppConfig>>,
+    /// HTML view leases are issued to the host, never to the opaque guest.
+    /// Individual tokens prevent a late unmount from revoking a newer frame.
+    pub(crate) dashboard_views: Mutex<HashMap<String, crate::dashboard::DashboardViewLease>>,
 }
 
 #[derive(Default)]

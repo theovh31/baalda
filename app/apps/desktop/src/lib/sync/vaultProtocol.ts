@@ -1,3 +1,5 @@
+import { parseVaultAppearanceSettings, type VaultAppearanceSettings } from "../appearanceSettings";
+
 // Client half of the vault replication channel framing (spec 05 §3.1). Mirrors
 // the server's `sync/vault-protocol.ts`: JSON text control frames + binary data
 // frames [docIdLen u16 BE][docId utf8][update bytes]. Kept tiny and pure so the
@@ -14,11 +16,39 @@ export interface HelloFrame {
   /** Recently-touched docIds to backfill first (spec 05 §4). */
   priority?: string[];
   /**
+   * doc ids of the `files` rows (tree binaries) this device holds on disk.
+   *
+   * Not in {@link manifest}, because a binary has no CRDT and so no state vector
+   * — there is nothing to diff and nothing to backfill. The one thing the server
+   * does with them is the `ready.revoked` set arithmetic: a `.pdf` set to Private
+   * has to leave this disk exactly as a note does, and the server can only name
+   * what we tell it we hold. They share the notes' `REVOKED_CAP`.
+   */
+  files?: string[];
+  /** Mapped notes held locally, including those with no CRDT state vector yet. */
+  held?: string[];
+  /** W3: the vault key (base64), only for a keyed vault whose key verified. */
+  vk?: string;
+  /**
    * This app instance's id (`ApiClient.getClientId()`), the same value sent as
    * `x-baalda-origin` on registry writes. Lets the server skip telling us to
    * re-pull a structural change we made ourselves.
    */
   origin?: string;
+  /**
+   * Ask the server for a LIVE channel only: no cold `backfill()`.
+   *
+   * Sent while the bulk engine owns the download — the bootstrap route pages the
+   * same content out over HTTP with a resumable cursor, and having both deliver
+   * it means every doc arrives twice. The server still computes and sends
+   * `ready` (`empty`/`revoked`; `behind` may be empty), because those three
+   * lists are authorities the session needs on every connect, backfill or not.
+   *
+   * Omitted (not `false`) when the backfill IS wanted, so the common frame stays
+   * byte-identical to what every shipped server already parses; an older server
+   * ignores the unknown field and simply backfills, which is today's behaviour.
+   */
+  mode?: "live-only";
   /**
    * Feature flags this build understands. The server withholds any NEW binary
    * frame type from a client that didn't list it — without that, an older build
@@ -29,7 +59,7 @@ export interface HelloFrame {
 }
 
 /** What this build can handle beyond the original protocol. Sent in `hello`. */
-export const CLIENT_CAPS = ["voice"];
+export const CLIENT_CAPS = ["voice", "revocation-batches", "bulk-regrant", "member-removed", "invitations", "messages"];
 
 /** A teammate's live "who's viewing what" state (mirror of the server type).
  *  `docId` null means the user isn't viewing anything (or left) — clear them. */
@@ -39,6 +69,8 @@ export interface PresenceState {
   name: string;
   color: string;
   status: string;
+  /** Optional status moment; see `statusToWire` in lib/prefs.ts. */
+  moment?: string;
 }
 
 export type ServerControl =
@@ -58,12 +90,103 @@ export type ServerControl =
       /** The server had more empty docs than it would name in one frame (cap
        *  2000), so another `hello` is needed to fetch the next batch. */
       emptyTruncated?: boolean;
+      /**
+       * Readable docIds for which OUR manifest ran ahead of the server: this
+       * device holds ops the server has never received (typed offline and never
+       * flushed, a push cut short, a mint that failed). The backfill is
+       * downstream-only, so these must be pushed over their per-doc sockets —
+       * whatever the local `pushed` checkpoint claims. Until the server said so,
+       * such a doc re-downloaded an empty diff on every connect (40 notes
+       * "syncing" on every reload of one vault) and its edits stayed local.
+       *
+       * Absent when there are none.
+       */
+      behind?: string[];
+      /** More than one frame would name (cap 2000). */
+      behindTruncated?: boolean;
+      /**
+       * Readable-no-longer docIds: docs OUR OWN hello told the server we hold
+       * (the manifest's notes AND `files`' tree binaries), which are not in our
+       * readable set any more. The server STATING a
+       * revocation instead of us inferring one from a short listing.
+       *
+       * This is what covers a revocation that happened while the app was shut.
+       * The live announcement (`reauth`) only reaches a client that was
+       * connected at the time, so "Vault -> Private while the member's app is
+       * closed" left the notes readable on their disk indefinitely. This rides
+       * every `ready`, so the next launch carries the authority the removal
+       * needs — and, unlike `reauth`, it NAMES the docs, which lets the planner
+       * cross-check the registry listing against it.
+       *
+       * Bounded by our own manifest: a vault full of docs we never had names
+       * none of them. Absent when there are none.
+       */
+      revoked?: string[];
+      /** More than one frame would name (cap 2000). */
+      revokedTruncated?: boolean;
+      /**
+       * Docs our hello claims (manifest or `held`) that are SOFT-DELETED in this
+       * vault. Treated exactly like the registry pull's tombstones, and never
+       * as a revocation even when `revoked` names the same id (a deleted doc
+       * also leaves the readable set). Absent from older servers.
+       */
+      tombstones?: string[];
+      /** More than one frame would name (cap 2000). */
+      tombstonesTruncated?: boolean;
+      /**
+       * Manifest docs whose hello state vector the server FULLY covers — the
+       * server holds every op we said we had. The acknowledgement the inbound
+       * destruction gate reads (`VaultRegistry.recordAck`), recorded as the
+       * exact vector we sent. Omitted in live-only mode and by older servers;
+       * never overlaps `tombstones`/`revoked`.
+       */
+      covered?: string[];
+      /** More than one frame would name. */
+      coveredTruncated?: boolean;
     }
+  | { t: "revoked"; docIds: string[] }
+  | { t: "bootstrap" }
   | { t: "drop"; docId: string }
+  /** Our READ-ONLY connection tried to push ops for `docId`, and the server
+   *  dropped them (throttled server-side, ~5 s per connection). */
+  | { t: "rejected"; docId: string; reason: "read_only" }
   | { t: "reauth" }
-  | { t: "registry" }
+  /** `meta`: the window carried only "last edited by" stamps, nothing
+   *  structural (#262) — the session folds it into a throttled pull. */
+  | { t: "registry"; meta?: true }
+  /** The vault's Trash or shrink-event listings changed (#260). */
+  | { t: "activity" }
   | { t: "member"; name: string }
+  /** `userId` lost membership of vault `orgId` (removed by an owner/admin, or
+   *  left). Sent only to that user's own sockets, then the server closes them. */
+  | { t: "member-removed"; orgId: string; userId: string; reason: "removed" | "left" }
+  /** The vault's name or icon changed (#306): patch the vault list in place. */
+  | { t: "org"; name?: string; logo?: string | null }
+  /** The vault's appearance defaults changed: the WHOLE settings object. */
+  | { t: "appearance-changed"; orgId?: string; settings: VaultAppearanceSettings; updatedAt?: string }
+  /** The vault's team skills changed (publish, delivery, pin, delete,
+   *  settings): a hint to refetch the skills manifest, nothing more. */
+  | { t: "skills-changed"; orgId: string }
+  /** This user's pending messages changed: a hint to refetch `GET /api/messages`. */
+  | { t: "messages-changed" }
   | ({ t: "presence" } & PresenceState)
+  /** A new release exists (#269): a hint to run the normal update check now. */
+  | { t: "version-available"; version: string }
+  /** Addressed to THIS user, whatever vault the channel is for (`invitations`
+   *  cap): an invitation arrived, or one was answered/cancelled elsewhere. */
+  | {
+      t: "invitation";
+      invitationId: string;
+      orgId: string;
+      orgName: string;
+      inviterName: string;
+      role: string;
+    }
+  | { t: "invitation-gone"; invitationId: string }
+  /** The shrink burst brake (#252) paused — or stopped pausing — THIS user's
+   *  content writes in this vault. `until` (ms epoch) and `count` come with a
+   *  pause. Never a refusal: local edits stay and sync once it lifts. */
+  | { t: "brake"; held: boolean; until?: number; count?: number }
   | { t: "err"; message: string };
 
 export function encodeHello(frame: Omit<HelloFrame, "t">): string {
@@ -97,20 +220,85 @@ export function parseServerControl(text: string): ServerControl | null {
     // future one may widen it. Anything that isn't an array of non-empty strings
     // is dropped rather than trusted — a bad entry here would put a bogus docId
     // at the FRONT of the upload queue.
-    const empty = Array.isArray(o.empty)
-      ? o.empty.filter((d): d is string => typeof d === "string" && d.length > 0)
-      : null;
+    const ids = (v: unknown): string[] | null =>
+      Array.isArray(v) ? v.filter((d): d is string => typeof d === "string" && d.length > 0) : null;
+    const empty = ids(o.empty);
+    const behind = ids(o.behind);
+    const revoked = ids(o.revoked);
+    const tombstones = ids(o.tombstones);
+    const covered = ids(o.covered);
     return {
       t: "ready",
       ...(empty && empty.length > 0 ? { empty } : {}),
       ...(o.emptyTruncated === true ? { emptyTruncated: true } : {}),
+      ...(behind && behind.length > 0 ? { behind } : {}),
+      ...(o.behindTruncated === true ? { behindTruncated: true } : {}),
+      ...(revoked && revoked.length > 0 ? { revoked } : {}),
+      ...(o.revokedTruncated === true ? { revokedTruncated: true } : {}),
+      ...(tombstones && tombstones.length > 0 ? { tombstones } : {}),
+      ...(o.tombstonesTruncated === true ? { tombstonesTruncated: true } : {}),
+      ...(covered && covered.length > 0 ? { covered } : {}),
+      ...(o.coveredTruncated === true ? { coveredTruncated: true } : {}),
     };
   }
+  if (t === "bootstrap") return { t: "bootstrap" };
+  if (t === "revoked") {
+    const docIds = (v as { docIds?: unknown }).docIds;
+    if (!Array.isArray(docIds) || docIds.length > 2000 ||
+        !docIds.every((id) => typeof id === "string" && id.length > 0)) return null;
+    return { t: "revoked", docIds };
+  }
   if (t === "reauth") return { t: "reauth" };
-  if (t === "registry") return { t: "registry" };
+  if (t === "registry") {
+    return (v as { meta?: unknown }).meta === true ? { t: "registry", meta: true } : { t: "registry" };
+  }
+  if (t === "activity") return { t: "activity" };
+  if (t === "member-removed") {
+    const o = v as { orgId?: unknown; userId?: unknown; reason?: unknown };
+    if (typeof o.orgId !== "string" || o.orgId.length === 0) return null;
+    if (typeof o.userId !== "string" || o.userId.length === 0) return null;
+    if (o.reason !== "removed" && o.reason !== "left") return null;
+    return { t: "member-removed", orgId: o.orgId, userId: o.userId, reason: o.reason };
+  }
+  if (t === "invitation" || t === "invitation-gone") {
+    const o = v as Record<string, unknown>;
+    if (typeof o.invitationId !== "string") return null;
+    if (t === "invitation-gone") return { t, invitationId: o.invitationId };
+    const str = (x: unknown) => (typeof x === "string" ? x : "");
+    return {
+      t,
+      invitationId: o.invitationId,
+      orgId: str(o.orgId),
+      orgName: str(o.orgName),
+      inviterName: str(o.inviterName),
+      role: str(o.role) || "member",
+    };
+  }
   if (t === "member" && typeof (v as { name?: unknown }).name === "string") {
     return { t: "member", name: (v as { name: string }).name };
   }
+  if (t === "org") {
+    const o = v as { name?: unknown; logo?: unknown };
+    const frame: { t: "org"; name?: string; logo?: string | null } = { t: "org" };
+    if (typeof o.name === "string") frame.name = o.name;
+    if (typeof o.logo === "string" || o.logo === null) frame.logo = o.logo;
+    return frame;
+  }
+  // Accept the contract's `type` spelling as well as this protocol's `t`.
+  if (t === "appearance-changed" || (v as { type?: unknown }).type === "appearance-changed") {
+    const o = v as { orgId?: unknown; settings?: unknown; updatedAt?: unknown };
+    return {
+      t: "appearance-changed",
+      ...(typeof o.orgId === "string" ? { orgId: o.orgId } : {}),
+      settings: parseVaultAppearanceSettings(o.settings),
+      ...(typeof o.updatedAt === "string" ? { updatedAt: o.updatedAt } : {}),
+    };
+  }
+  if (t === "skills-changed") {
+    const orgId = (v as { orgId?: unknown }).orgId;
+    return typeof orgId === "string" && orgId ? { t: "skills-changed", orgId } : null;
+  }
+  if (t === "messages-changed") return { t: "messages-changed" };
   if (t === "presence") {
     const o = v as Record<string, unknown>;
     if (
@@ -127,9 +315,40 @@ export function parseServerControl(text: string): ServerControl | null {
         name: o.name,
         color: o.color,
         status: o.status,
+        ...(typeof o.moment === "string" ? { moment: o.moment } : {}),
       };
     }
     return null;
+  }
+  if (t === "rejected") {
+    const r = v as { docId?: unknown; reason?: unknown };
+    // Only the reason this build understands; anything else is ignored like
+    // any unknown frame.
+    if (typeof r.docId === "string" && r.docId.length > 0 && r.reason === "read_only") {
+      return { t: "rejected", docId: r.docId, reason: "read_only" };
+    }
+    return null;
+  }
+  if (t === "version-available") {
+    const ver = (v as { version?: unknown }).version;
+    return typeof ver === "string" && ver.length > 0 && ver.length <= 64
+      ? { t: "version-available", version: ver }
+      : null;
+  }
+  if (t === "brake") {
+    const o = v as { held?: unknown; until?: unknown; count?: unknown };
+    if (typeof o.held !== "boolean") return null;
+    if (!o.held) return { t: "brake", held: false };
+    const num = (x: unknown): number | undefined =>
+      typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined;
+    const until = num(o.until);
+    const count = num(o.count);
+    return {
+      t: "brake",
+      held: true,
+      ...(until !== undefined ? { until } : {}),
+      ...(count !== undefined ? { count: Math.floor(count) } : {}),
+    };
   }
   if (t === "drop" && typeof (v as { docId?: unknown }).docId === "string") {
     return { t: "drop", docId: (v as { docId: string }).docId };

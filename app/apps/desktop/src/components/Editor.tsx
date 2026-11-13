@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import "./editor.css";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { keymap, EditorView } from "@codemirror/view";
@@ -6,27 +6,43 @@ import { Compartment, EditorState } from "@codemirror/state";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import { remoteCursors } from "../lib/editor/remoteCursors";
 import type { Awareness } from "y-protocols/awareness";
-import { createEditorState } from "../lib/editor";
-import { setActiveView } from "../lib/editor/activeView";
+import { createEditorState, lineNumberExtension } from "../lib/editor";
+import { foldEffectsFor, parseNoteUiState, persistFolds } from "../lib/editor/folding";
+import { propertiesMode as propertiesModeFacet } from "../lib/editor/frontmatter";
+import { loadTypes } from "../lib/frontmatter/types";
+import { dispatchAfterCommit } from "../lib/editor/effectDispatch";
+import { openingCaret } from "../lib/editor/livePreview";
+import { wikilinkTitlesChanged } from "../lib/editor/wikilinks";
+import { wikilinkClickAction } from "../lib/editor/wikilinkResolve";
+import { setActiveNote } from "../lib/editor/activeView";
+import { bindActiveNote } from "../lib/editor/activeNoteBinding";
 import { saveAttachment } from "../lib/attachments";
 import { bridgeManager, type NoteBridge } from "../lib/bridge";
-import { effectiveLockForPath, lockScopesByPath } from "../lib/locks";
+import { editorMeasureStyle } from "../lib/editorMeasure";
+import { hasBillingLapsedLock, lockBlocksCaller, lockScopesByPath } from "../lib/locks";
 import { playPingSound } from "../lib/presence/ping";
 import { syncManager } from "../lib/sync/docSession";
 import { colorForUser, PRESENCE_OFFLINE, statusTone, ringShowsColor } from "../lib/presence/color";
 import type { ActivityStatus } from "../lib/prefs";
+import { StatusMoment } from "./StatusMoment";
+import { isMoment, statusFromWire } from "../lib/prefs";
 import { useStore } from "../store";
 import * as ipc from "../lib/ipc";
-import { HtmlView } from "./HtmlView";
 import { FilePreview } from "./FilePreview";
-import { previewKind } from "../lib/preview";
-import { relativeAgo, characterSvg } from "./Identity";
+import { viewerFor } from "../lib/formats";
+import { relativeAgo } from "./Identity";
+import { EditorEmpty, EditorSkeleton } from "./EditorPlaceholders";
+import { FaceSvg } from "./Avatar";
 import { agoFromIso, lastEditedTooltip } from "./versionFormat";
+import { noteContentReady, shouldShowNoteSkeleton } from "../lib/editor/noteLoading";
+import { registerLiveView } from "./liveEditorViews";
 
 interface Peer {
   id: string;
   name: string;
   color: string;
+  /** Their picked character or photo URL, when their build broadcasts it. */
+  image?: string;
   /** Their chosen availability status, broadcast via awareness (`user.status`). */
   status?: ActivityStatus;
   /** Line their cursor is on (from the `activity` awareness field), if known. */
@@ -36,7 +52,7 @@ interface Peer {
 }
 
 interface AwarenessPeerState {
-  user?: { id?: string; name?: string; color?: string; status?: ActivityStatus };
+  user?: { id?: string; name?: string; color?: string; status?: ActivityStatus; moment?: string; image?: string };
   activity?: { line?: number; at?: number };
   ping?: { to?: string; name?: string; at?: number };
 }
@@ -56,13 +72,15 @@ function readPeers(awareness: Awareness): Peer[] {
         id: u.id,
         name: u.name ?? "Someone",
         color: u.color ?? colorForUser(u.id),
-        status: u.status,
+        ...(typeof u.image === "string" && u.image ? { image: u.image } : {}),
+        status: statusFromWire(u.status, u.moment),
         line,
         lastActive: at,
       });
     } else {
       if (prev.line == null && line != null) prev.line = line;
-      if (prev.status == null && u.status != null) prev.status = u.status;
+      if (prev.status == null && u.status != null) prev.status = statusFromWire(u.status, u.moment);
+      if (prev.image == null && typeof u.image === "string" && u.image) prev.image = u.image;
       if (at != null && (prev.lastActive == null || at > prev.lastActive)) {
         prev.lastActive = at;
       }
@@ -107,9 +125,9 @@ function editableExtensions(readOnly: boolean) {
 const MAX_AVATARS = 4;
 
 /**
- * A single presence avatar: the peer's illustrated character (the same DiceBear
- * "notionists" art used for profile avatars, seeded by their name so it matches
- * their account avatar) framed by a ring in their unique presence colour. The
+ * A single presence avatar: the peer's face from the shared avatar rule
+ * (`lib/avatarIdentity.ts`: their picture, else the character seeded by their
+ * user id, so it matches their account avatar) framed by a ring in their unique presence colour. The
  * colour arrives as `--user-color` so the CSS owns the ring/glow treatment.
  */
 function PresenceAvatar({
@@ -122,19 +140,23 @@ function PresenceAvatar({
   /** When false the ring goes neutral gray — the local session isn't live. */
   online?: boolean;
 }) {
-  const svg = useMemo(() => characterSvg(peer.name || peer.id || "?"), [peer.name, peer.id]);
   // The ring shows the peer's unique colour only when the local session is live
   // AND the peer's own availability reads as present (online/busy). Away/invisible
   // peers — or any peer when we're offline — get the neutral gray ring.
   const tone = statusTone(peer.status);
   const live = online && ringShowsColor(tone);
   return (
-    <span
-      className={`presence-avatar tone-${tone}${live ? "" : " offline"}${className ? ` ${className}` : ""}`}
-      style={{ "--user-color": live ? peer.color : PRESENCE_OFFLINE } as CSSProperties}
-      aria-hidden="true"
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <span className="sm-host">
+      <FaceSvg
+        userId={peer.id}
+        name={peer.name}
+        image={peer.image}
+        className={`presence-avatar tone-${tone}${live ? "" : " offline"}${className ? ` ${className}` : ""}`}
+        style={{ "--user-color": live ? peer.color : PRESENCE_OFFLINE } as CSSProperties}
+        ariaHidden
+      />
+      <StatusMoment status={peer.status} size={30} image={peer.image} userId={peer.id} name={peer.name} pop="down" />
+    </span>
   );
 }
 
@@ -148,18 +170,14 @@ function PresenceAvatar({
 function RosterRecent({ notePath, now }: { notePath: string; now: number }) {
   const docId = syncManager.registry.getMapping(notePath)?.docId ?? null;
   const name = useStore((s) => (docId ? (s.noteLastEdited[docId]?.name ?? null) : null));
+  const userId = useStore((s) => (docId ? (s.noteLastEdited[docId]?.userId ?? null) : null));
   const at = useStore((s) => (docId ? (s.noteLastEdited[docId]?.at ?? null) : null));
-  const svg = useMemo(() => (name ? characterSvg(name) : null), [name]);
-  if (!svg || !at) return null;
+  if (!name || !at) return null;
   return (
     <>
       <div className="peer-roster-title roster-recent-title">Recent activity</div>
       <div className="roster-recent-row" title={lastEditedTooltip(name, at, now)}>
-        <span
-          className="roster-recent-avatar"
-          aria-hidden="true"
-          dangerouslySetInnerHTML={{ __html: svg }}
-        />
+        <FaceSvg userId={userId} name={name} className="roster-recent-avatar" ariaHidden />
         <span className="roster-recent-name">{name}</span>
         <span className="roster-recent-when">edited {agoFromIso(at, now)}</span>
       </div>
@@ -316,16 +334,72 @@ function PeerRoster({
  * doc is shared, a HocuspocusProvider syncs it to the server and supplies live
  * cursors + presence; a view-only grant makes the editor read-only.
  */
+/** Redesign preview: view-only as a floating dark chip with who can edit and,
+ *  when the owner is on this note right now, an Ask button that pings them. */
+function ViewOnlyChip({
+  reason,
+  peers,
+  onAsk,
+}: {
+  reason: "view" | "removed" | "lapsed";
+  peers: Peer[];
+  onAsk: (peer: Peer) => void;
+}) {
+  const members = useStore((s) => s.members);
+  const myId = useStore((s) => s.session?.user.id);
+  const owner = members.find((m) => m.role === "owner" && m.userId !== myId);
+  const ownerName = owner?.user?.name || owner?.user?.email?.split("@")[0] || null;
+  const ownerHere = owner ? peers.find((p) => p.id === owner.userId) : undefined;
+  const [asked, setAsked] = useState(false);
+  const label = reason === "removed" ? "Access removed" : reason === "lapsed" ? "Read only" : "View only";
+  return (
+    <div className="rd-viewonly" role="status">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <rect x="5" y="10" width="14" height="10" rx="2" />
+        <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+      </svg>
+      <span className="rd-viewonly-label">{label}</span>
+      <span className="rd-viewonly-msg">
+        {reason === "removed"
+          ? "This local copy is not syncing. Editing is disabled."
+          : reason === "lapsed"
+            ? "The Team subscription for this vault ended."
+            : "You can read this note, but you can’t edit it."}
+      </span>
+      {reason === "view" && ownerName && (
+        <span className="rd-viewonly-who">
+          <span className="rd-viewonly-dot">{ownerName.slice(0, 1).toUpperCase()}</span>
+          {ownerName} can edit
+        </span>
+      )}
+      {reason === "view" && ownerHere && (
+        <button type="button" className="rd-viewonly-ask" disabled={asked} onClick={() => { onAsk(ownerHere); setAsked(true); }}>
+          {asked ? "Asked" : "Ask"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function Editor() {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
 
   const openNote = useStore((s) => s.openNote);
+  // The note the user has CLICKED, which is not yet the open one. `openNoteByPath`
+  // registers the note server-side before it sets `openNote`, and that is a
+  // network round trip — ~0ms against a local server, hundreds against the
+  // managed one. Until this was read here, the editor column ignored the whole
+  // window: the click painted nothing, the previous note just sat there, and the
+  // loading skeleton only appeared for the (fast, local) half that came after.
+  // That is why the loader looked broken in production and fine in dev.
+  const openingNotePath = useStore((s) => s.openingNotePath);
   const syncEnabled = useStore((s) => s.syncEnabled);
-  const locks = useStore((s) => s.locks);
   const session = useStore((s) => s.session);
-  const tree = useStore((s) => s.tree);
   const syncStatus = useStore((s) => s.syncStatus);
+  // The vault's Team subscription lapsed: the one read-only reason that names
+  // its cause, because the fix is a plan, not an access setting.
+  const billingLapsed = useStore((s) => hasBillingLapsedLock(s.locks));
   // A version the user is hovering in the history panel, rendered over the live
   // editor. The live view stays mounted and synced underneath — this is a look,
   // not a mode.
@@ -335,9 +409,15 @@ export function Editor() {
 
   const [peers, setPeers] = useState<Peer[]>([]);
   const [readOnly, setReadOnly] = useState(false);
-  // False from the moment a note starts opening until its CodeMirror view is in
-  // the DOM. Drives the loading skeleton over the (genuinely empty) pane.
-  const [viewMounted, setViewMounted] = useState(false);
+  // These carry the path they describe rather than booleans. React renders the
+  // new `openNote` before the old effect's cleanup runs; a plain `true` from the
+  // previous note therefore briefly claimed the new note was already mounted.
+  const [mountedNotePath, setMountedNotePath] = useState<string | null>(null);
+  const [readyNotePath, setReadyNotePath] = useState<string | null>(null);
+  // True between destroying one note's view and mounting the next one's: the
+  // pane is empty because WE emptied it, so the skeleton must appear at once
+  // rather than after its first-open grace delay (see `EditorSkeleton`).
+  const switchingNoteRef = useRef(false);
   // Editability is held in a Compartment so a lock applied while the note is
   // open can flip the live view read-only without rebuilding it.
   const editableRef = useRef<Compartment | null>(null);
@@ -348,7 +428,44 @@ export function Editor() {
   // the rollback above: a live mid-session lock must never undo edits the
   // server already accepted.
   const hadEditAccessRef = useRef(false);
+  // The Properties display mode, in a Compartment so the Settings row
+  // reconfigures the live view instead of rebuilding it (like `editable`).
+  const propsModeRef = useRef<Compartment | null>(null);
+  const propertiesMode = useStore((s) => s.propertiesMode);
+  // The line-number gutter, also compartmented: flipping the Settings switch
+  // must not tear the live view down (and with it the CRDT binding).
+  const lineNumbersRef = useRef<Compartment | null>(null);
+  const lineNumbers = useStore((s) => s.lineNumbers);
+  const editorMeasure = useStore((s) => s.editorMeasure);
+  const editorFontSize = useStore((s) => s.editorFontSize);
+  const editorFont = useStore((s) => s.editorFont);
   const previewHostRef = useRef<HTMLDivElement | null>(null);
+
+  // Text size, note font and content width change every line's height through
+  // CSS alone, which CodeMirror does not observe: its height map went stale, so
+  // a click or drag was mapped to the wrong line and selected the wrong
+  // paragraph until something else forced a re-measure. Same when a web font
+  // finishes loading after the note opened.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const frame = requestAnimationFrame(() => {
+      if (viewRef.current === view) view.requestMeasure();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [editorFontSize, editorFont, editorMeasure, lineNumbers]);
+  useEffect(() => {
+    let live = true;
+    void document.fonts?.ready.then(() => {
+      if (live) viewRef.current?.requestMeasure();
+    });
+    const onLoaded = () => viewRef.current?.requestMeasure();
+    document.fonts?.addEventListener?.("loadingdone", onLoaded);
+    return () => {
+      live = false;
+      document.fonts?.removeEventListener?.("loadingdone", onLoaded);
+    };
+  }, []);
   const [rosterOpen, setRosterOpen] = useState(false);
   // Wraps the presence stack + its roster popover so an outside click can be
   // told apart from a click on the controls themselves.
@@ -361,9 +478,10 @@ export function Editor() {
   const awarenessRef = useRef<Awareness | null>(null);
   // Pings already played, keyed by sender clientId + timestamp.
   const seenPingsRef = useRef<Set<string>>(new Set());
-  const isHtml = notePath != null && /\.html?$/i.test(notePath);
-  // Images/PDFs aren't notes: no CRDT doc, no sync — just a streamed preview.
-  const preview = notePath != null ? previewKind(notePath) : null;
+  // The registry decides what opens this path. `editor` is the CRDT note
+  // family (md/markdown/mdx/txt); everything else — an HTML page, an image, a
+  // PDF, a spreadsheet, an unknown type — is `FilePreview`'s business.
+  const isNoteEditor = notePath != null && viewerFor(notePath) === "editor";
 
   // The roster opens on hover/focus of the presence stack (below); these keep it
   // honest for the pointer/keyboard paths too — a press outside closes it, as
@@ -408,16 +526,10 @@ export function Editor() {
     [],
   );
 
-  // Is this note (or a containing folder) locked? Refines the read-only badge
-  // copy — a lock is deliberate protection, not a missing grant.
-  const lockScope =
-    notePath && syncEnabled
-      ? effectiveLockForPath(lockScopesByPath(tree, locks, session?.user.id), notePath)
-      : null;
-
   useEffect(() => {
-    if (!hostRef.current || notePath == null || /\.html?$/i.test(notePath)) return;
-    if (previewKind(notePath) != null) return; // image/PDF preview, not a CRDT note
+    // Same test as the render branch below: only the `editor` family has a
+    // CRDT doc behind it, so nothing else opens a bridge or a provider.
+    if (!hostRef.current || notePath == null || viewerFor(notePath) !== "editor") return;
     const docId = useStore.getState().openNote?.id ?? null;
     if (docId == null) return; // wait until the note's doc_id (meta) is known
     const myUserId = useStore.getState().session?.user.id ?? null;
@@ -426,26 +538,27 @@ export function Editor() {
     let view: EditorView | null = null;
     let awareness: Awareness | null = null;
     let onAwarenessChange: (() => void) | null = null;
+    let onInitialContent: (() => void) | null = null;
+    let unsubscribeTitles: (() => void) | null = null;
+    let unregisterLiveView: (() => void) | null = null;
+    let cancelTitlesDispatch: (() => void) | null = null;
     // The editor pane is empty until CodeMirror is constructed below, and
     // getting there means opening the bridge, hydrating the CRDT from SQLite
     // and — for a synced note — waiting out the provider's first sync. On a
     // cold note that is a blank white sheet for long enough to look broken.
-    setViewMounted(false);
+    setMountedNotePath(null);
+    setReadyNotePath(null);
 
     const navigate = async (target: string) => {
       try {
-        const resolved = await ipc.resolveWikilink(target);
-        if (resolved) {
-          await useStore.getState().openNoteByPath(resolved.path);
-          return;
+        // A link to a note that does not exist does nothing — it is greyed out
+        // in the editor, and a click never creates a note at the vault root.
+        const action = wikilinkClickAction(await ipc.resolveWikilink(target));
+        if (action.kind === "open") {
+          await useStore.getState().openNoteByPath(action.path);
+        } else {
+          console.debug("wiki-link has no target", target);
         }
-        const slash = target.lastIndexOf("/");
-        const dir = slash === -1 ? "" : target.slice(0, slash);
-        const name = slash === -1 ? target : target.slice(slash + 1);
-        const path = await ipc.createNote(dir, name);
-        await useStore.getState().refreshTree();
-        await useStore.getState().refreshTitles();
-        await useStore.getState().openNoteByPath(path);
       } catch (err) {
         console.error("wiki-link navigation failed", err);
       }
@@ -455,9 +568,20 @@ export function Editor() {
       // Open the bridge; defer the disk-seed when this doc will sync so the
       // server's canonical state is pulled first (spec 03 §5 ordering).
       const willSync = syncManager.willSync(notePath);
-      const bridge = await bridgeManager.openNote(notePath, docId, {
-        seedFromFile: !willSync,
-      });
+      // The fold state is fetched ALONGSIDE the bridge, never after it: it has
+      // to be in hand by the time the view is constructed, so the folds can be
+      // applied in the same tick and no unfolded frame ever paints.
+      const uiEpoch = useStore.getState().vault?.epoch;
+      const storedUiStateP = ipc.getNoteUiState(docId, uiEpoch).catch(() => null);
+      // One writer per doc: the background feed stops delivering this doc and
+      // any bridge the background store holds for it is flushed and retired
+      // BEFORE ours opens (#200).
+      if (willSync) await syncManager.prepareOpen(notePath);
+      if (cancelled) return;
+      const [bridge, storedUiState] = await Promise.all([
+        bridgeManager.openNote(notePath, docId, { seedFromFile: !willSync }),
+        storedUiStateP,
+      ]);
       if (cancelled || !hostRef.current) return;
 
       const opened = await syncManager.openDoc(bridge, notePath);
@@ -476,25 +600,76 @@ export function Editor() {
       const st = useStore.getState();
       const lockedLocally =
         syncEnabled &&
-        effectiveLockForPath(
-          lockScopesByPath(st.tree, st.locks, st.session?.user.id),
+        lockBlocksCaller(
+          lockScopesByPath(st.tree, st.locks, st.session?.user.id, st.lifts),
           notePath,
-        ) != null;
+        );
       const ro = opened.readOnly || opened.status === "no-access" || lockedLocally;
       setReadOnly(ro);
       const editable = new Compartment();
       editableRef.current = editable;
+      const propsMode = new Compartment();
+      propsModeRef.current = propsMode;
+      const lineNumberCompartment = new Compartment();
+      lineNumbersRef.current = lineNumberCompartment;
+      // Vault-wide inputs for the Properties panel. Loaded in the background:
+      // the panel renders from inferred types until they arrive.
+      const epoch = useStore.getState().vault?.epoch;
+      void loadTypes(epoch);
+      let propertyKeys: string[] = [];
+      const propertyValues = new Map<string, string[]>();
+      void ipc
+        .listPropertyKeys(epoch)
+        .then((rows) => {
+          propertyKeys = rows.map((r) => r.key);
+        })
+        .catch(() => {});
 
       const state = createEditorState({
         doc: bridge.text.toString(),
         collab: true,
+        header: {
+          path: notePath,
+          mode: useStore.getState().propertiesMode,
+          modeCompartment: propsMode,
+          // The inline title commits a RENAME, never a CRDT edit. `Exact`, not
+          // `renameNoteFile`: a name a person just typed must be refused on a
+          // collision, not silently turned into "Name 1".
+          renameTo: async (nextPath) => {
+            try {
+              await useStore.getState().renameNoteFileExact(notePath, nextPath);
+              return null;
+            } catch (e) {
+              console.error("rename from inline title failed", e);
+              return "That name couldn't be saved.";
+            }
+          },
+          noteExists: (p) => ipc.noteExists(p, useStore.getState().vault?.epoch),
+          getPropertyKeys: () => propertyKeys,
+          getPropertyValues: (key) => {
+            const cached = propertyValues.get(key);
+            if (cached) return cached;
+            propertyValues.set(key, []);
+            void ipc
+              .listPropertyValues(key, useStore.getState().vault?.epoch)
+              .then((values) => propertyValues.set(key, values))
+              .catch(() => {});
+            return [];
+          },
+        },
         getTitles: () => useStore.getState().titles,
+        getTags: () => useStore.getState().tags,
+        lineNumbers: {
+          on: useStore.getState().lineNumbers,
+          compartment: lineNumberCompartment,
+        },
         onNavigate: (t) => void navigate(t),
         resolveAsset: makeResolveAsset(
           useStore.getState().vault?.path ?? null,
           notePath
         ),
-        saveAttachment,
+        saveAttachment: (bytes, ext) => saveAttachment(bytes, ext, epoch),
+        copyAttachments: { notePath, read: path => ipc.readBinaryFile(path, epoch) },
         extraExtensions: [
           yCollab(bridge.text, awareness, { undoManager: bridge.undoManager }),
           // Our own animated carets + always-on name flags, over yCollab's
@@ -510,14 +685,99 @@ export function Editor() {
           // View-only grants / locks: the editor cannot be typed into (spec
           // 04 §4). Compartmented so a live lock change can reconfigure it.
           editable.of(editableExtensions(ro)),
+          // Remember which sections were folded. Debounced well clear of the
+          // bridge's 150/300 ms timings — this writes to `index.sqlite`, never
+          // to the `.md`.
+          persistFolds((json) => {
+            void ipc
+              .setNoteUiState(docId, json, useStore.getState().vault?.epoch)
+              .catch(() => {});
+          }),
         ],
       });
 
+      // A note created by ⌘N / the sidebar's + wants the cursor in its TITLE,
+      // not the body — read before the view exists, because the title widget
+      // consumes the flag as it mounts inside the constructor below.
+      const titleWantsFocus = useStore.getState().pendingTitleFocus === notePath;
       view = new EditorView({ state, parent: hostRef.current });
+      // Restore the folds SYNCHRONOUSLY, in the tick the view is created. A
+      // `useEffect` or a rAF would be one painted frame too late, and the note
+      // would visibly collapse in front of the reader every time it opened.
+      const foldEffects = foldEffectsFor(view.state, parseNoteUiState(storedUiState));
+      if (foldEffects.length) view.dispatch({ effects: foldEffects });
       viewRef.current = view;
-      setViewMounted(true);
-      setActiveView(view); // let out-of-tree drops embed into this note
-      if (!ro) view.focus();
+      unregisterLiveView = registerLiveView(notePath, view);
+      switchingNoteRef.current = false;
+      // A note created, renamed or removed can flip a `[[link]]` between
+      // resolved and greyed out, so repaint the links when the title list moves.
+      // Deferred like every other dispatch into this view: a store update can
+      // land in the middle of a CodeMirror update (see effectDispatch.ts).
+      const titlesView = view;
+      unsubscribeTitles = useStore.subscribe((s, prev) => {
+        if (s.titles === prev.titles) return;
+        cancelTitlesDispatch?.();
+        cancelTitlesDispatch = dispatchAfterCommit(
+          titlesView,
+          { effects: wikilinkTitlesChanged.of(null) },
+          { isLive: () => !cancelled && viewRef.current === titlesView },
+        );
+      });
+      setMountedNotePath(notePath);
+
+      // Start the caret in the visible body, never on what the header hides
+      // (the duplicate first H1, a Properties panel's YAML): focus would
+      // otherwise reveal that line, and peers would see our caret off the page.
+      const caretView = view;
+      const parkCaret = () => {
+        if (cancelled || viewRef.current !== caretView) return;
+        const pos = openingCaret(caretView.state);
+        if (pos != null) caretView.dispatch({ selection: { anchor: pos } });
+      };
+      parkCaret();
+      let revealed = false;
+      const reveal = () => {
+        if (cancelled) return;
+        // A cold note's text arrives after mount, mapped around the caret at 0.
+        // Once, and deferred: this can run from inside a Y.Text observer.
+        if (!readyAtMount && !revealed) queueMicrotask(parkCaret);
+        revealed = true;
+        setReadyNotePath(notePath);
+      };
+      const readyAtMount = noteContentReady({
+        textLength: bridge.text.length,
+        hasSync: opened.sync != null,
+        syncStatus: opened.status,
+      });
+      if (readyAtMount) {
+        reveal();
+      } else {
+        // A cold synced note mounts against an empty Y.Text and receives its
+        // content during the provider handshake. Keep the skeleton over that
+        // half-hydrated editor (whose filename title already exists) until
+        // either content arrives or the handshake settles with a truly empty
+        // note. The timeout inside `whenSynced` preserves offline-first access.
+        const stopWatchingInitialContent = () => {
+          if (!onInitialContent) return;
+          bridge.text.unobserve(onInitialContent);
+          onInitialContent = null;
+        };
+        onInitialContent = () => {
+          if (bridge.text.length === 0) return;
+          stopWatchingInitialContent();
+          reveal();
+        };
+        bridge.text.observe(onInitialContent);
+        void opened.sync!
+          .whenSynced(5000)
+          .catch(() => {})
+          .then(() => {
+            stopWatchingInitialContent();
+            reveal();
+          });
+      }
+      setActiveNote(bindActiveNote(view)); // let out-of-tree drops embed into this note
+      if (!ro && !titleWantsFocus) view.focus();
 
       // Live "who's here" avatar row + incoming pings addressed to this user.
       onAwarenessChange = () => {
@@ -543,12 +803,22 @@ export function Editor() {
 
     return () => {
       cancelled = true;
+      unsubscribeTitles?.();
+      cancelTitlesDispatch?.();
+      if (onInitialContent) bridgeRef.current?.text.unobserve(onInitialContent);
       if (onAwarenessChange && awareness) awareness.off("change", onAwarenessChange);
-      setActiveView(null);
-      setViewMounted(false);
+      setActiveNote(null);
+      // Order matters: the ref is read by the render that clears the mounted
+      // path, so it must be written first.
+      if (view) switchingNoteRef.current = true;
+      setMountedNotePath(null);
+      setReadyNotePath(null);
+      unregisterLiveView?.();
       if (view) view.destroy();
       viewRef.current = null;
       editableRef.current = null;
+      propsModeRef.current = null;
+      lineNumbersRef.current = null;
       bridgeRef.current = null;
       hadEditAccessRef.current = false;
       awarenessRef.current = null;
@@ -557,9 +827,13 @@ export function Editor() {
       setReadOnly(false);
       setRosterOpen(false);
       setPingFrom(null);
-      // Tear down the network session, then flush + close the bridge.
-      syncManager.closeCurrent();
-      void bridgeManager.closeCurrent();
+      // Tear down the network session, then flush + close the bridge. The
+      // bridge's close only starts on a later microtask (it is queued), so the
+      // provider is still destroyed first; handing its promise to the session
+      // keeps the background feed off this doc until the final egest and
+      // persist have landed (#200).
+      const closing = bridgeManager.closeCurrent();
+      syncManager.closeCurrent(closing);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notePath, syncEnabled]);
@@ -569,6 +843,17 @@ export function Editor() {
   // token on reconnect and the status flips to "read-only" here — no reopen
   // needed. Also refresh the lock list so the tree badge appears for us too.
   useEffect(() => {
+    // Only the OPEN note's grant is being reported here, and between one note's
+    // teardown and the next note's `openDoc` there is no open note at all:
+    // `syncManager.closeCurrent()` nulls its own status and re-emits, so the
+    // badge falls back to the VAULT CHANNEL's — normally "synced". Acting on
+    // that phantom "synced" set `hadEditAccessRef` on a note that never had
+    // edit access (killing the pre-verdict rollback below for the rest of the
+    // session) and flipped `readOnly` false, which is the reconfigure storm the
+    // locked→locked switch used to crash on. The bridge ref is the liveness
+    // signal: the cleanup clears it before `closeCurrent`, and the open path
+    // sets it before any status can arrive.
+    if (!bridgeRef.current) return;
     if (syncStatus === "read-only" || syncStatus === "no-access") {
       setReadOnly(true);
       if (syncStatus === "read-only") void useStore.getState().refreshLocks();
@@ -582,20 +867,57 @@ export function Editor() {
         const um = bridgeRef.current?.undoManager;
         if (um) while (um.undoStack.length > 0) um.undo();
       }
-    } else if (syncStatus === "synced") {
-      // Unlocked / edit grant restored — become editable again.
+    } else if (syncStatus === "synced" && !syncManager.openDocReadOnly) {
+      // Unlocked / edit grant restored — become editable again. The open
+      // note's own grant must agree: "synced" is the APP's status, and a
+      // view-only note's reconnect must never read as an edit grant.
       hadEditAccessRef.current = true;
       setReadOnly(false);
     }
   }, [syncStatus]);
+
+  // Push the Properties display mode into the live view when it changes.
+  // Every reconfigure below goes through `dispatchAfterCommit`: a synchronous
+  // `view.dispatch` from a passive effect can be re-entered inside a CodeMirror
+  // update (see `lib/editor/effectDispatch.ts`) and throws.
+  useEffect(() => {
+    const view = viewRef.current;
+    const compartment = propsModeRef.current;
+    if (!view || !compartment) return;
+    return dispatchAfterCommit(
+      view,
+      { effects: compartment.reconfigure(propertiesModeFacet.of(propertiesMode)) },
+      { isLive: () => viewRef.current === view },
+    );
+  }, [propertiesMode]);
+
+  // Push the line-number gutter setting into the live view.
+  useEffect(() => {
+    const view = viewRef.current;
+    const compartment = lineNumbersRef.current;
+    if (!view || !compartment) return;
+    return dispatchAfterCommit(
+      view,
+      { effects: compartment.reconfigure(lineNumberExtension(lineNumbers)) },
+      { isLive: () => viewRef.current === view },
+    );
+  }, [lineNumbers]);
 
   // Push the current read-only state into the live CodeMirror view.
   useEffect(() => {
     const view = viewRef.current;
     const editable = editableRef.current;
     if (!view || !editable) return;
-    view.dispatch({ effects: editable.reconfigure(editableExtensions(readOnly)) });
-    if (!readOnly) view.focus();
+    return dispatchAfterCommit(
+      view,
+      { effects: editable.reconfigure(editableExtensions(readOnly)) },
+      {
+        isLive: () => viewRef.current === view,
+        then: (v) => {
+          if (!readOnly) v.focus();
+        },
+      },
+    );
   }, [readOnly]);
 
   // Hover preview of a past version: a SECOND, throwaway CodeMirror over the
@@ -622,21 +944,15 @@ export function Editor() {
     return () => view.destroy();
   }, [previewVersionId, previewContent, notePath]);
 
+  // App only mounts this component with a note open; the guard is here so the
+  // branches below can treat `notePath` as a string.
   if (notePath == null) {
-    return (
-      <div className="editor-empty">
-        <p>Select a note, or press ⌘N to create one.</p>
-      </div>
-    );
+    return <EditorEmpty />;
   }
 
-  // HTML pages render live in a sandboxed frame instead of the CRDT editor.
-  if (isHtml) {
-    return <HtmlView path={notePath} />;
-  }
-
-  // Images and PDFs stream from disk into a lightweight viewer.
-  if (preview) {
+  // Everything that is not a CRDT note — an HTML page, an image, a PDF, a
+  // CSV, a docx, an unknown type — routes through the viewer registry.
+  if (!isNoteEditor) {
     return <FilePreview path={notePath} />;
   }
 
@@ -652,6 +968,15 @@ export function Editor() {
   };
 
   const showToolbar = peers.length > 0;
+  // A different note is on its way in. Reopening the SAME path (a tab click) is
+  // not "opening another" — the path-scoped mounted state covers that one.
+  const isOpeningAnother = openingNotePath != null && openingNotePath !== notePath;
+  const showSkeleton = shouldShowNoteSkeleton({
+    requestedPath: notePath,
+    mountedPath: mountedNotePath,
+    readyPath: readyNotePath,
+    openingAnother: isOpeningAnother,
+  });
   // "from 2h ago" for the pill. The panel holds the metadata; the preview state
   // carries only the id + text, so look the timestamp back up here.
   const previewedAt =
@@ -660,43 +985,25 @@ export function Editor() {
       : null;
 
   return (
-    <div className="editor-column">
+    <div className="editor-column" style={editorMeasureStyle(editorMeasure)}>
       {(readOnly || showToolbar) && (
         <div className="editor-topbar">
           {readOnly && (
-            <div
-              className={`editor-lockbanner${lockScope ? " locked" : " viewonly"}`}
-              role="status"
-            >
-              <span className="editor-lockbanner-icon" aria-hidden="true">
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <rect x="4" y="11" width="16" height="10" rx="2" />
-                  <path d="M8 11V7a4 4 0 0 1 8 0v4" />
-                </svg>
-              </span>
-              <span className="editor-lockbanner-text">
-                <strong>{lockScope ? "This note is locked" : "View-only access"}</strong>
-                <span className="editor-lockbanner-sub">
-                  {lockScope
-                    ? "You can read it, but your changes won’t be saved or synced."
-                    : "You can read this note, but you can’t edit it."}
-                </span>
-              </span>
-            </div>
+            <ViewOnlyChip
+              reason={syncStatus === "no-access" ? "removed" : billingLapsed ? "lapsed" : "view"}
+              peers={peers}
+              onAsk={sendPing}
+            />
           )}
           {showToolbar && (
             <div className="editor-toolbar">
               <div
                 className="presence-controls"
                 ref={presenceRef}
-                onMouseEnter={openRoster}
+                // Redesign preview: when someone here has a status moment, hover
+                // plays it and the roster (with Ping) opens on click. Otherwise
+                // hover opens the roster as before.
+                onMouseEnter={() => { if (!peers.some((p) => isMoment(p.status))) openRoster(); }}
                 onMouseLeave={scheduleCloseRoster}
                 onFocus={openRoster}
                 onBlur={(e) => {
@@ -747,34 +1054,20 @@ export function Editor() {
           <div className="version-preview">
             <div className="version-preview-host" ref={previewHostRef} />
             <span className="version-preview-pill" role="status">
-              Viewing version from {agoFromIso(previewedAt, Date.now())} — read-only
+              Viewing version from {agoFromIso(previewedAt, Date.now())} (read-only)
             </span>
           </div>
         )}
       </div>
-      {!viewMounted && <EditorSkeleton />}
-    </div>
-  );
-}
-
-/**
- * Placeholder for a note that is still opening.
- *
- * Deliberately lines of text rather than a spinner. A spinner says "wait"; a
- * skeleton says "text is arriving, and roughly this much of it" — and because it
- * occupies the same column as the real content, the note doesn't visibly jump
- * when it swaps in. The bars only appear after a beat (`skeleton-in` has a
- * delay) so a note that opens from the local index in 40ms — the common case —
- * never flashes one.
- */
-function EditorSkeleton() {
-  return (
-    <div className="editor-skeleton" role="status" aria-label="Opening note">
-      <span className="skel-line skel-title" />
-      <span className="skel-line" style={{ width: "92%" }} />
-      <span className="skel-line" style={{ width: "78%" }} />
-      <span className="skel-line" style={{ width: "85%" }} />
-      <span className="skel-line" style={{ width: "45%" }} />
+      {/* One continuous loading state, from the click to the first painted line.
+          `openingNotePath` covers the registration round trip (the old note is
+          still on screen, so the bars fade in over it); the path-scoped mount
+          and ready states cover the bridge open, CodeMirror build, and a cold
+          note's first server hydration. The same element stays in place, so the
+          swap is one animation rather than title → bare pane → text. */}
+      {showSkeleton && (
+        <EditorSkeleton immediate={switchingNoteRef.current} />
+      )}
     </div>
   );
 }

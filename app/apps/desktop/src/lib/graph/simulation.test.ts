@@ -5,6 +5,7 @@ import {
   layoutScale,
   nodeRadius,
   centerWeight,
+  markHubs,
   IDLE_ALPHA,
   DRAG_ALPHA,
   type FlowForce,
@@ -48,6 +49,9 @@ function makeSim(count = 60) {
     });
   }
 
+  // Mark hubs the way the renderer does, so the links take the same spoke /
+  // hub-hub / note-note paths a real vault does.
+  markHubs(nodes);
   const sim = createSimulation(DEFAULT_SETTINGS).alphaTarget(IDLE_ALPHA);
   sim.nodes(nodes);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -215,7 +219,9 @@ describe("ambient flow", () => {
       return worst;
     };
     expect(wander(true)).toBeLessThan(wander(false) * 1.35);
-  });
+    // Two 90-second simulated sessions ≈ 10k ticks of a real force layout; a
+    // busy CI runner has blown vitest's default 5 s (2026-09-08), so give it room.
+  }, 30_000);
 
   it("scales the entrance above the resting drift", () => {
     const calm = settled();

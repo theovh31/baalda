@@ -1,6 +1,12 @@
 
 
-https://github.com/user-attachments/assets/b24c60ee-124e-4831-a97f-d6d1920900c6
+
+
+https://github.com/user-attachments/assets/d7522035-63f6-49a2-b0ec-f1b23755caa3
+
+
+
+
 
 <div align="center">
 
@@ -122,11 +128,23 @@ Everything else (the desktop app, the search index, the sync server) is a rebuil
 
 ## Getting started
 
+Just want the app? [Download it](https://baalda.com/download) for macOS, Windows or Linux.
+
+> **Windows:** the installer isn't code-signed yet, so SmartScreen may say
+> "Windows protected your PC". Click **More info → Run anyway** to install.
+> Updates after that install automatically without the warning.
+
+To build and run it yourself instead:
+
 ### Prerequisites
 
 - **Node.js** ≥ 22 (with corepack: `corepack enable` activates the pinned pnpm)
 - **Rust** & Cargo ([rustup.rs](https://rustup.rs))
 - **Docker** (for the Postgres database)
+- **Linux only** — Tauri's system dependencies plus `libdbus-1-dev`, the build
+  header for the Secret Service keychain backend that stores the session token
+  (Debian/Ubuntu: `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+  libxdo-dev libssl-dev libdbus-1-dev build-essential patchelf`)
 
 ### 1. Install dependencies
 
@@ -171,8 +189,10 @@ migrations and gives you an HTTPS URL:
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/baalda-server?utm_medium=integration&utm_source=button&utm_campaign=baalda)
 
-Then paste that URL into the desktop app's **Server settings** and create an
-account. See [`docs/DEPLOY.md`](docs/DEPLOY.md) for details.
+The desktop app asks whether your notes live on the managed service or your own
+server before your first sign-in — put that URL there, or send your team
+`https://<your-server>/open/connect` and let them click it. See
+[`docs/DEPLOY.md`](docs/DEPLOY.md) for details.
 
 Prefer your own machine? The Compose bundle brings up the same stack in one
 command:
@@ -182,6 +202,10 @@ cd deploy/compose
 cp .env.example .env      # fill in POSTGRES_PASSWORD, JWT_SECRET, BETTER_AUTH_URL
 docker compose up -d
 ```
+
+The default stack stores attachments in PostgreSQL and needs no MinIO credentials.
+For optional MinIO storage, explicitly include the additional Compose file as
+described in the [MinIO setup guide](deploy/compose/README.md#optional-minio-storage).
 
 See [`deploy/compose/README.md`](deploy/compose/README.md) for TLS, backups and
 upgrades, or [`docs/DEPLOY.md`](docs/DEPLOY.md) for plain Docker and the full
@@ -203,10 +227,25 @@ claude mcp add --transport http context http://localhost:3010/api/mcp \
   --header "Authorization: Bearer mcp_…"
 ```
 
+Or Codex: put the token in an environment variable (e.g. in your shell profile) and
+add the server to `~/.codex/config.toml`:
+
+```bash
+export CONTEXT_MCP_TOKEN="mcp_…"
+```
+
+```toml
+[mcp_servers.context]
+url = "http://localhost:3010/api/mcp"
+bearer_token_env_var = "CONTEXT_MCP_TOKEN"
+```
+
 (On the managed service the endpoint is `https://api.baalda.com/api/mcp`; for a
 self-hosted server, use your server URL plus `/api/mcp`.)
 
 The AI can now `read_note`, `search_notes`, `create_note`, `edit_note` (targeted replace/insert/delete at exact anchors), `update_note`, and more. `read_note` returns a `revision`; pass it back as `expectedRevision` and a write against a note that changed in between is refused instead of merged. Its writes flow through the same sync engine, so if the note is open you'll watch the AI type in real time.
+
+Files are in scope too: `search_notes` ranks the text extracted from your documents and spreadsheets alongside your notes (each hit says whether it is a `note` or a `file`), `list_attachments` lists the files it can reach, and `read_attachment_text` reads the words inside one. All three follow the same per-folder permissions as everything else.
 
 ---
 

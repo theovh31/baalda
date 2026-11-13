@@ -61,7 +61,10 @@ describe("per-member deny", () => {
     expect(await effectivePermission(member, doc)).toBe("none");
   });
 
-  it("beats an explicit per-user edit share on the note itself", async () => {
+  // The deepest of a person's own rows decides (resolver `userItemVerdict`):
+  // a folder deny no longer beats that person's edit share on a note inside it,
+  // and a deny on the note itself still beats a folder edit share.
+  it("loses to a deeper per-user edit share on the note itself, wins when it is the deeper row", async () => {
     const org = await seedOrg("Acme", "deny-share");
     const member = await seedUser("m@a.com");
     await seedMember(org, member, "member");
@@ -72,7 +75,12 @@ describe("per-member deny", () => {
 
     expect(await effectivePermission(member, doc)).toBe("edit");
     await seedDeny(org, "folder", folder, member);
-    expect(await effectivePermission(member, doc)).toBe("none");
+    expect(await effectivePermission(member, doc)).toBe("edit");
+
+    const other = await seedNote(vault, folder, "HR/other.md");
+    expect(await effectivePermission(member, other)).toBe("none");
+    await seedDeny(org, "file", other, member);
+    expect(await effectivePermission(member, other)).toBe("none");
   });
 
   it("beats owner and admin — a lock only caps them at view, a deny removes them", async () => {
@@ -82,6 +90,10 @@ describe("per-member deny", () => {
     await seedMember(org, owner, "owner");
     await seedMember(org, admin, "admin");
     const vault = await seedVault(org);
+    // Shared: a lock CAPS an edit, so there has to be an edit. In a Private
+    // vault neither of these two has one to cap — the posture is a baseline for
+    // owners and admins as much as for members.
+    await seedVaultGrant(org, "edit");
     const folder = await seedFolder(vault, null, "Private", "Private");
     const doc = await seedNote(vault, folder, "Private/note.md");
 
@@ -499,6 +511,7 @@ describe("vault-wide read-only cap", () => {
     const owner = await seedUser("o@a.com");
     await seedMember(org, owner, "owner");
     const vault = await seedVault(org);
+    await seedVaultGrant(org, "edit"); // Shared first, so there is an edit to cap
     const doc = await seedNote(vault, null, "root.md");
 
     expect(await effectivePermission(owner, doc)).toBe("edit");
@@ -513,6 +526,7 @@ describe("vault-wide read-only cap", () => {
     await seedMember(orgA, owner, "owner");
     await seedMember(orgB, owner, "owner");
     const vaultB = await seedVault(orgB);
+    await seedVaultGrant(orgB, "edit"); // B is Shared; only A is being capped
     const doc = await seedNote(vaultB, null, "b.md");
 
     await setVaultPosture(orgA, "view");

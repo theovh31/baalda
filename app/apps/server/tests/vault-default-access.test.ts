@@ -10,11 +10,10 @@ import { effectivePermission } from "../src/permissions/resolver.js";
 /**
  * The access a vault has the moment it is created.
  *
- * A vault is created SHARED with its team: someone you invite can read and
- * write its notes as soon as they join. This replaced a private-by-default
- * posture that was right about solo vaults and wrong about invitations — a
- * teammate would accept, sync, and land on an empty sidebar with no way to ask
- * for access.
+ * A vault is created SHARED — for its creator, its current team AND anyone
+ * who joins later: the future-member default starts Open alongside the
+ * org-wide `edit` grant, so a teammate invited next week sees the notes that
+ * already exist (a Private join default used to hide them).
  *
  * The tests below pin both halves of that: the default is applied at creation,
  * and it is applied ONLY at creation, so an owner who later chooses Private
@@ -73,8 +72,16 @@ describe("a new vault's default access", () => {
     expect(rows[0].permission).toBe("edit");
   });
 
-  it("lets someone who joins later read and write an existing note", async () => {
-    // The reported bug: invite a teammate, they see nothing.
+  it("opens the vault to people who join later", async () => {
+    await createVault(owner, org, "Notes");
+    const { rows } = await pool.query<{ join_default: string }>(
+      "SELECT join_default FROM organization_access_settings WHERE organization_id = $1",
+      [org],
+    );
+    expect(rows[0]?.join_default).toBe("open");
+  });
+
+  it("lets a later joiner read a note that existed before they joined", async () => {
     const vault = await createVault(owner, org, "Notes");
     const note = await seedNote(vault.id, null, "owners-note.md", owner.userId);
 
@@ -103,12 +110,16 @@ describe("a new vault's default access", () => {
   it("keeps a later member locked out of a vault the owner set to Private", async () => {
     const vault = await createVault(owner, org, "Notes");
     const note = await seedNote(vault.id, null, "secret.md", owner.userId);
-    // Access panel → Private revokes exactly this row.
+    // Access panel → Private revokes exactly this row…
     await pool.query(
       `DELETE FROM shares
         WHERE resource_type = 'vault' AND resource_id = $1 AND principal_type = 'org'`,
       [org],
     );
+    // …and New-member access is its own setting (it starts Open with the
+    // vault), so a fully locked vault sets that to Private too.
+    const res = await req(owner, "PUT", `/api/orgs/${org}/access-default`, { mode: "private" });
+    expect(res.status).toBe(200);
 
     const joiner = await signUp("late@default-access.test");
     await seedMember(org, joiner.userId, "member");

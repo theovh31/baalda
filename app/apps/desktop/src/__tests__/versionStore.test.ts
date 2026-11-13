@@ -12,7 +12,7 @@ const api = vi.hoisted(() => ({
     ok: true,
     preRevertVersionId: 9,
   })),
-  listCheckpoints: vi.fn(async (_vaultId: string) => [] as unknown[]),
+  listCheckpoints: vi.fn(async (_vaultId: string) => ({ checkpoints: [] as unknown[], schedule: null as unknown })),
   createCheckpoint: vi.fn(async (_vaultId: string, _label?: string) => ({}) as unknown),
   deleteCheckpoint: vi.fn(async (_vaultId: string, _id: string) => {}),
   revertToCheckpoint: vi.fn(async (_vaultId: string, _id: string) => ({
@@ -81,7 +81,7 @@ function synced(): void {
 beforeEach(() => {
   vi.clearAllMocks();
   api.listNoteVersions.mockResolvedValue([]);
-  api.listCheckpoints.mockResolvedValue([]);
+  api.listCheckpoints.mockResolvedValue({ checkpoints: [], schedule: null });
   sync.registry.vaultId = null;
   useStore.setState({
     syncEnabled: false,
@@ -230,17 +230,19 @@ describe("checkpoints", () => {
 
   it("lists the collection's checkpoints", async () => {
     synced();
-    api.listCheckpoints.mockResolvedValue([CHECKPOINT]);
+    const schedule = { auto: false, manualEveryDays: 7, nextManualAt: null };
+    api.listCheckpoints.mockResolvedValue({ checkpoints: [CHECKPOINT], schedule });
     await useStore.getState().refreshCheckpoints();
     expect(api.listCheckpoints).toHaveBeenCalledWith("vault-1");
     expect(useStore.getState().checkpoints).toEqual([CHECKPOINT]);
+    expect(useStore.getState().checkpointSchedule).toEqual(schedule);
   });
 
   it("drops a response for a collection that is no longer the open one", async () => {
     synced();
     api.listCheckpoints.mockImplementation(async () => {
       sync.registry.vaultId = "vault-2";
-      return [CHECKPOINT];
+      return { checkpoints: [CHECKPOINT], schedule: null };
     });
     await useStore.getState().refreshCheckpoints();
     expect(useStore.getState().checkpoints).toBeNull();
@@ -316,5 +318,78 @@ describe("vault scoping", () => {
     first["leaked"] = { userId: "u1", name: "Ada", at: "2026-08-11T10:00:00.000Z" };
     useStore.getState().closeLocalVault();
     expect(useStore.getState().noteLastEdited).toEqual({});
+  });
+});
+
+describe("right panel", () => {
+  beforeEach(() => {
+    useStore.setState({ rightPanel: null });
+    try {
+      localStorage.removeItem("baalda.rightPanelTab");
+    } catch {
+      // node env without storage: the store falls back to "sync"
+    }
+  });
+
+  it("opens on the Activity tab by default and closes", () => {
+    useStore.getState().openRightPanel();
+    expect(useStore.getState().rightPanel).toEqual({ tab: "activity" });
+    useStore.getState().closeRightPanel();
+    expect(useStore.getState().rightPanel).toBeNull();
+  });
+
+  it("switching away from Versions, or closing, clears the version state", () => {
+    useStore.getState().openRightPanel("versions");
+    useStore.setState({ versionPanelDocId: "doc-a", noteVersions: [VERSION], versionPreview: { versionId: 7, content: "x" } });
+    useStore.getState().setRightPanelTab("versions");
+    // Staying on Versions keeps the note's history.
+    expect(useStore.getState().versionPanelDocId).toBe("doc-a");
+    useStore.getState().setRightPanelTab("activity");
+    expect(useStore.getState()).toMatchObject({
+      rightPanel: { tab: "activity" },
+      versionPanelDocId: null,
+      noteVersions: null,
+      versionPreview: null,
+    });
+    useStore.getState().setRightPanelTab("versions");
+    useStore.setState({ versionPanelDocId: "doc-a" });
+    useStore.getState().closeRightPanel();
+    expect(useStore.getState().versionPanelDocId).toBeNull();
+  });
+
+  it("the header's Version history button opens Versions, switches from Activity, and closes on Versions", () => {
+    useStore.getState().toggleVersionsPanel();
+    expect(useStore.getState().rightPanel).toEqual({ tab: "versions" });
+    useStore.getState().toggleVersionsPanel();
+    expect(useStore.getState().rightPanel).toBeNull();
+    useStore.getState().openRightPanel("activity");
+    useStore.getState().toggleVersionsPanel();
+    expect(useStore.getState().rightPanel).toEqual({ tab: "versions" });
+  });
+
+  it("remembers the last strip tab, never the tab-less Versions view", () => {
+    const store = new Map<string, string>();
+    const prev = (globalThis as { localStorage?: unknown }).localStorage;
+    (globalThis as { localStorage?: unknown }).localStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+    };
+    try {
+      useStore.getState().openRightPanel("activity");
+      useStore.getState().closeRightPanel();
+      useStore.getState().openRightPanel();
+      expect(useStore.getState().rightPanel).toEqual({ tab: "activity" });
+      // Versions opens only from the toolbar's clock: the panel toggle reopens Activity.
+      useStore.getState().openRightPanel("versions");
+      useStore.getState().closeRightPanel();
+      useStore.getState().openRightPanel();
+      expect(useStore.getState().rightPanel).toEqual({ tab: "activity" });
+      store.set("baalda.rightPanelTab", "bogus");
+      useStore.getState().openRightPanel();
+      expect(useStore.getState().rightPanel).toEqual({ tab: "activity" });
+    } finally {
+      (globalThis as { localStorage?: unknown }).localStorage = prev;
+    }
   });
 });

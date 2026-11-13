@@ -121,6 +121,87 @@ server's SyncStep skips bootstrap, and the device diverges permanently. (memryno
 **Lifecycle ops** (create/rename/delete) are handled as metadata operations keyed by `doc_id`, not by
 content diff — a rename must never fork a doc. See [[02-database-architecture]] §5.
 
+## 5b. Editing the vault from outside the app (AI agents, scripts)
+
+The vault folder is a normal folder of `.md` files, and editing it from outside the app is a
+supported way to use Baalda — that is the whole point of the bridge. All four filesystem verbs
+are safe while the app is open on a synced vault, and each reaches the team live:
+
+| What you do on disk | What happens |
+|---|---|
+| **Create** a `.md` file | Unmapped path ⇒ a debounced registry pull registers it as a new note and uploads its content. |
+| **Edit** a `.md` file | Diff-merged into the note's `Y.Text` as operations (never an overwrite) and pushed, so it merges with whatever a teammate is typing. |
+| **Delete** a `.md` file | Propagated as a real soft delete after a **2.5 s grace window**: the note leaves the server and every teammate's device removes its copy. No local recovery copy is made (the file is already gone by your choice); Version History on the server still has the note. |
+| **Rename or move** a `.md` file | Recognised as a rename, so the note keeps its `doc_id` — its history, its backlinks, and its shares all survive. |
+| **Move or rename a folder** | Recognised as ONE folder move (`PATCH /folders/:id`, exactly like a sidebar drag), so every note and file under it keeps its id. See *External structure changes* below. |
+
+The grace window exists because a vanished file is not yet a delete: an editor that saves by
+unlinking and rewriting, a rename (which the OS reports as two unrelated events), and a
+`git checkout` that is about to restore the file all look identical for a few milliseconds. Inside
+the window a re-appearing file cancels the delete, and a file whose content matches a note that
+just vanished is paired with it as a rename.
+
+Three deliberate refusals, all of them protecting notes you did not mean to lose:
+
+- **A 0-byte file never clears a note.** Emptying a file completely is refused as an ingest (a
+  *partial* truncation is a normal edit and applies). Writing an empty placeholder is something
+  the app itself does when it materializes a note it hasn't downloaded yet, and treating that as
+  an edit would delete the note's content for everyone.
+- **A mass disappearance is never propagated silently.** More than a fifth of the vault vanishing
+  in one window (minimum five notes) is held: with the vault root present in a live session the
+  app asks "Delete them for everyone, or restore them?" and does neither until answered; with the
+  vault root gone (an unmounted volume) the whole batch is refused without asking.
+- **A note this device never finished uploading is never deleted from the server.** The only copy
+  of that work might be the one you just removed.
+
+Two things stay off-limits to outside writers:
+
+- **`.context/` is the app's own state** (`index.sqlite`, the CRDT store, `config.json`, the local
+  trash). It is excluded from the tree walk, the watcher and the index. Never write there, and
+  never restore a trashed note by moving it back — copy its text into a new note instead, or the
+  restored file re-registers as a brand-new note.
+- **Deletes at startup are not propagated.** Until the vault channel is connected *and* a structure
+  pull has completed, a missing file is read as "the disk isn't ready yet" and the note is
+  re-materialized (with its content, when this device has it) rather than deleted. The user is
+  told (`restoredFromServer` in the reconcile summary). Neither a note nor a binary delete makes a
+  `.context/trash` copy: the note's text survives in the CRDT and the server's trash, and a
+  binary's only other copy is the server's.
+- **A deleted non-note file stays deleted (#215).** `DELETE /api/files/:id` tombstones the id
+  (`file_tombstones`); `GET /api/vaults/:id/file-tombstones` lists those ids, and the attachment
+  mirror (`planBinarySync` `toTrash`) moves a local file this device knows by a tombstoned id into
+  `.context/trash` instead of uploading it back. Matching is by id only, so a new file saved at the
+  same path still uploads.
+
+### External structure changes (#221)
+
+The rule is simple: **content edits on disk are fine at any time; structure changes (rename,
+move, delete) need the app open** — or go through the sidebar, or MCP `move_note` /
+`move_folder` / `delete_note` / `delete_folder` / `move_file` / `delete_file`. Symbolic links inside a vault are not supported.
+While the app is open:
+
+- **A folder moved outside the app** arrives from the OS as one event for the folder (old path
+  gone, new path present), never per note. The delete drain pairs the topmost vanished registered
+  folder with a new unregistered one by sub-path: when at least 80% of the old folder's notes
+  exist at the same sub-path under the new folder with byte-identical text (sha256, the same hash
+  the per-note rename pairing uses), it is one server folder move; every note under it keeps its
+  id, including notes edited in the same breath (their new bytes are pushed), and binaries follow
+  the folder row. Below 80% the notes go through the per-note pairing and then the delete drain.
+  The registry pull waits until this decision is made.
+- **The vault root vanishing** (renamed, moved, unmounted) pauses every structural step for that
+  vault — pull, materialize, register, delete, binary mirror — and every Rust write that would
+  re-create the old folder is refused. A banner asks to reopen the vault from its new location.
+- **A large live delete asks** instead of being undone (above).
+
+Changes made while the app was **closed** are not reconciled as structure (#215): edits are
+merged on reopen, but the old paths of renamed, moved or deleted notes come back and new paths
+register as new notes. The first pass after opening shows a one-time notice when it sees both
+known notes missing and unknown files present.
+
+For a *scripted* or agent-driven workflow that needs confirmation of each write rather than
+fire-and-forget filesystem semantics, use the MCP server instead ([[04-team-collaboration]]): its
+tools carry revisions, optimistic-concurrency checks and idempotency keys, and they broadcast the
+same way a teammate's edit does.
+
 ## 6. Test plan for the bridge (non-negotiable before Phase 2)
 
 - **Golden round-trip:** a corpus of markdown files → into `Y.Text` → serialize → byte-identical out.

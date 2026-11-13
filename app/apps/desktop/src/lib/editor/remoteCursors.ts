@@ -13,6 +13,9 @@ import { Annotation, type Extension } from "@codemirror/state";
 import { EditorView, layer, ViewPlugin, type LayerMarker } from "@codemirror/view";
 import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
+import { insideFold } from "./folding";
+import { visibleBodyPos } from "./livePreview";
+import { noteAwareness, titlePresenceOf } from "./titlePresence";
 
 /** Dispatched to nudge the layer into recomputing when awareness changes. */
 const remoteCursorsSync = Annotation.define<boolean>();
@@ -50,11 +53,26 @@ function readCursors(view: EditorView, ytext: Y.Text, awareness: Awareness): Rem
   const cursors: RemoteCursor[] = [];
   awareness.getStates().forEach((state, clientId) => {
     if (clientId === awareness.clientID) return; // never draw our own caret
+    // Focused in the title: yCollab left `cursor` at their last body spot, so
+    // drawing it here would show them in two places. The title draws theirs.
+    if (titlePresenceOf(state)) return;
     const cursor = state.cursor;
     if (!cursor || cursor.head == null) return;
     const abs = Y.createAbsolutePositionFromRelativePosition(cursor.head, ydoc);
     if (!abs || abs.type !== ytext) return;
-    const pos = view.coordsAtPos(abs.index);
+    // A caret inside a section WE have folded has no coordinates of its own —
+    // `coordsAtPos` would answer with the placeholder's box, parking every
+    // hidden peer's flag on top of the same `…` pill. Theirs is not our fold to
+    // open, so the honest thing is to draw nothing.
+    if (insideFold(view.state, abs.index)) return;
+    // A caret on what OUR header hides (the duplicate first H1, a Properties
+    // panel's YAML) has no line here either, and `coordsAtPos` answers with the
+    // replaced block's edge: the flag floated at the pane's far left, between
+    // the title and the body. A new peer's caret starts at 0, exactly there, so
+    // draw it at the first visible body position instead; presence still shows.
+    const index = visibleBodyPos(view.state, abs.index);
+    if (index == null) return;
+    const pos = view.coordsAtPos(index);
     if (!pos) return; // off-screen (outside the rendered viewport) — skip
     const top = pos.top - base.top;
     const user = state.user ?? {};
@@ -185,5 +203,6 @@ export function remoteCursors(ytext: Y.Text, awareness: Awareness): Extension {
     },
   });
 
-  return [nudge, cursorLayer];
+  // The title widget reads the same awareness to publish and draw title carets.
+  return [noteAwareness.of(awareness), nudge, cursorLayer];
 }

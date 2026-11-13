@@ -12,7 +12,14 @@ import { sha256Hex } from "../src/versions/capture.js";
 import { recordingAppDeps, type RecordingAppDeps } from "./helpers/app.js";
 import { signUp, type TestUser } from "./helpers/auth.js";
 import { resetDb } from "./helpers/db.js";
-import { seedFolder, seedMember, seedNote, seedOrg, seedVault } from "./helpers/seed.js";
+import {
+  seedFolder,
+  seedMember,
+  seedNote,
+  seedOrg,
+  seedVault,
+  seedVaultGrant,
+} from "./helpers/seed.js";
 
 /**
  * Vault-wide checkpoints and the vault revert.
@@ -73,6 +80,9 @@ describe("vault checkpoints", () => {
     await seedMember(org, owner.userId, "owner");
     await seedMember(org, member.userId, "member");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
     const a = await seedNote(vault, null, "a.md", owner.userId);
     const b = await seedNote(vault, null, "b.md", owner.userId);
     rec.docWriter.store.set(a, "alpha");
@@ -105,6 +115,30 @@ describe("vault checkpoints", () => {
     expect(JSON.stringify(body)).not.toContain("alpha");
   });
 
+  it("refuses a whole-vault revert in a Private vault, even for the owner", async () => {
+    // The role is not vault-wide read any more, and this rewrites every note at
+    // once. Reverting from a seat that can see only some of them would restore
+    // the structure whole and the contents partially — worse than refusing.
+    const owner = await signUp("p-owner@t.com");
+    const org = await seedOrg("Acme", "acme-c-private");
+    await seedMember(org, owner.userId, "owner");
+    const vault = await seedVault(org); // no grant == Private
+    await seedNote(vault, null, "n.md", owner.userId);
+
+    const created = await api(owner, `/api/vaults/${vault}/checkpoints`, {
+      method: "POST",
+      body: "{}",
+    });
+    expect(created.status).toBe(201);
+    const { id } = (await created.json()) as { id: string };
+
+    const res = await api(owner, `/api/vaults/${vault}/checkpoints/${id}/revert`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(403);
+    expect((await res.json()) as unknown).toMatchObject({ code: "no_vault_wide_access" });
+  });
+
   it("gates create/delete/revert to owner+admin, and shuts members out", async () => {
     const owner = await signUp("g-owner@t.com");
     const admin = await signUp("g-admin@t.com");
@@ -115,6 +149,9 @@ describe("vault checkpoints", () => {
     await seedMember(org, admin.userId, "admin");
     await seedMember(org, member.userId, "member");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
 
     expect(
       (await api(member, `/api/vaults/${vault}/checkpoints`, { method: "POST", body: "{}" }))
@@ -162,6 +199,9 @@ describe("vault checkpoints", () => {
   it("prunes the oldest automatic checkpoints first, then the oldest manual ones", async () => {
     const org = await seedOrg("Acme", "acme-c3");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
     const oldAuto = await seedCheckpoint(vault, "auto", "2026-01-01T00:00:00Z");
     const newAuto = await seedCheckpoint(vault, "auto", "2026-01-02T00:00:00Z");
     const m1 = await seedCheckpoint(vault, "manual", "2026-01-03T00:00:00Z");
@@ -183,6 +223,9 @@ describe("vault checkpoints", () => {
   it("never prunes a checkpoint that is mid-flight", async () => {
     const org = await seedOrg("Acme", "acme-c4");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
     const target = await seedCheckpoint(vault, "auto", "2026-01-01T00:00:00Z");
     const second = await seedCheckpoint(vault, "auto", "2026-01-02T00:00:00Z");
     for (let i = 3; i <= 7; i++) {
@@ -203,6 +246,9 @@ describe("vault checkpoints", () => {
   it("takes the daily checkpoint once, and not again within the day", async () => {
     const org = await seedOrg("Acme", "acme-c5");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
     const docId = await seedNote(vault, null, "n.md");
     rec.docWriter.store.set(docId, "daily");
 
@@ -223,6 +269,9 @@ describe("vault checkpoints", () => {
   it("two simultaneous daily checks produce ONE checkpoint (advisory lock)", async () => {
     const org = await seedOrg("Acme", "acme-c6");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
     const docId = await seedNote(vault, null, "n.md");
     rec.docWriter.store.set(docId, "stampede");
 
@@ -239,6 +288,9 @@ describe("vault checkpoints", () => {
     const org = await seedOrg("Acme", "acme-c7");
     await seedMember(org, owner.userId, "owner");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
 
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
@@ -269,6 +321,9 @@ describe("vault checkpoints", () => {
     const org = await seedOrg("Acme", "acme-c8");
     await seedMember(org, owner.userId, "owner");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
     const folder = await seedFolder(vault, null, "Docs", "Docs");
     const kept = await seedNote(vault, folder, "Docs/kept.md", owner.userId);
     const removed = await seedNote(vault, null, "gone.md", owner.userId);
@@ -363,6 +418,9 @@ describe("vault checkpoints", () => {
     const org = await seedOrg("Lag", "lag-c8");
     await seedMember(org, owner.userId, "owner");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
     const uploaded = await seedNote(vault, null, "uploaded.md", owner.userId);
     const lagging = await seedNote(vault, null, "lagging.md", owner.userId);
     rec.docWriter.store.set(uploaded, "made it up");
@@ -398,6 +456,9 @@ describe("vault checkpoints", () => {
     const org = await seedOrg("Guard", "guard-c8");
     await seedMember(org, owner.userId, "owner");
     const vault = await seedVault(org);
+    // Shared: a whole-vault revert needs whole-vault read, which the role alone
+    // no longer confers (a Private vault scopes owners too).
+    await seedVaultGrant(org, "edit");
     const doc = await seedNote(vault, null, "precious.md", owner.userId);
     rec.docWriter.store.set(doc, "precious words");
 
@@ -422,11 +483,105 @@ describe("vault checkpoints", () => {
     expect(rec.docWriter.store.get(doc)).toBe("precious words");
   });
 
+  it("refuses a revert that would delete more notes than the cap allows", async () => {
+    const owner = await signUp("rv-cap@t.com");
+    const org = await seedOrg("Acme", "acme-cap");
+    await seedMember(org, owner.userId, "owner");
+    const vault = await seedVault(org);
+    await seedVaultGrant(org, "edit");
+
+    // A checkpoint of an EMPTY vault. Everything created afterwards counts as
+    // "created after the checkpoint" and is soft-deleted on revert — so an empty
+    // (or truncated, or never-captured) `structure.notes` means the whole vault.
+    const create = await api(owner, `/api/vaults/${vault}/checkpoints`, {
+      method: "POST",
+      body: JSON.stringify({ label: "empty" }),
+    });
+    const checkpoint = (await create.json()) as { id: string };
+
+    const ids: string[] = [];
+    for (let i = 0; i < 12; i++) ids.push(await seedNote(vault, null, `n${i}.md`, owner.userId));
+
+    const res = await api(owner, `/api/vaults/${vault}/checkpoints/${checkpoint.id}/revert`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      code: "revert_too_destructive",
+      wouldDelete: 12,
+      cap: 5,
+    });
+
+    // AND it did nothing: the refusal rolls the whole transaction back, so no
+    // note is half-deleted and no structure moved.
+    const { rows } = await pool.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM notes WHERE vault_id = $1 AND deleted_at IS NULL",
+      [vault],
+    );
+    expect(rows[0]!.n).toBe(12);
+  });
+
+  it("leaves the structure committed when a content write fails", async () => {
+    const owner = await signUp("rv-partial@t.com");
+    const org = await seedOrg("Acme", "acme-part");
+    await seedMember(org, owner.userId, "owner");
+    const vault = await seedVault(org);
+    await seedVaultGrant(org, "edit");
+    const a = await seedNote(vault, null, "a.md", owner.userId);
+    const b = await seedNote(vault, null, "b.md", owner.userId);
+    rec.docWriter.store.set(a, "A original");
+    rec.docWriter.store.set(b, "B original");
+
+    const create = await api(owner, `/api/vaults/${vault}/checkpoints`, {
+      method: "POST",
+      body: JSON.stringify({ label: "good" }),
+    });
+    const checkpoint = (await create.json()) as { id: string };
+    rec.docWriter.store.set(a, "A drifted");
+    rec.docWriter.store.set(b, "B drifted");
+    await pool.query("UPDATE notes SET deleted_at = now() WHERE id = $1", [b]);
+
+    // One doc's content write blows up. Run INSIDE the lock's transaction, this
+    // rolled the structure back while leaving the other note's body already
+    // rewritten — reverted content with no record of it. Run after COMMIT, the
+    // failure costs exactly itself.
+    const realSetContent = rec.docWriter.setContent.bind(rec.docWriter);
+    rec.docWriter.setContent = async (
+      vaultId: string,
+      docId: string,
+      content: string,
+      actor?: { userId?: string | null },
+    ) => {
+      if (docId === a) throw new Error("doc writer exploded");
+      return realSetContent(vaultId, docId, content, actor);
+    };
+    try {
+      const res = await api(owner, `/api/vaults/${vault}/checkpoints/${checkpoint.id}/revert`, {
+        method: "POST",
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ docsChanged: 1, docsRestored: 1 });
+    } finally {
+      rec.docWriter.setContent = realSetContent;
+    }
+
+    // The structure change committed…
+    const { rows } = await pool.query<{ deleted_at: Date | null }>(
+      "SELECT deleted_at FROM notes WHERE id = $1",
+      [b],
+    );
+    expect(rows[0]!.deleted_at).toBeNull();
+    // …the write that worked landed, and the one that threw simply did not.
+    expect(rec.docWriter.store.get(b)).toBe("B original");
+    expect(rec.docWriter.store.get(a)).toBe("A drifted");
+  });
+
   it("404s a checkpoint from another vault", async () => {
     const owner = await signUp("rv-cross@t.com");
     const org = await seedOrg("Acme", "acme-c9");
     await seedMember(org, owner.userId, "owner");
     const vaultA = await seedVault(org, "A");
+    await seedVaultGrant(org, "edit");
     const vaultB = await seedVault(org, "B");
     const created = await api(owner, `/api/vaults/${vaultA}/checkpoints`, {
       method: "POST",

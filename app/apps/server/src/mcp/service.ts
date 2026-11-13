@@ -1,9 +1,19 @@
+import { withNoteQuota, NoteQuotaError } from "../billing/note-quota.js";
 import { randomUUID } from "node:crypto";
 import { pool } from "../db/pool.js";
-import { orgRole } from "../permissions/lookup.js";
-import { effectivePermission, type Permission } from "../permissions/resolver.js";
-import { listReadableDocsInVault } from "../permissions/vault-docs.js";
-import { canEditFolder } from "../permissions/http-gates.js";
+import { orgRole, resolveResource } from "../permissions/lookup.js";
+import { createResolverCache, effectivePermission, type Permission } from "../permissions/resolver.js";
+import { listReadableDocsInVault, listVisibleFolders, vaultAccess } from "../permissions/vault-docs.js";
+import {
+  canEditFolder,
+  canReadAttachment,
+  filterReadableBlobs,
+  vaultRootWritable,
+  canDeleteItem,
+  billingReadOnly,
+  ACCOUNT_READ_ONLY,
+  ACCOUNT_READ_ONLY_MESSAGE,
+} from "../permissions/http-gates.js";
 import {
   TreeOpError,
   deleteFolderCascade,
@@ -17,9 +27,36 @@ import {
   resolveFolderParent,
   resolveParentFolder,
 } from "../registry/tree-ops.js";
-import { purgeNoteIndex, searchNoteIndex } from "../index/indexer.js";
+import { indexDoc, purgeNoteIndex, searchNoteIndex } from "../index/indexer.js";
+import { vaultKeyCache } from "../crypto/key-cache.js";
 import type { McpAuth } from "./tokens.js";
-import { StaleRevisionError, revisionOf, type DocWriter, type TextOp } from "./doc-writer.js";
+import {
+  NoteTooLargeError,
+  StaleRevisionError,
+  replacementOp,
+  revisionOf,
+  type DocWriter,
+  type TextOp,
+} from "./doc-writer.js";
+import {
+  AccessManagementError,
+  applyBulkAccess,
+  getJoinDefault,
+  requireAccessManager,
+  setJoinDefault,
+  type AccessAudience,
+  type AccessMode,
+  type AccessResource,
+} from "../permissions/access-management.js";
+import { buildAccessContext, resolveAccessForUser } from "../permissions/resolver.js";
+import { softDeleteSet } from "../trash/retention.js";
+import { deleteRegisteredFile } from "../http/routes/registry.js";
+import { registerCtx, registerFile } from "../registry/batch-ops.js";
+import { vaultKeysEnabled } from "../crypto/config.js";
+import { KeyRequiredError, KEY_REQUIRED_CODE, loadVkCheck } from "../crypto/transport.js";
+import { verifyVk } from "../crypto/vk-check.js";
+import type { DocCrypto } from "../crypto/doc-crypto.js";
+import { openBlobTextRow } from "../index/sealed-index.js";
 
 /**
  * The CRUD operations the MCP exposes, each one gated by the SAME ACL the rest
@@ -48,10 +85,181 @@ export interface McpContext {
    * edit announces itself.
    */
   onRegistryChanged?: (vaultId: string) => void;
+  onAclChanged?: (vaultId: string) => void;
 }
 
 /** A tool tried to touch something it may not, or that doesn't exist. */
-export class McpToolError extends Error {}
+export class McpToolError extends Error {
+  /** Machine-readable refusal code, surfaced on the tool result (e.g. `delete_not_creator`). */
+  constructor(
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message);
+  }
+}
+
+const KEY_REQUIRED_MESSAGE =
+  "This connection does not have this vault's key yet. It picks it up automatically the next time someone on " +
+  "the team has Baalda open; if it still fails after that, reconnect Baalda in this app's connector settings " +
+  "(for a token, make a new one in Baalda: Vault Settings > MCP).";
+
+/**
+ * W3: the caller's verified key for a keyed vault, unwrapped from the token's
+ * own wrap for this call (`McpAuth.vaultKeys`, never the process cache).
+ * Unkeyed vault or flag off: undefined, today's path. Keyed vault without a
+ * usable key: a hard `key_required` refusal BEFORE anything is read or written.
+ */
+async function vaultCrypto(auth: McpAuth, vaultId: string): Promise<DocCrypto | undefined> {
+  if (!vaultKeysEnabled()) return undefined;
+  const state = await loadVkCheck(vaultId);
+  if (!state) return undefined;
+  const held = auth.vaultKeys?.get(vaultId);
+  if (!held || held.generation !== state.generation) {
+    throw new McpToolError(KEY_REQUIRED_MESSAGE, KEY_REQUIRED_CODE);
+  }
+  return { vaultId, key: held.key, generation: held.generation };
+}
+
+/**
+ * W3: re-index a keyed vault's note with THIS call's key, so the write is
+ * searchable with no desktop online (background indexing only has the keys of
+ * connected members). Unkeyed: nothing to do here, the usual queue indexes it.
+ * Best-effort: the write is already durable.
+ */
+async function indexWithCallKey(docId: string, crypto: DocCrypto | undefined): Promise<void> {
+  if (!crypto) return;
+  // A write with a key unwrapped from this token/grant keeps the vault keyed
+  // for background work (idle versions ~10 min later, the index queue), as a
+  // connected member would. One-way: the call itself never reads the cache.
+  // Verified against the vault's check first: a wrong key in the cache would
+  // seal background writes the members could not open.
+  try {
+    const state = await loadVkCheck(crypto.vaultId);
+    if (state && state.generation === crypto.generation && verifyVk(crypto.key, crypto.vaultId, state.vkCheck)) {
+      vaultKeyCache.holdForRequest(crypto.vaultId, crypto.key, crypto.generation);
+    }
+  } catch (err) {
+    console.warn("[mcp] could not hold the call's key for background work:", (err as Error).message);
+  }
+  try {
+    await indexDoc(docId, pool, crypto);
+  } catch (err) {
+    console.warn(`[mcp] keyed re-index of ${docId} failed:`, (err as Error).message);
+  }
+}
+
+/** A write refusal: `account_read_only` when the vault's billing account has
+ *  lapsed, else the caller's ordinary message. */
+async function writeRefusal(orgId: string, message: string, code?: string): Promise<McpToolError> {
+  try {
+    if (await billingReadOnly(orgId)) return new McpToolError(ACCOUNT_READ_ONLY_MESSAGE, ACCOUNT_READ_ONLY.code);
+  } catch { /* fall through to the ordinary refusal */ }
+  return new McpToolError(message, code);
+}
+
+/** Members delete only what they created; owners/admins delete anything (`canDeleteItem`). */
+async function requireDeletable(
+  ctx: McpContext,
+  kind: "note" | "file" | "folder",
+  id: string,
+): Promise<void> {
+  const gate = await canDeleteItem(pool, {
+    orgId: ctx.auth.organizationId,
+    userId: ctx.auth.userId,
+    kind,
+    id,
+  });
+  if (gate.ok) return;
+  throw await writeRefusal(
+    ctx.auth.organizationId,
+    gate.code === "folder_has_others_items"
+      ? "This folder holds items someone else created. Only an owner or admin can delete it."
+      : "Only the person who created this, or an owner or admin, can delete it.",
+    gate.code,
+  );
+}
+
+function accessToolError(error: unknown): never {
+  if (error instanceof AccessManagementError) throw new McpToolError(error.message, error.code);
+  throw error;
+}
+
+export async function getAccessDefaultTool(ctx: McpContext) {
+  try {
+    return { mode: await getJoinDefault(ctx.auth.organizationId, ctx.auth.userId) };
+  } catch (error) {
+    accessToolError(error);
+  }
+}
+
+export async function setAccessDefaultTool(ctx: McpContext, mode: AccessMode) {
+  try {
+    return { mode: await setJoinDefault(ctx.auth.organizationId, ctx.auth.userId, mode) };
+  } catch (error) {
+    accessToolError(error);
+  }
+}
+
+export async function manageAccessTool(
+  ctx: McpContext,
+  resources: AccessResource[],
+  audience: AccessAudience,
+  mode: AccessMode,
+) {
+  try {
+    return await applyBulkAccess(
+      {
+        organizationId: ctx.auth.organizationId,
+        actorUserId: ctx.auth.userId,
+        resources,
+        audience,
+        mode,
+      },
+      { disconnectDoc: ctx.disconnectDoc, onAclChanged: ctx.onAclChanged },
+    );
+  } catch (error) {
+    accessToolError(error);
+  }
+}
+
+export async function listResourceAccessTool(
+  ctx: McpContext,
+  resourceType: "folder" | "file",
+  resourceId: string,
+) {
+  try {
+    await requireAccessManager(ctx.auth.organizationId, ctx.auth.userId);
+    const resource = await resolveResource(resourceType, resourceId);
+    if (!resource || resource.organizationId !== ctx.auth.organizationId) {
+      throw new McpToolError("Unknown resource or outside this token's vault", "not_found");
+    }
+    const accessContext = await buildAccessContext(resourceType, resourceId);
+    if (!accessContext) throw new McpToolError("Unknown resource", "not_found");
+    const { rows } = await pool.query<{
+      user_id: string;
+      role: string;
+      name: string | null;
+      email: string | null;
+    }>(
+      `SELECT m."userId" AS user_id, m.role, u.name, u.email
+         FROM member m JOIN "user" u ON u.id = m."userId"
+        WHERE m."organizationId" = $1`,
+      [ctx.auth.organizationId],
+    );
+    return Promise.all(
+      rows.map(async (member) => ({
+        userId: member.user_id,
+        name: member.name,
+        email: member.email,
+        role: member.role,
+        ...(await resolveAccessForUser(accessContext, member.user_id, member.role)),
+      })),
+    );
+  } catch (error) {
+    accessToolError(error);
+  }
+}
 
 function relPathStem(relPath: string): string {
   const base = relPath.split("/").pop() ?? relPath;
@@ -61,17 +269,87 @@ function relPathStem(relPath: string): string {
 // ── scope + permission guards ───────────────────────────────────────────────
 
 /** Confirm a vault (a `vaults` note-collection row) exists and is in scope —
- *  i.e. it belongs to the token's vault (the organization). */
-async function requireVaultInScope(auth: McpAuth, vaultId: string): Promise<void> {
-  const { rows } = await pool.query<{ organization_id: string }>(
-    "SELECT organization_id FROM vaults WHERE id = $1",
-    [vaultId],
+ *  i.e. it belongs to the token's vault (the organization) — and return its id.
+ *
+ *  Agents often pass what they were shown instead of the collection id: the
+ *  organization id the token is bound to, or the vault's name from
+ *  `list_vaults`. Both name exactly one collection when they match, so they
+ *  resolve to it rather than failing; anything else is refused with the ids
+ *  this token CAN use, so the retry is one step. Only this token's own vaults
+ *  are ever listed or matched. */
+async function requireVaultInScope(auth: McpAuth, vaultId: string): Promise<string> {
+  const { rows } = await pool.query<{ id: string; name: string }>(
+    "SELECT id, name FROM vaults WHERE organization_id = $1 ORDER BY created_at ASC",
+    [auth.organizationId],
   );
-  const org = rows[0]?.organization_id;
-  if (!org) throw new McpToolError(`Unknown vault: ${vaultId}`);
-  if (org !== auth.organizationId) {
-    throw new McpToolError("This vault is outside the scope of this token");
+  if (rows.some((r) => r.id === vaultId)) return vaultId;
+  if (vaultId === auth.organizationId && rows.length === 1) return rows[0].id;
+  const byName = rows.filter((r) => r.name.trim().toLowerCase() === vaultId.trim().toLowerCase());
+  if (byName.length === 1) return byName[0].id;
+  // One answer for "no such id" and "another team's id": a differing message
+  // would let a token probe which ids exist outside its vault.
+  const valid = rows.map((r) => `${r.id} (${r.name})`).join(", ");
+  throw notFound("vault", vaultId, valid ? `. Use a vaultId from list_vaults: ${valid}` : "");
+}
+
+/** The refusal for an id that does not exist OR lives outside the token's vault. */
+function outOfScope(kind: "vault" | "folder" | "note" | "file", id: string): string {
+  return `Unknown ${kind}, or it is outside the scope of this token: ${id}`;
+}
+
+/** {@link outOfScope} as a tool error, coded so the metrics can count it. */
+function notFound(kind: "vault" | "folder" | "note" | "file", id: string, hint = ""): McpToolError {
+  return new McpToolError(outOfScope(kind, id) + hint, "not_found");
+}
+
+/** {@link requireVaultInScope} for an item lookup: refuse with the ITEM's
+ *  not-found answer, so a foreign item reads exactly like a missing one. */
+async function requireItemVaultInScope(
+  auth: McpAuth,
+  kind: "folder" | "file",
+  id: string,
+  vaultId: string | undefined,
+): Promise<string> {
+  if (vaultId) {
+    const { rows } = await pool.query<{ organization_id: string }>(
+      "SELECT organization_id FROM vaults WHERE id = $1",
+      [vaultId],
+    );
+    if (rows[0]?.organization_id === auth.organizationId) return vaultId;
   }
+  throw notFound(kind, id);
+}
+
+/**
+ * Deleting something that is already deleted: the end state the caller asked
+ * for already holds, so the delete tools answer success with `alreadyDeleted`
+ * instead of "Unknown …". Agents retry deletes (a lost response, a note that
+ * went with its folder) and each retry used to count as a failed call. Only
+ * this token's own vault is consulted, so it reveals nothing outside it.
+ */
+async function tombstonedInScope(
+  auth: McpAuth,
+  table: "folder_tombstones" | "file_tombstones",
+  id: string,
+): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM ${table} t JOIN vaults v ON v.id = t.vault_id
+      WHERE t.id = $1 AND v.organization_id = $2`,
+    [id, auth.organizationId],
+  );
+  return rows.length > 0;
+}
+
+/** A soft-deleted note in this token's vault that the caller could read. */
+async function noteAlreadyDeleted(auth: McpAuth, docId: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM notes n JOIN vaults v ON v.id = n.vault_id
+      WHERE n.id = $1 AND n.deleted_at IS NOT NULL AND v.organization_id = $2`,
+    [docId, auth.organizationId],
+  );
+  if (rows.length === 0) return false;
+  const perm = await effectivePermission(auth.userId, docId, pool, undefined, { includeDeleted: true });
+  return perm !== "none";
 }
 
 async function isAdmin(auth: McpAuth): Promise<boolean> {
@@ -99,7 +377,15 @@ async function folderWritePermission(
   // two gates legitimately differ, and callers that MOVE things to the root have
   // to skip this check rather than inherit the admin-only rule (HTTP doesn't
   // apply it either).
-  if (!folderId) return (await isAdmin(auth)) ? "edit" : "none";
+  //
+  // The Read-only posture cuts across even that: `vaultBaseline` caps every
+  // shortcut for everyone, so an admin must not be able to keep creating notes
+  // at the root of a vault whose existing notes they cannot touch. That was the
+  // one hole this gate had — admin-only is not the same as "always allowed".
+  if (!folderId) {
+    if (!(await isAdmin(auth))) return "none";
+    return (await vaultRootWritable(auth.userId, auth.organizationId)) ? "edit" : "none";
+  }
   // Otherwise defer to the HTTP gate rather than keeping a second implementation.
   // The copy that used to live here was missing the creator rule, so a member who
   // made a folder in the app could rename and delete it over HTTP but couldn't
@@ -119,16 +405,8 @@ export async function listVaults(ctx: McpContext) {
 }
 
 export async function listFolders(ctx: McpContext, vaultId: string) {
-  await requireVaultInScope(ctx.auth, vaultId);
-  const { rows } = await pool.query<{
-    id: string;
-    parent_id: string | null;
-    name: string;
-    path: string;
-  }>(
-    "SELECT id, parent_id, name, path FROM folders WHERE vault_id = $1 ORDER BY path",
-    [vaultId],
-  );
+  vaultId = await requireVaultInScope(ctx.auth, vaultId);
+  const rows = await listVisibleFolders(ctx.auth.userId, vaultId);
   return rows.map((r) => ({
     folderId: r.id,
     parentId: r.parent_id,
@@ -156,7 +434,8 @@ async function assertRootNotFrozen(
   );
   if (rows[0]?.root_frozen) {
     throw new McpToolError(
-      `This vault's root is frozen — ${action} this inside a folder instead.`,
+      `This vault's root is frozen. ${action === "move" ? "Move" : "Create"} this inside a folder instead.`,
+      "root_frozen",
     );
   }
 }
@@ -165,7 +444,7 @@ export async function createFolder(
   ctx: McpContext,
   input: { vaultId: string; name: string; path: string; parentId?: string | null },
 ) {
-  await requireVaultInScope(ctx.auth, input.vaultId);
+  input = { ...input, vaultId: await requireVaultInScope(ctx.auth, input.vaultId) };
   // `path` is authoritative; `parentId` must be the folder at its dirname or is
   // resolved from it. Done before the permission check so the check judges the
   // real parent (see `resolveParentFolder`).
@@ -176,11 +455,11 @@ export async function createFolder(
     parentId = loc.folderId;
     storedPath = loc.relPath;
   } catch (err) {
-    if (err instanceof TreeOpError) throw new McpToolError(err.message);
+    if (err instanceof TreeOpError) throw new McpToolError(err.message, "invalid_target");
     throw err;
   }
   if ((await folderWritePermission(ctx.auth, parentId)) !== "edit") {
-    throw new McpToolError("You do not have edit access to create a folder here");
+    throw await writeRefusal(ctx.auth.organizationId, "You do not have edit access to create a folder here", "no_access");
   }
   // Adopt an existing row at this path instead of inserting a duplicate, exactly
   // as `POST /api/folders` does. Matched case-insensitively and echoing the
@@ -190,7 +469,7 @@ export async function createFolder(
   // the right shape for a tool an LLM retries.
   const existing = await pool.query<{ id: string; name: string; path: string }>(
     `SELECT id, name, path FROM folders
-      WHERE vault_id = $1 AND lower(path) = lower($2)
+      WHERE vault_id = $1 AND vault_path_key(path) = vault_path_key($2)
       ORDER BY created_at ASC, id ASC LIMIT 1`,
     [input.vaultId, storedPath],
   );
@@ -220,7 +499,7 @@ export async function createFolder(
     if ((err as { code?: string }).code === "23505") {
       const winner = await pool.query<{ id: string; name: string; path: string }>(
         `SELECT id, name, path FROM folders
-          WHERE vault_id = $1 AND lower(path) = lower($2)
+          WHERE vault_id = $1 AND vault_path_key(path) = vault_path_key($2)
           ORDER BY created_at ASC, id ASC LIMIT 1`,
         [input.vaultId, storedPath],
       );
@@ -252,12 +531,14 @@ export async function deleteFolder(
     "SELECT vault_id FROM folders WHERE id = $1",
     [folderId],
   );
-  const vaultId = rows[0]?.vault_id;
-  if (!vaultId) throw new McpToolError(`Unknown folder: ${folderId}`);
-  await requireVaultInScope(ctx.auth, vaultId);
-  if ((await folderWritePermission(ctx.auth, folderId)) !== "edit") {
-    throw new McpToolError("You do not have edit access to delete this folder");
+  if (!rows[0] && (await tombstonedInScope(ctx.auth, "folder_tombstones", folderId))) {
+    return { deleted: folderId, deletedNotes: 0, alreadyDeleted: true };
   }
+  const vaultId = await requireItemVaultInScope(ctx.auth, "folder", folderId, rows[0]?.vault_id);
+  if ((await folderWritePermission(ctx.auth, folderId)) !== "edit") {
+    throw await writeRefusal(ctx.auth.organizationId, "You do not have edit access to delete this folder", "no_access");
+  }
+  await requireDeletable(ctx, "folder", folderId);
   if (!opts.recursive) {
     const { rows: files } = await pool.query<{ n: number }>(
       "SELECT count(*)::int AS n FROM files WHERE folder_id = $1",
@@ -265,11 +546,12 @@ export async function deleteFolder(
     );
     if (!(await folderIsEmpty(pool, folderId)) || (files[0]?.n ?? 0) > 0) {
       throw new McpToolError(
-        "Folder is not empty — move its contents first, or pass recursive: true to delete them with it",
+        "Folder is not empty. Move its contents first, or pass recursive: true to delete them with it",
+        "folder_not_empty",
       );
     }
   }
-  const { deletedNoteIds } = await deleteFolderCascade(pool, folderId);
+  const { deletedNoteIds } = await deleteFolderCascade(pool, folderId, ctx.auth.userId ?? null);
   // Same trailing work as `delete_note`: drop derived index rows and kick anyone
   // whose editor is still attached to a doc that no longer exists.
   await purgeNoteIndex(deletedNoteIds);
@@ -287,10 +569,10 @@ export async function moveFolderTool(
   input: { folderId: string; path?: string; name?: string; parentId?: string | null },
 ) {
   const folder = await findFolder(pool, input.folderId);
-  if (!folder) throw new McpToolError(`Unknown folder: ${input.folderId}`);
-  await requireVaultInScope(ctx.auth, folder.vault_id);
+  await requireItemVaultInScope(ctx.auth, "folder", input.folderId, folder?.vault_id);
+  if (!folder) throw notFound("folder", input.folderId);
   if ((await folderWritePermission(ctx.auth, input.folderId)) !== "edit") {
-    throw new McpToolError("You do not have edit access to move this folder");
+    throw await writeRefusal(ctx.auth.organizationId, "You do not have edit access to move this folder", "no_access");
   }
   // Re-parenting must not be a way to change inherited access, so edit on the
   // destination is required too — but only for a real folder. `parentId: null`
@@ -303,7 +585,7 @@ export async function moveFolderTool(
   try {
     plan = await planFolderMove(pool, folder, moveInput);
   } catch (err) {
-    if (err instanceof TreeOpError) throw new McpToolError(err.message);
+    if (err instanceof TreeOpError) throw new McpToolError(err.message, "invalid_target");
     throw err;
   }
   if (
@@ -311,7 +593,7 @@ export async function moveFolderTool(
     plan.parentId !== folder.parent_id &&
     (await folderWritePermission(ctx.auth, plan.parentId)) !== "edit"
   ) {
-    throw new McpToolError("You do not have edit access to the destination folder");
+    throw await writeRefusal(ctx.auth.organizationId, "You do not have edit access to the destination folder", "no_access");
   }
   // Moving a folder OUT to the root is a root creation by another name — the
   // same latch the HTTP registry honours (a rename in place at root is fine).
@@ -323,7 +605,7 @@ export async function moveFolderTool(
     ctx.onRegistryChanged?.(moved.vaultId);
     return { folderId: moved.id, name: moved.name, path: moved.path };
   } catch (err) {
-    if (err instanceof TreeOpError) throw new McpToolError(err.message);
+    if (err instanceof TreeOpError) throw new McpToolError(err.message, "invalid_target");
     throw err;
   }
 }
@@ -342,7 +624,7 @@ export async function moveNoteTool(
   try {
     plan = await planNoteMove(pool, row, moveInput);
   } catch (err) {
-    if (err instanceof TreeOpError) throw new McpToolError(err.message);
+    if (err instanceof TreeOpError) throw new McpToolError(err.message, "invalid_target");
     throw err;
   }
   // Moving a note INTO a folder inherits that folder's grants, so it needs edit
@@ -353,7 +635,7 @@ export async function moveNoteTool(
     plan.folderId !== note.folder_id &&
     (await folderWritePermission(ctx.auth, plan.folderId)) !== "edit"
   ) {
-    throw new McpToolError("You do not have edit access to the destination folder");
+    throw await writeRefusal(ctx.auth.organizationId, "You do not have edit access to the destination folder", "no_access");
   }
   // Same root-freeze latch as HTTP's PATCH /api/notes/:id: dragging a note out
   // to a frozen root is refused; a rename in place at root is allowed.
@@ -370,61 +652,136 @@ export async function moveNoteTool(
       folderId: moved.folderId,
     };
   } catch (err) {
-    if (err instanceof TreeOpError) throw new McpToolError(err.message);
+    if (err instanceof TreeOpError) throw new McpToolError(err.message, "invalid_target");
     throw err;
   }
 }
 
 // ── notes (markdown docs) ─────────────────────────────────────────────────────
 
+/** Page size used when `cursor` is given without `limit`. */
+export const LIST_NOTES_DEFAULT_PAGE = 500;
+/** Largest page `list_notes` hands back in one call. */
+export const LIST_NOTES_MAX_PAGE = 5000;
+
+export interface ListedNote {
+  docId: string;
+  folderId: string | null;
+  title: string;
+  relPath: string;
+  permission: Permission;
+  updatedAt: string;
+}
+
+/** Opaque keyset cursor over `(rel_path, id)`, the paged listing's sort order. */
+function encodeNotesCursor(relPath: string, id: string): string {
+  return Buffer.from(JSON.stringify([relPath, id]), "utf8").toString("base64url");
+}
+
+function decodeNotesCursor(cursor: string): [string, string] {
+  try {
+    const v: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (Array.isArray(v) && v.length === 2 && typeof v[0] === "string" && typeof v[1] === "string") {
+      return [v[0], v[1]];
+    }
+  } catch {
+    // fall through to the refusal
+  }
+  throw new McpToolError("Invalid cursor: pass the nextCursor from a previous list_notes call", "invalid_argument");
+}
+
+/**
+ * List the notes the caller can read.
+ *
+ * With neither `limit` nor `cursor` this returns EVERY readable note as a bare
+ * array, exactly as before: existing scripts depend on that shape. With either,
+ * it returns one page `{ results, nextCursor }`, keyset-paged on
+ * `(rel_path, id)`. Permission filtering happens before the page is cut, so a
+ * page is short only when it is the last one, and `nextCursor` is null exactly
+ * then. `pathPrefix` keeps notes whose relPath starts with it (case-sensitive).
+ */
 export async function listNotes(
   ctx: McpContext,
   vaultId: string,
   folderId?: string | null,
-) {
-  await requireVaultInScope(ctx.auth, vaultId);
-  const params: unknown[] = [vaultId];
-  let where = "vault_id = $1 AND deleted_at IS NULL";
-  if (folderId !== undefined && folderId !== null) {
-    params.push(folderId);
-    where += ` AND folder_id = $${params.length}`;
+  opts: { limit?: number; cursor?: string; pathPrefix?: string } = {},
+): Promise<ListedNote[] | { results: ListedNote[]; nextCursor: string | null }> {
+  vaultId = await requireVaultInScope(ctx.auth, vaultId);
+  const paged = opts.limit !== undefined || opts.cursor !== undefined;
+  let pageSize = Number.POSITIVE_INFINITY;
+  if (paged) {
+    const raw = opts.limit ?? LIST_NOTES_DEFAULT_PAGE;
+    if (!Number.isInteger(raw) || raw < 1) {
+      throw new McpToolError("limit must be a positive integer", "invalid_argument");
+    }
+    pageSize = Math.min(raw, LIST_NOTES_MAX_PAGE);
   }
-  const { rows } = await pool.query<{
-    id: string;
-    folder_id: string | null;
-    title: string | null;
-    rel_path: string;
-    updated_at: string;
-  }>(
-    `SELECT id, folder_id, title, rel_path, updated_at
-       FROM notes WHERE ${where} ORDER BY rel_path`,
-    params,
-  );
+  let after = opts.cursor !== undefined ? decodeNotesCursor(opts.cursor) : null;
 
   // effectivePermission honours role AND locks, and never returns 'none' for an
   // admin — so this both filters (members see only what's shared) and reports an
   // accurate permission (a locked note shows 'view' even for an owner/admin).
-  const out: Array<{
-    docId: string;
-    folderId: string | null;
-    title: string;
-    relPath: string;
-    permission: Permission;
-    updatedAt: string;
-  }> = [];
-  for (const r of rows) {
-    const permission = await effectivePermission(ctx.auth.userId, r.id);
-    if (permission === "none") continue; // members only see what's shared with them
-    out.push({
-      docId: r.id,
-      folderId: r.folder_id,
-      title: r.title ?? relPathStem(r.rel_path),
-      relPath: r.rel_path,
-      permission,
-      updatedAt: r.updated_at,
-    });
+  const out: ListedNote[] = [];
+  // One request-scoped cache, prefetched per fetched chunk (it merges across
+  // calls): the same per-doc resolver, answered from three batch reads instead
+  // of ~8 queries per note (#263). See `permissions/resolver.ts ResolverCache`.
+  // A paged call only prefetches its own page, not the whole vault.
+  const resolverCache = createResolverCache();
+  for (;;) {
+    const params: unknown[] = [vaultId];
+    let where = "vault_id = $1 AND deleted_at IS NULL";
+    if (folderId !== undefined && folderId !== null) {
+      params.push(folderId);
+      where += ` AND folder_id = $${params.length}`;
+    }
+    if (opts.pathPrefix) {
+      params.push(opts.pathPrefix);
+      where += ` AND left(rel_path, length($${params.length})) = $${params.length}`;
+    }
+    if (after) {
+      params.push(after[0], after[1]);
+      where += ` AND (rel_path, id) > ($${params.length - 1}, $${params.length})`;
+    }
+    // Paged: fetch one past what the page still needs, so a full page knows
+    // whether a readable note follows it.
+    const want = paged ? pageSize - out.length + 1 : 0;
+    if (paged) params.push(want);
+    const { rows } = await pool.query<{
+      id: string;
+      folder_id: string | null;
+      title: string | null;
+      rel_path: string;
+      updated_at: string;
+    }>(
+      `SELECT id, folder_id, title, rel_path, updated_at
+         FROM notes WHERE ${where} ORDER BY rel_path, id${paged ? ` LIMIT $${params.length}` : ""}`,
+      params,
+    );
+    await resolverCache.prefetch(pool, rows.map((r) => r.id));
+    for (const r of rows) {
+      const permission = await effectivePermission(ctx.auth.userId, r.id, pool, resolverCache);
+      if (permission === "none") continue; // members only see what's shared with them
+      if (out.length === pageSize) {
+        // A readable note exists past this page: point the cursor at the last
+        // note handed back.
+        const last = out[out.length - 1]!;
+        return { results: out, nextCursor: encodeNotesCursor(last.relPath, last.docId) };
+      }
+      out.push({
+        docId: r.id,
+        folderId: r.folder_id,
+        title: r.title ?? relPathStem(r.rel_path),
+        relPath: r.rel_path,
+        permission,
+        updatedAt: r.updated_at,
+      });
+    }
+    if (!paged) return out;
+    if (rows.length < want) return { results: out, nextCursor: null };
+    // The chunk was full but hidden notes kept the page short: read on.
+    const tail = rows[rows.length - 1]!;
+    after = [tail.rel_path, tail.id];
   }
-  return out;
 }
 
 /** Locate a live note + confirm it's in scope. Throws McpToolError otherwise. */
@@ -442,9 +799,9 @@ async function locateNote(auth: McpAuth, docId: string) {
     [docId],
   );
   const note = rows[0];
-  if (!note) throw new McpToolError(`Unknown note: ${docId}`);
-  if (note.organization_id !== auth.organizationId) {
-    throw new McpToolError("This note is outside the scope of this token");
+  // Same answer for missing and foreign, so a token cannot probe other vaults.
+  if (!note || note.organization_id !== auth.organizationId) {
+    throw notFound("note", docId);
   }
   return note;
 }
@@ -452,8 +809,9 @@ async function locateNote(auth: McpAuth, docId: string) {
 export async function readNote(ctx: McpContext, docId: string) {
   const note = await locateNote(ctx.auth, docId);
   const perm = await effectivePermission(ctx.auth.userId, docId);
-  if (perm === "none") throw new McpToolError("You do not have access to this note");
-  const content = await ctx.docWriter.readContent(note.vault_id, docId);
+  if (perm === "none") throw new McpToolError("You do not have access to this note", "no_access");
+  const crypto = await vaultCrypto(ctx.auth, note.vault_id);
+  const content = await writeOrToolError(() => ctx.docWriter.readContent(note.vault_id, docId, crypto));
   return {
     docId,
     vaultId: note.vault_id,
@@ -478,7 +836,9 @@ export async function createNote(
     content?: string;
   },
 ) {
-  await requireVaultInScope(ctx.auth, input.vaultId);
+  input = { ...input, vaultId: await requireVaultInScope(ctx.auth, input.vaultId) };
+  // W3: content needs the key; refuse before any row is written.
+  const crypto = input.content ? await vaultCrypto(ctx.auth, input.vaultId) : undefined;
   // `relPath` is authoritative; `folderId` must be the folder at its dirname or
   // is resolved from it. An assistant that computes the two inconsistently
   // (the 2026-08-27 phantom-root-folder: `folderId` of `Team/BenAI/…/Daily`,
@@ -491,11 +851,11 @@ export async function createNote(
     folderId = loc.folderId;
     storedRelPath = loc.relPath;
   } catch (err) {
-    if (err instanceof TreeOpError) throw new McpToolError(err.message);
+    if (err instanceof TreeOpError) throw new McpToolError(err.message, "invalid_target");
     throw err;
   }
   if ((await folderWritePermission(ctx.auth, folderId)) !== "edit") {
-    throw new McpToolError("You do not have edit access to create a note here");
+    throw await writeRefusal(ctx.auth.organizationId, "You do not have edit access to create a note here", "no_access");
   }
   // Adopt the live note already at this path instead of inserting a second row,
   // exactly as `createFolder` does. A vault-relative path addresses ONE note —
@@ -509,7 +869,7 @@ export async function createNote(
     rel_path: string;
   }>(
     `SELECT id, title, folder_id, rel_path FROM notes
-      WHERE vault_id = $1 AND lower(rel_path) = lower($2) AND deleted_at IS NULL
+      WHERE vault_id = $1 AND vault_path_key(rel_path) = vault_path_key($2) AND deleted_at IS NULL
       ORDER BY created_at ASC, id ASC LIMIT 1`,
     [input.vaultId, storedRelPath],
   );
@@ -520,12 +880,17 @@ export async function createNote(
     // the caller can reach for once `adopted` has told it what happened.
     let seeded = false;
     if (input.content) {
-      const current = await ctx.docWriter.readContent(input.vaultId, row.id);
+      const current = await writeOrToolError(() => ctx.docWriter.readContent(input.vaultId, row.id, crypto));
       if (current.trim().length === 0) {
-        await ctx.docWriter.setContent(input.vaultId, row.id, input.content, {
-          userId: ctx.auth.userId,
-        });
+        const content = input.content;
+        await writeOrToolError(() =>
+          ctx.docWriter.setContent(input.vaultId, row.id, content, {
+            userId: ctx.auth.userId,
+            crypto,
+          }),
+        );
         seeded = true;
+        await indexWithCallKey(row.id, crypto);
       }
     }
     return {
@@ -544,16 +909,24 @@ export async function createNote(
   await assertRootNotFrozen(input.vaultId, folderId);
 
   const docId = randomUUID();
-  await pool.query(
+  await withNoteQuota(input.vaultId, pool, async (db, remaining, cap) => {
+    if (remaining !== null && remaining <= 0) throw new NoteQuotaError(cap);
+    await db.query(
     `INSERT INTO notes (id, vault_id, folder_id, title, rel_path, doc_id, created_by)
      VALUES ($1, $2, $3, $4, $5, $1, $6)`,
-    [docId, input.vaultId, folderId, input.title ?? null, storedRelPath, ctx.auth.userId],
-  );
+      [docId, input.vaultId, folderId, input.title ?? null, storedRelPath, ctx.auth.userId],
+    );
+  });
   if (input.content) {
-    await ctx.docWriter.setContent(input.vaultId, docId, input.content, {
-      userId: ctx.auth.userId,
-    });
+    const content = input.content;
+    await writeOrToolError(() =>
+      ctx.docWriter.setContent(input.vaultId, docId, content, {
+        userId: ctx.auth.userId,
+        crypto,
+      }),
+    );
   }
+  if (input.content) await indexWithCallKey(docId, crypto);
   // After the content, so a client that reacts to the announcement by pulling
   // the note finds it already written rather than briefly empty.
   ctx.onRegistryChanged?.(input.vaultId);
@@ -572,10 +945,12 @@ async function requireEditableNote(auth: McpAuth, docId: string) {
   const note = await locateNote(auth, docId);
   const perm = await effectivePermission(auth.userId, docId);
   if (perm !== "edit") {
-    throw new McpToolError(
+    throw await writeRefusal(
+      auth.organizationId,
       perm === "view"
         ? "This note is read-only for you (view access or locked)"
         : "You do not have access to this note",
+      perm === "view" ? "read_only" : "no_access",
     );
   }
   return note;
@@ -613,40 +988,19 @@ async function writeOrToolError<T>(fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } catch (err) {
-    if (err instanceof StaleRevisionError || err instanceof EditError) {
-      throw new McpToolError(err.message);
-    }
+    if (err instanceof StaleRevisionError) throw new McpToolError(err.message, "stale_revision");
+    if (err instanceof EditError) throw new McpToolError(err.message, err.code);
+    if (err instanceof NoteTooLargeError) throw new McpToolError(err.message, "note_too_large");
+    // Never "" or a partial write: the sealed doc could not be read, so nothing
+    // was applied and the caller is told so.
+    if (err instanceof KeyRequiredError) throw new McpToolError(KEY_REQUIRED_MESSAGE, KEY_REQUIRED_CODE);
     throw err;
   }
 }
 
-/**
- * The smallest single replacement that turns `current` into `next`: the shared
- * prefix and suffix are left alone. So `update_note` on a 20 KB note where one
- * paragraph changed touches one paragraph's worth of CRDT — a concurrent edit
- * elsewhere in the note merges instead of being clobbered by a delete-all —
- * while remaining, by construction, a whole-body replacement in effect.
- */
-export function replacementOp(current: string, next: string): TextOp[] {
-  if (current === next) return [];
-  let prefix = 0;
-  const max = Math.min(current.length, next.length);
-  while (prefix < max && current.charCodeAt(prefix) === next.charCodeAt(prefix)) prefix++;
-  let suffix = 0;
-  while (
-    suffix < max - prefix &&
-    current.charCodeAt(current.length - 1 - suffix) === next.charCodeAt(next.length - 1 - suffix)
-  ) {
-    suffix++;
-  }
-  return [
-    {
-      index: prefix,
-      deleteLength: current.length - prefix - suffix,
-      insert: next.slice(prefix, next.length - suffix),
-    },
-  ];
-}
+/** The smallest single replacement between two bodies — lives beside the writer
+ *  it feeds (`setContent` uses it too); re-exported for the MCP tools. */
+export { replacementOp };
 
 export async function updateNote(
   ctx: McpContext,
@@ -655,6 +1009,7 @@ export async function updateNote(
   expectedRevision?: string,
 ) {
   const note = await requireEditableNote(ctx.auth, docId);
+  const crypto = await vaultCrypto(ctx.auth, note.vault_id);
   // The actor rides along so the edit is attributed to the MCP token's user —
   // an AI write shows up as "edited by <that user>" like any teammate's.
   const { revision } = await writeOrToolError(() =>
@@ -665,10 +1020,11 @@ export async function updateNote(
         requireRevision(current, expectedRevision);
         return replacementOp(current, content);
       },
-      { userId: ctx.auth.userId },
+      { userId: ctx.auth.userId, crypto },
     ),
   );
   await pool.query("UPDATE notes SET updated_at = now() WHERE id = $1", [docId]);
+  await indexWithCallKey(docId, crypto);
   return { docId, bytes: content.length, revision };
 }
 
@@ -715,6 +1071,7 @@ export async function appendNote(
   opts: { expectedRevision?: string; idempotencyKey?: string } = {},
 ) {
   const note = await requireEditableNote(ctx.auth, docId);
+  const crypto = await vaultCrypto(ctx.auth, note.vault_id);
   const key = opts.idempotencyKey ? `${docId}\n${opts.idempotencyKey}` : null;
   if (key) {
     const prior = recallAppend(key);
@@ -728,11 +1085,12 @@ export async function appendNote(
         requireRevision(current, opts.expectedRevision);
         return [{ index: current.length, deleteLength: 0, insert: text }];
       },
-      { userId: ctx.auth.userId },
+      { userId: ctx.auth.userId, crypto },
     ),
   );
   if (key) rememberAppend(key, { revision });
   await pool.query("UPDATE notes SET updated_at = now() WHERE id = $1", [docId]);
+  await indexWithCallKey(docId, crypto);
   return { docId, appended: text.length, duplicate: false, revision };
 }
 
@@ -745,8 +1103,19 @@ export type NoteEdit =
   | { type: "insert_after"; anchor: string; text: string }
   | { type: "delete"; find: string; all?: boolean };
 
-/** An edit's anchor was missing or ambiguous — nothing was written. */
-export class EditError extends Error {}
+/**
+ * An edit's anchor was missing or ambiguous — nothing was written. `code` is
+ * surfaced on the tool result (and counted in the sync metrics) so a refusal can
+ * be told apart from a crash without reading prose.
+ */
+export class EditError extends Error {
+  constructor(
+    message: string,
+    readonly code: "anchor_not_found" | "anchor_ambiguous" | "bad_edit" = "bad_edit",
+  ) {
+    super(message);
+  }
+}
 
 function occurrences(haystack: string, needle: string): number[] {
   const out: number[] = [];
@@ -763,6 +1132,144 @@ function anchorOf(edit: NoteEdit): string {
   return edit.type === "replace" || edit.type === "delete" ? edit.find : edit.anchor;
 }
 
+// ── tolerant anchor matching ────────────────────────────────────────────────
+//
+// An agent copies its anchor out of `read_note`'s JSON, and that copy is not
+// always byte-exact: a model rewrites a non-breaking or ideographic space as a
+// plain space, drops zero-width characters it cannot see, straightens curly
+// quotes, turns an en/em dash into a hyphen, collapses doubled spaces, loses the
+// trailing spaces before a newline, or hands back NFC where the note holds NFD.
+// Each of those used to be "anchor not found" (an `isError` result), and they
+// were the bulk of edit_note's failures. Exact matching still runs first and
+// wins; folding is a FALLBACK that only engages when the exact anchor is absent,
+// and the same exactly-once rule applies to the folded text, so a tolerant match
+// can never pick between two candidates.
+//
+// `foldForMatch` returns the folded string plus `map`, where `map[i]` is the
+// original index of folded character `i` and `map[folded.length]` is the
+// original length. A folded span `[a, b)` therefore covers the original span
+// `[map[a], map[b])`, which is what the op deletes — the agent's replacement
+// text goes in verbatim; folding never rewrites the note.
+
+const UNICODE_SPACES = new Set([
+  "\u00a0", "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004", "\u2005",
+  "\u2006", "\u2007", "\u2008", "\u2009", "\u200a", "\u202f", "\u205f", "\u3000",
+]);
+const ZERO_WIDTH = new Set(["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad"]);
+const FOLD_CHAR: Record<string, string> = {
+  "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'",
+  "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"', "\u2033": '"',
+  "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-", "\u2212": "-",
+};
+const COMBINING = /\p{M}/u;
+
+/** Fold one already-NFC character (or the empty string to drop it). */
+function foldChar(ch: string): string {
+  if (ch === "\t" || UNICODE_SPACES.has(ch)) return " ";
+  if (ZERO_WIDTH.has(ch)) return "";
+  return FOLD_CHAR[ch] ?? ch;
+}
+
+export interface Folded {
+  folded: string;
+  map: number[];
+}
+
+/**
+ * Normalise `s` for matching. Rules (all many-to-one or many-to-zero, never
+ * one-to-many, so every folded index maps back to one original index):
+ * CRLF/CR → LF · tabs and Unicode spaces → space · a run of spaces collapses to
+ * one, and vanishes before a line break or the end · zero-width characters and
+ * soft hyphens vanish · curly quotes, primes and dashes straighten · a base
+ * character plus its combining marks is NFC-composed as one group.
+ */
+export function foldForMatch(s: string): Folded {
+  const out: string[] = [];
+  const map: number[] = [];
+  const hasMarks = COMBINING.test(s);
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const start = i;
+    let group = s[i];
+    i++;
+    // Surrogate pair → one code point.
+    if (group.charCodeAt(0) >= 0xd800 && group.charCodeAt(0) <= 0xdbff && i < n) {
+      group += s[i];
+      i++;
+    }
+    if (hasMarks) {
+      while (i < n && COMBINING.test(s[i])) {
+        group += s[i];
+        i++;
+      }
+      group = group.normalize("NFC");
+    }
+    if (group === "\r") {
+      if (s[i] === "\n") i++;
+      out.push("\n");
+      map.push(start);
+      continue;
+    }
+    const folded = group.length === 1 ? foldChar(group) : group;
+    if (folded === " ") {
+      // Swallow the whole run; drop it entirely before a line break / the end.
+      while (i < n && (s[i] === " " || s[i] === "\t" || UNICODE_SPACES.has(s[i]))) i++;
+      const atBreak = i >= n || s[i] === "\n" || s[i] === "\r";
+      if (!atBreak) {
+        out.push(" ");
+        map.push(start);
+      }
+      continue;
+    }
+    for (const c of folded) {
+      out.push(c);
+      map.push(start);
+    }
+  }
+  map.push(n);
+  return { folded: out.join(""), map };
+}
+
+/** `[start, end)` original spans of `anchor` in `text`, exact first, folded as a fallback. */
+export function findAnchor(
+  text: string,
+  anchor: string,
+): { spans: Array<[number, number]>; folded: boolean } {
+  const exact = occurrences(text, anchor);
+  if (exact.length > 0) {
+    return { spans: exact.map((at) => [at, at + anchor.length]), folded: false };
+  }
+  const fa = foldForMatch(anchor).folded;
+  if (fa.length === 0) return { spans: [], folded: true };
+  const ft = foldForMatch(text);
+  const hits = occurrences(ft.folded, fa);
+  return {
+    spans: hits.map((at) => [ft.map[at], ft.map[at + fa.length]]),
+    folded: true,
+  };
+}
+
+/** 1-based line of `index` in `text`. */
+function lineAt(text: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index && i < text.length; i++) if (text[i] === "\n") line++;
+  return line;
+}
+
+/**
+ * When the whole anchor is absent, say where its first line is — an agent that
+ * pasted a multi-line anchor usually got the first line right and drifted after
+ * it, and a line number lets it re-read just that part instead of guessing.
+ */
+function notFoundHint(text: string, anchor: string): string {
+  const first = anchor.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+  if (!first || first === anchor.trim()) return "";
+  const { spans } = findAnchor(text, first);
+  if (spans.length !== 1) return "";
+  return ` Its first line appears alone at line ${lineAt(text, spans[0][0])}; the rest differs from the note.`;
+}
+
 /**
  * Turn `edits` into ops against `current`, in order — each edit is matched in
  * the text as left by the previous ones, and its ops are emitted with indices
@@ -771,7 +1278,8 @@ function anchorOf(edit: NoteEdit): string {
  * Strict on purpose: an anchor must occur EXACTLY once unless the edit says
  * `all`. "Not found" and "ambiguous" are both refused with the count, so an
  * agent gets a conflict it can reason about instead of a change in the wrong
- * place — the failure mode this tool exists to remove.
+ * place — the failure mode this tool exists to remove. Exact matches win; when
+ * there is none, the tolerant fold above gets one try under the same rule.
  */
 export function planEdits(current: string, edits: NoteEdit[]): TextOp[] {
   if (edits.length === 0) throw new EditError("edit_note needs at least one edit");
@@ -782,35 +1290,38 @@ export function planEdits(current: string, edits: NoteEdit[]): TextOp[] {
     if (typeof anchor !== "string" || anchor.length === 0) {
       throw new EditError(`edit ${n + 1}: the anchor text must be a non-empty string`);
     }
-    const hits = occurrences(text, anchor);
+    const { spans } = findAnchor(text, anchor);
     const all = (edit.type === "replace" || edit.type === "delete") && edit.all === true;
-    if (hits.length === 0) {
+    if (spans.length === 0) {
       throw new EditError(
-        `edit ${n + 1} (${edit.type}): anchor not found — the note may have changed; read it again`,
+        `edit ${n + 1} (${edit.type}): anchor not found. The note may have changed; read it again.` +
+          notFoundHint(text, anchor),
+        "anchor_not_found",
       );
     }
-    if (hits.length > 1 && !all) {
+    if (spans.length > 1 && !all) {
       throw new EditError(
-        `edit ${n + 1} (${edit.type}): anchor matches ${hits.length} times — include more surrounding text to make it unique` +
+        `edit ${n + 1} (${edit.type}): anchor matches ${spans.length} times. Include more surrounding text to make it unique` +
           (edit.type === "replace" || edit.type === "delete" ? ", or set all: true" : ""),
+        "anchor_ambiguous",
       );
     }
-    const targets = all ? hits : [hits[0]];
+    const targets = all ? spans : [spans[0]];
     // Apply right-to-left so earlier indices stay valid within this one edit.
-    for (const at of [...targets].reverse()) {
+    for (const [at, end] of [...targets].reverse()) {
       let op: TextOp;
       switch (edit.type) {
         case "replace":
-          op = { index: at, deleteLength: anchor.length, insert: edit.replace };
+          op = { index: at, deleteLength: end - at, insert: edit.replace };
           break;
         case "delete":
-          op = { index: at, deleteLength: anchor.length, insert: "" };
+          op = { index: at, deleteLength: end - at, insert: "" };
           break;
         case "insert_before":
           op = { index: at, deleteLength: 0, insert: edit.text };
           break;
         case "insert_after":
-          op = { index: at + anchor.length, deleteLength: 0, insert: edit.text };
+          op = { index: end, deleteLength: 0, insert: edit.text };
           break;
       }
       ops.push(op);
@@ -827,6 +1338,7 @@ export async function editNote(
   expectedRevision?: string,
 ) {
   const note = await requireEditableNote(ctx.auth, docId);
+  const crypto = await vaultCrypto(ctx.auth, note.vault_id);
   const { revision, content } = await writeOrToolError(() =>
     ctx.docWriter.editContent(
       note.vault_id,
@@ -835,17 +1347,23 @@ export async function editNote(
         requireRevision(current, expectedRevision);
         return planEdits(current, edits);
       },
-      { userId: ctx.auth.userId },
+      { userId: ctx.auth.userId, crypto },
     ),
   );
   await pool.query("UPDATE notes SET updated_at = now() WHERE id = $1", [docId]);
+  await indexWithCallKey(docId, crypto);
   return { docId, applied: edits.length, bytes: content.length, revision };
 }
 
 /** Soft-delete a note (matches the app: sets deleted_at, keeps CRDT history). */
 export async function deleteNote(ctx: McpContext, docId: string) {
+  if (await noteAlreadyDeleted(ctx.auth, docId)) return { deleted: docId, alreadyDeleted: true };
   const note = await requireEditableNote(ctx.auth, docId);
-  await pool.query("UPDATE notes SET deleted_at = now() WHERE id = $1", [docId]);
+  await requireDeletable(ctx, "note", docId);
+  await pool.query(`UPDATE notes SET ${softDeleteSet("$2")} WHERE id = $1`, [
+    docId,
+    ctx.auth.userId ?? null,
+  ]);
   // Drop derived index rows and kick any live editors off the now-gone doc.
   await purgeNoteIndex([docId]);
   ctx.disconnectDoc(note.vault_id, docId);
@@ -855,6 +1373,52 @@ export async function deleteNote(ctx: McpContext, docId: string) {
   return { deleted: docId };
 }
 
+// ── tree files (non-note binaries) ─────────────────────────────────────────
+
+/** Delete a tree file through the SAME gate as `DELETE /api/files/:id`. */
+export async function deleteFileTool(ctx: McpContext, fileId: string) {
+  const out = await deleteRegisteredFile(ctx.auth.userId, fileId, ctx.auth.organizationId);
+  if (out.status === "gone" && (await tombstonedInScope(ctx.auth, "file_tombstones", fileId))) {
+    return { deleted: fileId, alreadyDeleted: true };
+  }
+  if (out.status === "gone" || out.status === "not_member") {
+    throw notFound("file", fileId);
+  }
+  if (out.status === "account_read_only") throw new McpToolError(ACCOUNT_READ_ONLY_MESSAGE, ACCOUNT_READ_ONLY.code);
+  if (out.status === "forbidden") throw await writeRefusal(ctx.auth.organizationId, "You do not have edit access to this file", "no_access");
+  if (out.status === "not_creator") {
+    throw new McpToolError(
+      "Only the person who created this, or an owner or admin, can delete it.",
+      "delete_not_creator",
+    );
+  }
+  ctx.disconnectDoc(out.vaultId, fileId);
+  ctx.onRegistryChanged?.(out.vaultId);
+  return { deleted: fileId, path: out.path };
+}
+
+/**
+ * Rename or move a tree file, keeping its id: the same re-registration
+ * (`registerFile` with the file's id and a new path) `POST /api/files` does.
+ */
+export async function moveFileTool(ctx: McpContext, fileId: string, path: string) {
+  const { rows } = await pool.query<{ vault_id: string; path: string }>(
+    "SELECT vault_id, path FROM files WHERE id = $1",
+    [fileId],
+  );
+  const row = rows[0];
+  await requireItemVaultInScope(ctx.auth, "file", fileId, row?.vault_id);
+  if (!row) throw notFound("file", fileId);
+  const out = await registerFile(registerCtx(row.vault_id, ctx.auth.userId), {
+    path,
+    docId: fileId,
+    folderId: null,
+  });
+  if (out.status === "error") throw new McpToolError(out.message ?? "move refused", "invalid_target");
+  if (out.wrote) ctx.onRegistryChanged?.(row.vault_id);
+  return { fileId: out.row.id, path: out.row.path, folderId: out.row.folderId };
+}
+
 // ── search ────────────────────────────────────────────────────────────────
 
 export async function searchNotes(
@@ -862,8 +1426,9 @@ export async function searchNotes(
   vaultId: string,
   query: string,
   k = 10,
+  includeFiles = true,
 ) {
-  await requireVaultInScope(ctx.auth, vaultId);
+  vaultId = await requireVaultInScope(ctx.auth, vaultId);
   const limit = Number.isFinite(k) && k > 0 ? Math.min(Math.trunc(k), 50) : 10;
 
   // Two changes, neither of which alters the result shape or the ranking:
@@ -878,6 +1443,166 @@ export async function searchNotes(
   //    batches and never pulls note bodies onto the heap. The old version
   //    selected `ni.content` + `ni.vector` for every row in the vault with no
   //    LIMIT and then pinned that whole array across the permission loop.
+  //  - files are ranked alongside notes out of `blob_text` and tagged
+  //    `kind: "file"`, gated by the SAME readable set; the vault-wide flag only
+  //    decides whether the doc-less `attachments/` blobs are candidates, which
+  //    mirrors what the download gate would answer for them.
+  // W3: a keyed vault's sealed rows are scored with this call's own key.
+  const crypto = await vaultCrypto(ctx.auth, vaultId);
   const readable = await listReadableDocsInVault(ctx.auth.userId, vaultId);
-  return searchNoteIndex({ vaultId, query, k: limit, readableDocIds: readable });
+  const access = await vaultAccess(pool, ctx.auth.userId, vaultId);
+  return writeOrToolError(() =>
+    searchNoteIndex({
+      vaultId,
+      query,
+      k: limit,
+      readableDocIds: readable,
+      includeFiles,
+      vaultWideReader: access?.vaultWide === true,
+      crypto,
+    }),
+  );
+}
+
+// ── attachments / files ───────────────────────────────────────────────────
+
+/** Biggest `blob_text` body one `read_attachment_text` call may return, and the
+ *  default when the caller names no bound. A whole spreadsheet's text in one
+ *  tool result is rarely what an assistant wants and always what it pays for. */
+const ATTACHMENT_TEXT_DEFAULT_CHARS = 20_000;
+const ATTACHMENT_TEXT_MAX_CHARS = 200_000;
+
+/** Most blobs one `list_attachments` call may consider before ACL filtering.
+ *  Bounds the listing of a vault with thousands of attachments. */
+const ATTACHMENT_LIST_SCAN = 2000;
+
+/**
+ * The files stored in a vault that the caller may read.
+ *
+ * Filtered by `filterReadableBlobs` — the same gate the HTTP list route uses —
+ * so a registered tree file follows its folder's ACL and a hash-named
+ * `attachments/` drop follows the notes that embed it. `hasText` says whether
+ * `read_attachment_text` has anything to give back for it.
+ */
+export async function listAttachments(
+  ctx: McpContext,
+  vaultId: string,
+  opts: { folder?: string; limit?: number } = {},
+) {
+  vaultId = await requireVaultInScope(ctx.auth, vaultId);
+  const limit = Number.isFinite(opts.limit) && (opts.limit as number) > 0
+    ? Math.min(Math.trunc(opts.limit as number), 200)
+    : 50;
+  // A folder prefix, matched case-insensitively like every other path
+  // comparison here. `%`/`_` are escaped so a folder called `50%` is a folder
+  // and not a wildcard.
+  const prefix = opts.folder
+    ? `${opts.folder.replace(/\/+$/, "").toLowerCase().replace(/[\\%_]/g, (ch) => `\\${ch}`)}/%`
+    : null;
+
+  const { rows } = await pool.query<{
+    id: string;
+    doc_id: string | null;
+    rel_path: string | null;
+    filename: string | null;
+    mime: string | null;
+    size: string | number;
+    has_text: boolean;
+  }>(
+    `SELECT b.id, b.doc_id, b.rel_path, b.filename, b.mime, b.size,
+            (bt.blob_id IS NOT NULL) AS has_text
+       FROM blobs b
+       LEFT JOIN blob_text bt ON bt.blob_id = b.id
+      WHERE b.vault_id = $1 AND b.status = 'ready'
+        AND ($2::text IS NULL OR lower(b.rel_path) LIKE $2 ESCAPE '\\')
+      ORDER BY b.rel_path
+      LIMIT $3`,
+    [vaultId, prefix, ATTACHMENT_LIST_SCAN],
+  );
+
+  // W3: the attachment ACL may read sealed note text (embed references).
+  const crypto = await vaultCrypto(ctx.auth, vaultId);
+  const visible = await writeOrToolError(() =>
+    filterReadableBlobs(ctx.auth.userId, vaultId, rows, pool, crypto),
+  );
+  return visible.slice(0, limit).map((r) => ({
+    docId: r.doc_id,
+    blobId: r.id,
+    relPath: r.rel_path,
+    filename: r.filename ?? (r.rel_path ? (r.rel_path.split("/").pop() ?? null) : null),
+    mime: r.mime,
+    size: Number(r.size),
+    hasText: r.has_text,
+  }));
+}
+
+/**
+ * The plain text extracted from a file — NOT the file.
+ *
+ * The bytes are never served here: an assistant asking for a 20 MB workbook
+ * over JSON-RPC wants its words, and the words are what the vault indexed. A
+ * file nobody has extracted yet answers with an empty string rather than an
+ * error, because "not indexed yet" is a normal state (extraction happens on the
+ * device that holds the file) and not a mistake the caller made.
+ *
+ * Gated by `canReadAttachment`, which for a registered tree file is the
+ * resolver itself — so a folder share, a revoke, a sealed vault and a `locked`
+ * cap all reach this tool without it knowing they exist.
+ */
+export async function readAttachmentText(
+  ctx: McpContext,
+  vaultId: string,
+  ref: { relPath?: string; blobId?: string },
+  maxChars?: number,
+) {
+  vaultId = await requireVaultInScope(ctx.auth, vaultId);
+  if (!ref.relPath && !ref.blobId) {
+    throw new McpToolError("read_attachment_text needs either relPath or blobId", "invalid_argument");
+  }
+  const cap = Number.isFinite(maxChars) && (maxChars as number) > 0
+    ? Math.min(Math.trunc(maxChars as number), ATTACHMENT_TEXT_MAX_CHARS)
+    : ATTACHMENT_TEXT_DEFAULT_CHARS;
+
+  const { rows } = await pool.query<{
+    id: string;
+    doc_id: string | null;
+    rel_path: string | null;
+    sha256: string;
+    chars: number | null;
+    content: string | null;
+    search_enc: Buffer | null;
+  }>(
+    `SELECT b.id, b.doc_id, b.rel_path, b.sha256, bt.chars, bt.content, bt.search_enc
+       FROM blobs b
+       LEFT JOIN blob_text bt ON bt.blob_id = b.id
+      WHERE b.vault_id = $1 AND b.status = 'ready'
+        AND ($2::text IS NULL OR b.id = $2)
+        AND ($3::text IS NULL OR lower(b.rel_path) = lower($3))
+      LIMIT 1`,
+    [vaultId, ref.blobId ?? null, ref.relPath ?? null],
+  );
+  const row = rows[0];
+  if (!row) throw new McpToolError("No such file in this vault", "not_found");
+  const crypto = await vaultCrypto(ctx.auth, vaultId);
+  if (!(await writeOrToolError(() => canReadAttachment(ctx.auth.userId, vaultId, row.rel_path, row.doc_id, pool, crypto)))) {
+    throw new McpToolError("You do not have access to this file", "no_access");
+  }
+
+  // W3: sealed text is opened with this call's own key (the token's wrap);
+  // without one, `vaultCrypto` refuses with key_required. Never "" for it.
+  let full = row.content ?? "";
+  if (row.search_enc) {
+    if (!crypto) throw new McpToolError(KEY_REQUIRED_MESSAGE, KEY_REQUIRED_CODE);
+    full = openBlobTextRow(crypto, row.id, row.search_enc).body;
+  }
+  const text = full.length > cap ? full.slice(0, cap) : full;
+  return {
+    blobId: row.id,
+    docId: row.doc_id,
+    relPath: row.rel_path,
+    text,
+    chars: row.chars ?? full.length,
+    truncated: full.length > text.length,
+    sha256: row.sha256,
+  };
 }

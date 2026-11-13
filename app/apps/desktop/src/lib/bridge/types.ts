@@ -22,27 +22,90 @@ export interface YjsPersistedState {
   updates: Uint8Array[];
   /** `updates.length` — we compact when this exceeds the threshold after load. */
   updateCount: number;
+  /**
+   * The highest row id among `updates` (SQLite rowid), when the store can say.
+   *
+   * The compaction watermark for a log this bridge did not append itself: a
+   * load-time compaction has to truncate exactly the rows it just read and
+   * nothing newer. Absent (an older host that doesn't report it) means "no
+   * watermark", and a compaction then writes the snapshot without truncating —
+   * a log that is read twice, never an update that is deleted unseen.
+   */
+  lastUpdateId?: number;
 }
 
 /** Durable CRDT store. Production maps this to the SQLite-backed Rust commands. */
 export interface CrdtPersistence {
   loadState(docId: string): Promise<YjsPersistedState>;
-  appendUpdate(docId: string, update: Uint8Array): Promise<void>;
-  /** Write a merged snapshot + state vector, truncating the doc's update log. */
+  /** Append one update to the doc's log and answer the row it landed in. Row
+   *  ids are monotonic in commit order, which is what makes them a usable
+   *  compaction watermark (see {@link saveSnapshot}). */
+  appendUpdate(docId: string, update: Uint8Array): Promise<number>;
+  /**
+   * Write a merged snapshot + state vector, truncating the doc's update log up
+   * to `upTo` — and NO further.
+   *
+   * The watermark is the whole point. A snapshot is encoded from the doc as it
+   * was, then written; updates issued during that await (every keystroke of an
+   * ordinary typing session — the trigger fires at 64 rows) are NOT in it. A
+   * blanket `DELETE FROM yjs_updates WHERE doc_id = ?` deleted them anyway, and
+   * the doc then loaded SHORT: the surviving later updates reference the missing
+   * one's items, so Yjs parks them as pending and never integrates them.
+   * `upTo` is the highest row id the caller knows is both committed and folded
+   * into this snapshot; omitting it deletes NOTHING (snapshot only).
+   */
   saveSnapshot(
     docId: string,
     snapshot: Uint8Array,
     stateVector: Uint8Array,
+    upTo?: number,
   ): Promise<void>;
+  /**
+   * The doc's DISK BASE (#200): sha256 of the bytes this device last synced
+   * between the doc's file and its CRDT — last written by egest (recorded by
+   * `writeFileAtomic` when it is given the doc id) or last read into the doc
+   * by an ingest or a seed. Null when none was ever recorded. Optional: a
+   * store without it leaves the bridge on its older rule (every differing
+   * file is diffed).
+   */
+  loadDiskBase?(docId: string): Promise<string | null>;
+  /** Record the disk base after the bridge read a file INTO the doc. */
+  saveDiskBase?(docId: string, sha256: string): Promise<void>;
 }
+
+/** What a compare-and-swap write did. */
+export type WriteResult = "written" | "stale";
 
 /** All I/O the bridge depends on, injected so it is testable in isolation. */
 export interface BridgeIO {
   readFile(path: string): Promise<string>;
-  writeFileAtomic(path: string, content: string): Promise<void>;
+  /**
+   * Atomic write. `docId` is passed by the bridge's egest so the store can
+   * record the written bytes as that doc's disk base with the write.
+   *
+   * Compare-and-swap (#216): with `expectedSha` (sha256 of the file bytes this
+   * bridge last observed; the empty-string hash for "no file"), the store must
+   * NOT write when the file no longer hashes to it, and resolve `"stale"`
+   * instead. `undefined`/`null` is an unconditional write. Resolving nothing
+   * (`void`) means written, so a store without CAS support stays valid.
+   */
+  writeFileAtomic(
+    path: string,
+    content: string,
+    docId?: string,
+    expectedSha?: string | null,
+  ): Promise<void | WriteResult>;
   /** SHA-256 hex of `text`. May be sync (Node) or async (Web Crypto). */
   sha256(text: string): Promise<string> | string;
   persistence: CrdtPersistence;
+  /**
+   * Optional: preserve `content` (bytes found at `path`) as a recovery copy
+   * under `.context/trash`, resolving to where it landed. Used before a
+   * signed-in open whose file the doc cannot take in yet — no local CRDT, and
+   * bytes that differ from the disk base — so the first pull's egest can never
+   * be the only thing that ever happened to them.
+   */
+  saveRecoveryCopy?(path: string, content: string): Promise<string | null>;
   /** Optional: re-index a written file if `writeFileAtomic` doesn't itself. */
   reindex?(path: string): Promise<void> | void;
   /** Optional error sink (defaults to console.error). */
@@ -66,8 +129,20 @@ export interface BridgeConfig {
   ingestDebounceMs: number;
   /** Debounce before a CRDT→file egest write. */
   egestDebounceMs: number;
-  /** Compact the update log when it exceeds this many rows after load. */
+  /** Compact the update log when it exceeds this many rows. */
   compactThreshold: number;
+  /**
+   * Compact the update log when it exceeds this many BYTES, whatever the row
+   * count.
+   *
+   * The row count alone never fires on a real vault: the trigger was 64 rows and
+   * the busiest doc on a 5,933-note vault held 58 — while 28 individual updates
+   * were over 1 MB each (a paste, an AI rewrite, an image data-URI). So the log
+   * a launch has to read back, and every doc load has to apply, grew without
+   * bound under a threshold that was never reached. Bytes are what cost time
+   * here, so bytes are what we count. 0 disables the check.
+   */
+  compactBytes: number;
   /** Take a recovery snapshot before a diff that churns this fraction of the doc. */
   largeDiffRatio: number;
   /**
@@ -82,6 +157,24 @@ export interface BridgeConfig {
    * note we also refuse to read back in. 0 disables the check.
    */
   maxIngestBytes: number;
+  /**
+   * Allow a 0-byte file to clear a doc that still holds text (default false).
+   *
+   * The ingest-side twin of the egest clobber guard. A file that reads as
+   * COMPLETELY empty against a populated doc is almost never an edit: it is the
+   * registry's own 0-byte placeholder landing on a note whose content this
+   * device already has (issue #93 — the placeholder was diff-merged as a
+   * delete-all and pushed, destroying the server's copy), or a truncated write
+   * caught mid-flight. Refusing costs a log line and a re-read; accepting costs
+   * the note, on every device.
+   *
+   * A PARTIAL truncation still applies — this is only the all-or-nothing case.
+   * "Empty" also covers a file with no body (whitespace, a lone newline or bare
+   * frontmatter) over a doc with at least 200 characters of body (#256,
+   * `blankFile.ts`). Set true where clearing a note from disk must be honoured
+   * verbatim.
+   */
+  allowTruncateFromDisk: boolean;
   /** First retry delay after a failed egest write; doubles per consecutive
    *  failure up to `egestRetryMaxMs`. */
   egestRetryBaseMs: number;
@@ -100,14 +193,26 @@ export interface BridgeConfig {
    * 0 disables trimming.
    */
   undoStackLimit: number;
+  /**
+   * Upper bound on how long a signed-in bridge waits for its first server pull
+   * before it reconciles the file anyway (#200). While the pull is pending the
+   * bridge neither ingests the file nor writes it; the sync layer normally
+   * ends the wait itself (`reconcileAfterPull`) within a few seconds, and this
+   * only guarantees no caller can leave a note unreconciled forever.
+   */
+  pullReconcileTimeoutMs: number;
 }
 
 export const DEFAULT_CONFIG: BridgeConfig = {
   ingestDebounceMs: 150,
   egestDebounceMs: 300,
   compactThreshold: 64,
+  // 1 MB of pending updates is already more than a snapshot of almost any note
+  // would cost, so past this the log is pure overhead on every load.
+  compactBytes: 1024 * 1024,
   largeDiffRatio: 0.6,
   maxIngestBytes: 10 * 1024 * 1024,
+  allowTruncateFromDisk: false,
   egestRetryBaseMs: 1_000,
   egestRetryMaxMs: 30_000,
   // 500ms matches Yjs' own default and CodeMirror's `newGroupDelay`, so undo
@@ -117,6 +222,7 @@ export const DEFAULT_CONFIG: BridgeConfig = {
   // switching away — far past any realistic Ctrl+Z run (CodeMirror's own
   // history keeps ~100), while still bounding the stack.
   undoStackLimit: 500,
+  pullReconcileTimeoutMs: 20_000,
 };
 
 export interface NoteBridgeOptions {

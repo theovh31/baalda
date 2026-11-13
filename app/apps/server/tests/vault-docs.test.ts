@@ -3,6 +3,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import {
   listDeletedReadableDocsInVault,
   listReadableDocsInVault,
+  listVisibleFolders,
 } from "../src/permissions/vault-docs.js";
 import { effectivePermission } from "../src/permissions/resolver.js";
 import { pool } from "../src/db/pool.js";
@@ -10,6 +11,7 @@ import { resetDb } from "./helpers/db.js";
 import {
   seedFolder,
   seedMember,
+  seedItemPrivate,
   seedNote,
   seedOrg,
   seedShare,
@@ -108,7 +110,13 @@ describe("listReadableDocsInVault agrees with effectivePermission (spec 05 §3.1
     }
 
     // And the concrete expected sets, so a resolver bug can't make both wrong.
-    expect(await listReadableDocsInVault(owner, vault)).toEqual(new Set(all));
+    // The owner reads NOTHING: this vault carries no org grant, so its posture
+    // is Private, and Private is not special-cased for the person who owns it
+    // (`resolver.vaultBaseline`). `seedNote` leaves `created_by` null here, so
+    // authorship saves nothing either and the owner lands exactly where carol
+    // does. The Shared vault — where the owner does read everything, through
+    // the org grant like everyone else — is the next test.
+    expect(await listReadableDocsInVault(owner, vault)).toEqual(new Set());
     expect(await listReadableDocsInVault(alice, vault)).toEqual(new Set([s1, d1]));
     expect(await listReadableDocsInVault(bob, vault)).toEqual(new Set([p1]));
     expect(await listReadableDocsInVault(carol, vault)).toEqual(new Set());
@@ -148,12 +156,43 @@ describe("listReadableDocsInVault agrees with effectivePermission (spec 05 §3.1
     expect(await listReadableDocsInVault(outsider, vault)).toEqual(new Set());
   });
 
+  it("rescues an item-Private doc through a per-USER vault grant, like the resolver", async () => {
+    // `resolver.sharePermission`'s personal branch has always matched a per-user
+    // row on the VAULT resource; `scopedDocs`' personal pass looked only at
+    // folder/file shares. So this user was READABLE to the resolver and ABSENT
+    // from the set — and by the desktop's rule a disagreement leaves the WHOLE
+    // revoked group, which means one such doc permanently stalls revocation
+    // cleanup on that device.
+    const org = await seedOrg("Delta", "delta-vd");
+    const owner = await seedUser("o4@d.com");
+    const named = await seedUser("n4@d.com");
+    await seedMember(org, owner, "owner");
+    await seedMember(org, named, "member");
+
+    const vault = await seedVault(org);
+    const folder = await seedFolder(vault, null, "Team", "Team");
+    const note = await seedNote(vault, folder, "Team/secret.md");
+    // Shared vault, one note taken out of the team's reach…
+    await seedVaultShare(org, "org", org, "edit");
+    // …and this user named on the vault itself, which is what lifts it back.
+    await seedVaultShare(org, "user", named, "edit");
+    await seedItemPrivate(org, "file", note);
+
+    await assertAgrees(named, vault, [note]);
+    expect(await effectivePermission(named, note)).not.toBe("none");
+    expect(await listReadableDocsInVault(named, vault)).toContain(note);
+  });
+
   it("excludes soft-deleted notes and returns empty for a non-member", async () => {
     const org = await seedOrg("Beta", "beta-vd");
     const owner = await seedUser("o2@b.com");
     await seedMember(org, owner, "owner");
     const outsider = await seedUser("out@x.com"); // not a member
     const vault = await seedVault(org);
+    // The org-wide grant every vault is created with (POST /api/vaults). Without
+    // it the vault is Private, which since it stopped exempting owners would make
+    // this a test about the posture rather than about tombstones.
+    await seedVaultShare(org, "org", org, "edit");
     const live = await seedNote(vault, null, "live.md");
     const gone = await seedNote(vault, null, "gone.md");
     await pool.query("UPDATE notes SET deleted_at = now() WHERE id = $1", [gone]);
@@ -178,6 +217,10 @@ describe("listDeletedReadableDocsInVault", () => {
     const owner = await seedUser("owner@tomb.com");
     await seedMember(org, owner, "owner");
     const vault = await seedVault(org);
+    // The org-wide grant every vault is created with (POST /api/vaults). Without
+    // it the vault is Private, which since it stopped exempting owners would make
+    // this a test about the posture rather than about tombstones.
+    await seedVaultShare(org, "org", org, "edit");
     const live = await seedNote(vault, null, "live.md");
     const gone = await seedNote(vault, null, "gone.md");
     await pool.query("UPDATE notes SET deleted_at = now() WHERE id = $1", [gone]);
@@ -244,6 +287,10 @@ describe("listDeletedReadableDocsInVault", () => {
     const owner = await seedUser("owner@tomb5.com");
     await seedMember(org, owner, "owner");
     const vault = await seedVault(org);
+    // The org-wide grant every vault is created with (POST /api/vaults). Without
+    // it the vault is Private, which since it stopped exempting owners would make
+    // this a test about the posture rather than about tombstones.
+    await seedVaultShare(org, "org", org, "edit");
     const fileId = randomUUID();
     await pool.query(
       "INSERT INTO files (id, vault_id, folder_id, path) VALUES ($1, $2, NULL, 'a.md')",
@@ -253,5 +300,28 @@ describe("listDeletedReadableDocsInVault", () => {
     expect(await listReadableDocsInVault(owner, vault)).toEqual(new Set([fileId]));
     // ...but can never be a tombstone, so the client can't be told to delete it.
     expect(await listDeletedReadableDocsInVault(owner, vault)).toEqual(new Set());
+  });
+});
+
+
+describe("restricted folder visibility", () => {
+  beforeEach(resetDb);
+
+  it("shows the path to a personally shared note without exposing its siblings", async () => {
+    const org = await seedOrg("Private paths", "private-paths");
+    const user = await seedUser("reader@paths.test");
+    await seedMember(org, user, "member");
+    const vault = await seedVault(org);
+    await seedVaultShare(org, "org", org, "edit");
+    const parent = await seedFolder(vault, null, "Finance", "Finance");
+    const child = await seedFolder(vault, parent, "Budgets", "Finance/Budgets");
+    const sibling = await seedFolder(vault, parent, "Payroll", "Finance/Payroll");
+    const note = await seedNote(vault, child, "Finance/Budgets/plan.md");
+    const secret = await seedNote(vault, sibling, "Finance/Payroll/salaries.md");
+    await seedItemPrivate(org, "folder", parent);
+    await seedShare(org, "file", note, user, "view");
+    expect((await listVisibleFolders(user, vault)).map(f => f.id).sort()).toEqual([parent, child].sort());
+    expect(await listReadableDocsInVault(user, vault)).toEqual(new Set([note]));
+    expect(await effectivePermission(user, secret)).toBe("none");
   });
 });

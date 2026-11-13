@@ -44,17 +44,36 @@ export class FakeFs {
   }
 }
 
+interface LoggedUpdate {
+  /** Monotonic row id, exactly as SQLite's rowid is — the watermark the
+   *  bridge's compaction passes back as `upTo`. */
+  id: number;
+  bytes: Uint8Array;
+}
+
 interface DocStore {
   snapshot: Uint8Array | null;
   stateVector: Uint8Array | null;
-  updates: Uint8Array[];
+  updates: LoggedUpdate[];
 }
 
 /** In-memory equivalent of the SQLite yjs_updates/yjs_snapshot tables. */
 export class FakePersistence implements CrdtPersistence {
   private docs = new Map<string, DocStore>();
+  /** Shared across docs, like a SQLite table's rowid sequence. */
+  private nextRowId = 0;
   /** Every snapshot ever written, per doc — lets tests assert recovery points. */
   snapshotHistory = new Map<string, Uint8Array[]>();
+  /** The `yjs_disk_base` table (#200). */
+  diskBases = new Map<string, string>();
+
+  async loadDiskBase(docId: string): Promise<string | null> {
+    return this.diskBases.get(docId) ?? null;
+  }
+
+  async saveDiskBase(docId: string, sha256: string): Promise<void> {
+    this.diskBases.set(docId, sha256);
+  }
 
   private store(docId: string): DocStore {
     let d = this.docs.get(docId);
@@ -70,24 +89,30 @@ export class FakePersistence implements CrdtPersistence {
     if (!d) return { snapshot: null, updates: [], updateCount: 0 };
     return {
       snapshot: d.snapshot,
-      updates: [...d.updates],
+      updates: d.updates.map((u) => u.bytes),
       updateCount: d.updates.length,
+      lastUpdateId: d.updates.length ? d.updates[d.updates.length - 1].id : 0,
     };
   }
 
-  async appendUpdate(docId: string, update: Uint8Array): Promise<void> {
-    this.store(docId).updates.push(update);
+  async appendUpdate(docId: string, update: Uint8Array): Promise<number> {
+    const id = ++this.nextRowId;
+    this.store(docId).updates.push({ id, bytes: update });
+    return id;
   }
 
+  /** Truncates only up to `upTo`, like the SQLite store's
+   *  `DELETE … WHERE id <= ?`. Omitted ⇒ nothing is deleted. */
   async saveSnapshot(
     docId: string,
     snapshot: Uint8Array,
     stateVector: Uint8Array,
+    upTo?: number,
   ): Promise<void> {
     const d = this.store(docId);
     d.snapshot = snapshot;
     d.stateVector = stateVector;
-    d.updates = []; // truncate the log, atomically with the snapshot write
+    d.updates = upTo == null ? d.updates : d.updates.filter((u) => u.id > upTo);
     const hist = this.snapshotHistory.get(docId) ?? [];
     hist.push(snapshot);
     this.snapshotHistory.set(docId, hist);
@@ -113,7 +138,14 @@ export function makeHarness(seed?: Record<string, string>): Harness {
   const errors: unknown[] = [];
   const io: BridgeIO = {
     readFile: (p) => fs.readFile(p),
-    writeFileAtomic: (p, c) => fs.writeFileAtomic(p, c),
+    // Like Rust's `write_note` given a doc id: the write records the disk base.
+    // And like it given `expectedSha` (#216): a file that no longer hashes to
+    // it (missing = the empty string) is left alone and the answer is "stale".
+    writeFileAtomic: async (p, c, docId, expectedSha) => {
+      if (expectedSha != null && sha256Hex(fs.get(p) ?? "") !== expectedSha) return "stale";
+      await fs.writeFileAtomic(p, c);
+      if (docId) persistence.diskBases.set(docId, sha256Hex(c));
+    },
     sha256: sha256Hex,
     persistence,
     onError: (e) => {

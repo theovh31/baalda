@@ -1,11 +1,19 @@
 import { Server } from "@hocuspocus/server";
 import * as Y from "yjs";
 import { config } from "../config.js";
+import { pool } from "../db/pool.js";
+import { createResolverCache } from "../permissions/resolver.js";
 import { verifySyncToken } from "../tokens/sync-token.js";
+import { syncPermission } from "../trash/access.js";
 import { appendUpdate, loadDocState } from "../yjs/persistence.js";
 import { scheduleIndex } from "../index/indexer.js";
 import { formatDocName, parseDocName } from "./doc-name.js";
 import { redisExtensions } from "./redis-extension.js";
+import { isShrinkHeld, reportShrink } from "../versions/shrink-guard.js";
+import { vaultKeysEnabled } from "../crypto/config.js";
+import { KeyRequiredError, loadVkCheck, redactToken, splitSyncToken } from "../crypto/transport.js";
+import type { DocCrypto } from "../crypto/doc-crypto.js";
+import { verifyVk } from "../crypto/vk-check.js";
 
 /**
  * Hocuspocus sync server (spec 03 §3, 04 §4).
@@ -21,6 +29,13 @@ import { redisExtensions } from "./redis-extension.js";
 // Origin used when we hydrate a freshly-loaded doc, so onChange can tell our own
 // load echo apart from real client edits and skip persisting it.
 const LOAD_ORIGIN = "hocuspocus:load";
+
+/**
+ * The note text as `onChange` last saw it, per loaded doc — the "before" side
+ * of the sharp-shrink check (`versions/shrink-guard.ts`). Weak, so an unloaded
+ * doc takes its entry with it.
+ */
+const lastSeenText = new WeakMap<Y.Doc, string>();
 
 /**
  * WebSocket close code for "this doc's Yjs state is over `MAX_NOTE_MB`".
@@ -47,6 +62,8 @@ class NoteTooLargeError extends Error {
   }
 }
 
+export { KeyRequiredError };
+
 export interface SyncContext {
   docId: string;
   vaultId: string;
@@ -60,7 +77,38 @@ export interface SyncContext {
    * `context`, so `onChange` can read one field regardless of who wrote.
    */
   userId: string | null;
+  /**
+   * The vault key this socket presented (`<jwt>.<vk-b64>`), verified against
+   * `vaults.vk_check` at connect. Only for this socket's own hooks; never
+   * logged, never put in the process cache from here. Absent for an unkeyed
+   * vault or with BAALDA_VAULT_KEYS off.
+   */
+  vaultKey?: Buffer;
+  /** Generation recorded in `vaults.key_generation` when `vaultKey` was verified. */
+  vaultKeyGeneration?: number;
+  /** Throttle for {@link RejectedHook}: last time this connection reported a
+   *  dropped read-only edit (ms epoch). */
+  lastRejectedAt?: number;
+  /**
+   * Read-only only because the shrink burst brake holds this user's content
+   * writes in this vault (`versions/shrink-guard.ts ShrinkBrake`), not because
+   * of a grant. Such a connection never reports `rejected`: that frame sends
+   * the desktop down its view-grant rebase, and a hold must leave the device's
+   * copy untouched.
+   */
+  shrinkHeld?: boolean;
 }
+
+/** Minimum gap between two `rejected` reports for one connection. */
+export const REJECTED_THROTTLE_MS = 5000;
+
+/**
+ * Notified when a READ-ONLY connection sends an update carrying ops the server
+ * lacks, which Hocuspocus drops with only a bare `syncStatus: false`. The vault
+ * channel turns it into a `rejected` frame for that user, so the desktop can park
+ * the edit. Attributed connections only; throttled per connection.
+ */
+export type RejectedHook = (vaultId: string, docId: string, userId: string) => void;
 
 /**
  * Notified after each persisted doc change so the vault replication channel
@@ -84,12 +132,63 @@ export type DocEditedHook = (
   vaultId: string,
   docId: string,
   userId: string | null,
+  /** The transaction origin's `source` tag (`bulk`, `mcp`, …) when the write came
+   *  from the server itself; undefined for an ordinary client edit. */
+  source?: string | null,
 ) => void;
+
+/**
+ * Why this message must be refused, or null to let it through.
+ *
+ * TWO ceilings, and the second is the one experience added. Capping the MESSAGE
+ * alone bounds a single step, and a note that doubles doubles from small: a
+ * customer's `Map of Content.md` went 276 bytes → 8 MB in seventeen messages,
+ * not one of them near the cap, and ended at 16 MB of Yjs state holding
+ * 1,179,679 lines of 35 distinct ones. Capping the DOC makes the limit a wall
+ * the note cannot be pushed through rather than a step size: a doc under it
+ * always accepts one more message, a doc over it accepts none and is a repair
+ * job (`POST /api/notes/:id/reset-crdt`).
+ *
+ * BOTH ceilings are in BYTES, and the doc side has to be MEASURED in bytes —
+ * `Y.Text.length` counts UTF-16 code units, which is not the same number the cap
+ * is written in. A vault of CJK or emoji notes is 2-4 bytes per unit, so a doc
+ * comparing its unit count against a byte cap is admitted well past the limit
+ * this is meant to be a wall at. The caller passes the text; `Buffer.byteLength`
+ * is the honest size of what would be written to disk.
+ */
+export function noteSizeRefusal(
+  updateBytes: number,
+  docText: string | Y.Text,
+  capBytes: number = config.maxNoteMb * 1024 * 1024,
+): string | null {
+  if (updateBytes > capBytes) {
+    return `Rejecting oversized sync message: ${updateBytes} bytes (cap ${capBytes})`;
+  }
+  // A `Y.Text` is measured lazily. Every UTF-16 code unit encodes to at most 3
+  // UTF-8 bytes (a surrogate pair is 2 units → 4 bytes; a lone surrogate
+  // becomes U+FFFD, 3 bytes), so a doc whose `length * 3` fits under the cap
+  // cannot exceed it and is admitted without building its string — this runs on
+  // EVERY incoming message. Only a doc that might be over is stringified and
+  // measured exactly, so the limit itself is unchanged.
+  if (typeof docText !== "string") {
+    if (docText.length * 3 <= capBytes) return null;
+    docText = docText.toString();
+  }
+  const docBytes = Buffer.byteLength(docText, "utf8");
+  if (docBytes > capBytes) {
+    return `Refusing writes to oversized doc: ${docBytes} bytes (cap ${capBytes}); needs /reset-crdt`;
+  }
+  return null;
+}
+
+/** W3: the key a keyed doc was loaded with, per in-memory Y.Doc. */
+const docCrypto = new WeakMap<Y.Doc, DocCrypto>();
 
 export function createSyncServer(
   port: number = config.hocuspocusPort,
   onDocChanged?: DocChangedHook,
   onDocEdited?: DocEditedHook,
+  onRejected?: RejectedHook,
 ): Server<SyncContext> {
   return new Server<SyncContext>({
     name: "context-sync",
@@ -116,13 +215,41 @@ export function createSyncServer(
      * a second for as long as the app was open.
      */
     async beforeHandleMessage(data) {
-      const cap = config.maxNoteMb * 1024 * 1024;
-      if (data.update.byteLength > cap) {
-        console.error(
-          `Rejecting oversized sync message for ${data.documentName}: ` +
-            `${data.update.byteLength} bytes (cap ${cap})`,
-        );
+      const refusal = noteSizeRefusal(
+        data.update.byteLength,
+        data.document.getText("content"),
+      );
+      if (refusal) {
+        console.error(`${refusal} for ${data.documentName}`);
         throw new NoteTooLargeError();
+      }
+    },
+
+    /**
+     * Read-only drop detection. Runs before Hocuspocus' own readOnly branch
+     * (which answers step 2 / update with `syncStatus: false` and discards it).
+     * Only step 2 (1) and update (2) carry ops; an update the document already
+     * contains (a reconnecting viewer's step 2) is not a rejection.
+     */
+    async beforeSync(data) {
+      if (!onRejected) return;
+      const ctx = data.context as SyncContext | undefined;
+      if (!ctx?.readOnly || !ctx.userId || ctx.shrinkHeld) return;
+      if (data.type !== 1 && data.type !== 2) return;
+      const now = Date.now();
+      if (ctx.lastRejectedAt && now - ctx.lastRejectedAt < REJECTED_THROTTLE_MS) return;
+      let contained = true;
+      try {
+        contained = Y.snapshotContainsUpdate(Y.snapshot(data.document), data.payload);
+      } catch {
+        contained = true; // undecodable: Hocuspocus will reject it anyway
+      }
+      if (contained) return;
+      ctx.lastRejectedAt = now;
+      try {
+        onRejected(ctx.vaultId, ctx.docId, ctx.userId);
+      } catch (err) {
+        console.error("onRejected hook failed:", err);
       }
     },
 
@@ -132,19 +259,24 @@ export function createSyncServer(
         throw new Error(`Unrecognized document name: ${data.documentName}`);
       }
 
+      // W3: the token may carry the vault key as `<jwt>.<vk-b64>`. Split only
+      // with the flag on; off, the token is verified exactly as before.
+      const keysOn = vaultKeysEnabled();
+      const { jwt, vk } = keysOn ? splitSyncToken(data.token) : { jwt: data.token, vk: null };
+
       let claims;
       try {
-        claims = await verifySyncToken(data.token);
+        claims = await verifySyncToken(jwt);
       } catch (err) {
         // Log WHY, not just that it failed: an empty token (the client couldn't
         // mint one) and an expired or wrong-secret token are completely different
         // faults, and "Invalid or expired sync token" alone can't tell them apart
         // — which turned a client-side retry storm into thousands of identical,
         // undiagnosable log lines.
-        const len = typeof data.token === "string" ? data.token.length : -1;
+        // Never the raw token: it may carry the vault key as a suffix.
         const code = (err as { code?: string })?.code ?? (err as Error)?.name;
         console.warn(
-          `[onAuthenticate] rejected token for ${data.documentName}: ${code} (token length ${len})`,
+          `[onAuthenticate] rejected token for ${data.documentName}: ${code} (${redactToken(data.token)})`,
         );
         throw new Error("Invalid or expired sync token");
       }
@@ -154,16 +286,82 @@ export function createSyncServer(
         throw new Error("Sync token does not match requested document");
       }
 
+      // The DB is the authority on permission; the token's `readOnly` claim is
+      // only a hint.
+      //
+      // Trusting the claim alone left a revocation hole exactly as wide as the
+      // token TTL (`SYNC_TOKEN_TTL_SECONDS`, 10 min by default): the moment a
+      // vault went Read-only, or a lock landed, `disconnectDoc` closed every
+      // live socket — but it could not invalidate a token a client already
+      // held, so that client reconnected inside the window and was re-admitted
+      // as an editor. A kick is a disconnection, not a revocation.
+      //
+      // One resolver call per connect, which is the right unit: a token is
+      // minted per connect anyway, so this adds one query to a path that
+      // already did several. `none` rejects the connection outright — the doc
+      // was deleted, or the grant is gone — and anything less than `edit` is
+      // read-only regardless of what the token says. Never the other way round:
+      // a `readOnly` token whose user has since regained `edit` still has to
+      // re-mint, because the claim is what the client was told it holds.
+      let readOnly = claims.readOnly;
+      if (claims.userId) {
+        let permission;
+        try {
+          // Per-connect cache: fewer round trips, never a reused answer — it
+          // is created here and dropped with this call (#263).
+          permission = await syncPermission(claims.userId, parsed.docId, pool, createResolverCache());
+        } catch (err) {
+          // Fail CLOSED. A resolver that cannot answer must not be read as
+          // "carry on with whatever the token claimed" — that is the hole this
+          // check exists to close, re-opened by a database blip.
+          console.error(
+            `[onAuthenticate] permission re-check failed for ${data.documentName}:`,
+            err,
+          );
+          throw new Error("Could not verify access to this document");
+        }
+        if (permission === "none") {
+          throw new Error("No access to this document");
+        }
+        readOnly = claims.readOnly || permission !== "edit";
+      }
+      // An attribution-less token (`userId` absent) has nobody to resolve, so it
+      // keeps the claim. Those predate the `userId` claim and no route can mint
+      // one any more — `POST /api/sync-token` always sets it — so this branch
+      // covers only tokens already in flight at deploy time, and it dies with
+      // them. It is reachable only by someone who can sign with `JWT_SECRET`.
+
+      // The shrink burst brake (#252): this user just emptied several populated
+      // notes in this vault, so their content writes are held for a while. The
+      // connection is admitted read-only (updates dropped unapplied, the client
+      // keeps them) and flagged so it never reports `rejected`.
+      const shrinkHeld = !readOnly && isShrinkHeld(claims.userId, parsed.vaultId);
+
       // View grants: server silently rejects updates from this connection.
-      if (claims.readOnly) {
+      if (readOnly || shrinkHeld) {
         data.connectionConfig.readOnly = true;
+      }
+
+      // W3: a keyed vault needs this socket's own key, checked against
+      // `vk_check` (never the process cache). Unkeyed vault: today's path.
+      let vaultKey: Buffer | undefined;
+      let vaultKeyGeneration: number | undefined;
+      if (keysOn) {
+        const state = await loadVkCheck(parsed.vaultId, pool);
+        if (state) {
+          if (!vk || !verifyVk(vk, parsed.vaultId, state.vkCheck)) throw new KeyRequiredError();
+          vaultKey = vk;
+          vaultKeyGeneration = state.generation;
+        }
       }
 
       const context: SyncContext = {
         docId: parsed.docId,
         vaultId: parsed.vaultId,
-        readOnly: claims.readOnly,
+        readOnly: readOnly || shrinkHeld,
         userId: claims.userId ?? null,
+        ...(shrinkHeld ? { shrinkHeld: true } : {}),
+        ...(vaultKey ? { vaultKey, vaultKeyGeneration } : {}),
       };
       return context;
     },
@@ -172,10 +370,19 @@ export function createSyncServer(
       const parsed = parseDocName(data.documentName);
       if (!parsed) return data.document;
       try {
-        const state = await loadDocState(parsed.docId);
+        // W3: a keyed vault's log is sealed; the loading connection's verified
+        // key opens it and is remembered for this in-memory doc, so every later
+        // write (any connection, or a server-side writer) seals with it.
+        const loadCtx = data.context as Partial<SyncContext> | undefined;
+        const crypto: DocCrypto | undefined = loadCtx?.vaultKey
+          ? { vaultId: parsed.vaultId, key: Buffer.from(loadCtx.vaultKey), generation: loadCtx.vaultKeyGeneration ?? 1 }
+          : undefined;
+        if (crypto) docCrypto.set(data.document, crypto);
+        const state = await loadDocState(parsed.docId, pool, crypto);
         if (state) {
           Y.applyUpdate(data.document, state, LOAD_ORIGIN);
         }
+        lastSeenText.set(data.document, data.document.getText("content").toString());
       } catch (err) {
         // Destroy-then-rethrow is load-bearing; Hocuspocus cannot clean this up
         // for us. It only inserts the Document into its `documents` map AFTER
@@ -206,15 +413,77 @@ export function createSyncServer(
     },
 
     async onChange(data) {
+      // Read the text BEFORE any await, so the before/after pair brackets
+      // exactly the updates seen so far.
+      const text = data.document.getText("content").toString();
+      const before = lastSeenText.get(data.document);
+      lastSeenText.set(data.document, text);
       // Skip the echo from our own onLoadDocument hydration.
       if (data.transactionOrigin === LOAD_ORIGIN) return;
       const parsed = parseDocName(data.documentName);
       if (!parsed) return;
-      await appendUpdate(parsed.docId, data.update);
+      // Captured synchronously above any await: the doc's remembered key, or
+      // this connection's own. Unkeyed vault: undefined, today's path. The
+      // SAME key seals the update below and the pre-shrink text; a keyed doc
+      // with neither has its update refused by `appendUpdate` (key_required),
+      // so the stored state keeps the prior text and nothing is lost.
+      const ctxKey = (data.context as Partial<SyncContext> | undefined)?.vaultKey;
+      const crypto: DocCrypto | undefined =
+        docCrypto.get(data.document) ??
+        (ctxKey ? { vaultId: parsed.vaultId, key: Buffer.from(ctxKey), generation: (data.context as Partial<SyncContext>).vaultKeyGeneration ?? 1 } : undefined);
+      if (before !== undefined) {
+        const ctx = data.context as (Partial<SyncContext> & { source?: string }) | undefined;
+        reportShrink(
+          parsed.vaultId,
+          parsed.docId,
+          before,
+          text,
+          ctx?.userId ?? null,
+          ctx?.source ?? null,
+          crypto,
+        );
+      }
+      // NEVER let this reject. Hocuspocus calls `onChange` unawaited AND
+      // uncaught (`handleDocumentUpdate` → `this.hooks("onChange", …)`), so a
+      // rejection here is an unhandled rejection, which Node 22 turns into a
+      // process exit — a pool-exhaustion blip or a slow compact would take the
+      // whole server down and drop every in-memory doc whose updates had not
+      // been appended yet.
+      //
+      // Swallowing it is also the SAFE direction for the client: the update
+      // never reached the log, so the client keeps a clock the server lacks and
+      // `loadDocDiff` reports `clientAhead` on its next connect — the doc is
+      // named on `ready.behind` and re-pushed. A crash loses that signal for
+      // every other doc too.
+      try {
+        // `crypto` was captured synchronously above (before any await).
+        await appendUpdate(parsed.docId, data.update, pool, config.compactionThreshold, crypto);
+      } catch (err) {
+        console.error(
+          `[sync] failed to persist an update for ${data.documentName}; the client stays ahead and will re-push:`,
+          err,
+        );
+        // W3: a doc loaded BEFORE its vault was keyed has no key to seal with,
+        // so every later edit is refused here — yet it already sits in this
+        // in-memory doc and was broadcast. Left loaded, a keyed teammate would
+        // attach to text storage never got, and the author would never re-send
+        // it (the server's in-memory state vector already covers it). Drop the
+        // doc: every client reconnects (presenting the key), the doc reloads
+        // from storage, and each client's sync re-pushes what storage lacks.
+        if (err instanceof KeyRequiredError && !docCrypto.get(data.document)) {
+          try {
+            data.instance.closeConnections(data.documentName);
+            void Promise.resolve(data.instance.unloadDocument(data.document)).catch(() => {});
+          } catch (resetErr) {
+            console.error(`[sync] could not reset ${data.documentName} after key_required:`, resetErr);
+          }
+        }
+        return;
+      }
       // Re-derive links + embedding for this note (debounced, best-effort).
       // Also covers lazy indexing: a doc missing from note_index gets a row on
       // its next store.
-      scheduleIndex(parsed.docId);
+      scheduleIndex(parsed.docId, undefined, crypto);
       // Fan the incremental update out to vault-channel subscribers (spec 05).
       // The `update` is the exact delta this connection applied — replay it to
       // background clients so their disk stays current without opening the note.
@@ -232,8 +501,9 @@ export function createSyncServer(
       // update) lands as `{}`, i.e. anonymous.
       if (onDocEdited) {
         try {
-          const editorId = (data.context as Partial<SyncContext> | undefined)?.userId ?? null;
-          onDocEdited(parsed.vaultId, parsed.docId, editorId);
+          const ctx = data.context as (Partial<SyncContext> & { source?: string }) | undefined;
+          const editorId = ctx?.userId ?? null;
+          onDocEdited(parsed.vaultId, parsed.docId, editorId, ctx?.source ?? null);
         } catch (err) {
           console.error("onDocEdited hook failed:", err);
         }
@@ -252,6 +522,31 @@ export function disconnectDoc(
   docId: string,
 ): void {
   server.hocuspocus.closeConnections(formatDocName(vaultId, docId));
+}
+
+/**
+ * Close every live socket ONE user holds on any doc in a vault. Used when the
+ * shrink burst brake engages (#252): the client reconnects, and
+ * `onAuthenticate` re-admits it read-only for as long as the hold lasts.
+ * Returns how many connections were closed.
+ */
+export function disconnectUserInVault(
+  server: Server<SyncContext>,
+  vaultId: string,
+  userId: string,
+): number {
+  const prefix = formatDocName(vaultId, "");
+  let closed = 0;
+  for (const [name, doc] of server.hocuspocus.documents) {
+    if (!name.startsWith(prefix)) continue;
+    for (const conn of doc.getConnections()) {
+      const ctx = conn.context as Partial<SyncContext> | undefined;
+      if (ctx?.userId !== userId) continue;
+      conn.close();
+      closed++;
+    }
+  }
+  return closed;
 }
 
 /**

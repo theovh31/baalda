@@ -4,7 +4,13 @@ import { createApp } from "../src/http/app.js";
 import { pool } from "../src/db/pool.js";
 import { resetDb } from "./helpers/db.js";
 import { authHeaders, createOrg, signUp, type TestUser } from "./helpers/auth.js";
-import { freezeVaultRoot, seedFolder, seedNote, seedVault } from "./helpers/seed.js";
+import {
+  freezeVaultRoot,
+  seedFolder,
+  seedNote,
+  seedVault,
+  seedVaultGrant,
+} from "./helpers/seed.js";
 import { recordingAppDeps } from "./helpers/app.js";
 import { createMcpToken } from "../src/mcp/tokens.js";
 
@@ -78,6 +84,10 @@ describe("rel_path ↔ folder_id consistency", () => {
     owner = await signUp("owner@paths.test");
     org = (await createOrg(owner, "Paths Co", "paths-co")).id;
     vault = await seedVault(org);
+    // The org-wide grant `POST /api/vaults` gives a new vault. Seeded directly a
+    // vault has none, so it is Private — and Private stopped exempting owners,
+    // which would silently make these tests about the posture instead.
+    await seedVaultGrant(org, "edit");
     team = await seedFolder(vault, null, "Team", "Team");
     daily = await seedFolder(vault, team, "Daily", "Team/Daily");
   });
@@ -237,9 +247,11 @@ describe("rel_path ↔ folder_id consistency", () => {
       // `folders_vault_path_ci_uq` (migration 023, case-insensitive) also refuses
       // these twins and is NOT restored by 022's SQL, so it is re-created at the
       // end of this test — dropping it for the whole run would silently disarm
-      // the case-collision backstop for every test after this one.
+      // the case-collision backstop for every test after this one. The same
+      // goes for `folders_vault_path_key_uq` (migration 043, NFC + lowercase).
       await pool.query("DROP INDEX IF EXISTS folders_vault_path_uq");
       await pool.query("DROP INDEX IF EXISTS folders_vault_path_ci_uq");
+      await pool.query("DROP INDEX IF EXISTS folders_vault_path_key_uq");
       const twin = await seedFolder(vault, team, "Daily", "Team/Daily"); // newer twin of `daily`
       const inTwin = await seedNote(vault, twin, "Team/Daily/twin.md", owner.userId);
       const child = await seedFolder(vault, twin, "Sub", "Team/Daily/Sub");
@@ -248,6 +260,9 @@ describe("rel_path ↔ folder_id consistency", () => {
       // 022 has collapsed the twins, so the case-insensitive backstop can go back.
       await pool.query(
         "CREATE UNIQUE INDEX IF NOT EXISTS folders_vault_path_ci_uq ON folders (vault_id, lower(path))",
+      );
+      await pool.query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS folders_vault_path_key_uq ON folders (vault_id, vault_path_key(path))",
       );
 
       const { rows } = await pool.query<{ id: string }>(

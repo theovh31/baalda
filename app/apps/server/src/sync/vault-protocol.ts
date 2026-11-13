@@ -29,6 +29,26 @@ export interface HelloFrame {
   /** Optional recently-touched docIds to backfill first (spec 05 §4). */
   priority?: string[];
   /**
+   * doc ids of `files` rows (tree binaries) this client holds on disk.
+   *
+   * Separate from {@link manifest} because a binary has no CRDT and therefore no
+   * state vector to advertise — there is nothing for the backfill to diff, and
+   * putting a sentinel in the manifest would have the backfill open a Y.Doc per
+   * PDF. The ONE thing these ids are for is the set arithmetic behind
+   * `ready.revoked`: a file set to Private has to leave the ex-reader's disk
+   * exactly as a note does, and the server can only name what the client says it
+   * holds.
+   *
+   * They count toward `REVOKED_CAP` alongside the manifest's notes — one frame,
+   * one budget, and a vault whose revocation is mostly binaries must not be able
+   * to push its notes out of the list.
+   *
+   * Absent on clients that predate this (they simply never have a file named).
+   */
+  files?: string[];
+  /** Mapped notes held locally, including those with no CRDT state vector yet. */
+  held?: string[];
+  /**
    * Opaque per-app-instance id, echoed by the client on its registry HTTP writes
    * (`x-baalda-origin`). It lets the channel skip telling a client about a
    * structural change it made itself — a 500-note reconcile used to bounce ~1,100
@@ -48,6 +68,28 @@ export interface HelloFrame {
    * new binary frame type to a connection that asked for it.
    */
   caps?: string[];
+  /**
+   * How much of the channel this connection wants.
+   *
+   * `"live-only"` says the client is fetching its cold state over the bootstrap
+   * HTTP routes and needs the socket ONLY for live updates: the server skips
+   * `backfill()` entirely and still sends `ready`. Everything on `ready` is
+   * either free set arithmetic (`revoked`) or one query over the readable set
+   * (`empty`), and all three lists are what the client acts on — so withholding
+   * them to save the backfill would trade a download for a stuck vault.
+   * `behind` may come back empty in this mode, because it is a BY-PRODUCT of the
+   * backfill diff and there is no backfill; the bootstrap session's byte-sized
+   * doc list answers the same question.
+   *
+   * Absent ⇒ full backfill, which is every shipped client.
+   */
+  mode?: "live-only";
+  /**
+   * Client-held vault keys (W3): the vault key, base64 (32 bytes). Verified
+   * against `vaults.vk_check`; when valid, held in the process key cache for
+   * this connection's lifetime (background work only). Never logged.
+   */
+  vk?: string;
 }
 
 /** A teammate's live "who's viewing what" state, forwarded to every subscriber
@@ -61,6 +103,9 @@ export interface PresenceState {
   name: string;
   color: string;
   status: string;
+  /** Optional status moment ("coffee", "meeting"…) for clients that show one;
+   *  `status` then carries its plain tone (away/busy) for clients that don't. */
+  moment?: string;
 }
 
 export type ServerControl =
@@ -75,19 +120,161 @@ export type ServerControl =
    * client's cue to seed from its own disk. `emptyTruncated` means the list hit
    * the server's cap and another pass is needed.
    *
-   * Both fields are OMITTED when nothing is empty, so the overwhelmingly common
-   * frame stays byte-identical to `{"t":"ready"}`. Old clients ignore unknown
-   * keys (`parseServerControl` switches on `t` and reads only what it knows),
-   * which is why this could be added without a capability flag — unlike a new
-   * *binary* frame, see {@link HelloFrame.caps}.
+   * `behind` names the readable docs for which the CLIENT'S manifest ran ahead
+   * of the server — it holds ops we have never received (an edit typed while
+   * offline and never flushed, a push cut short). The backfill is downstream
+   * only, so this is the client's cue to push those docs over their per-doc
+   * sockets; without it they stayed local forever while every connect
+   * re-delivered an empty diff for them (see `DocDiff.clientAhead`).
+   * `behindTruncated` means the list hit the cap.
+   *
+   * `revoked` names the docs THIS CLIENT'S OWN MANIFEST claims — i.e. copies it
+   * is holding — that are NOT in the caller's readable set any more. It is the
+   * server STATING a revocation instead of leaving the client to infer one from
+   * a listing that came back short. That distinction is the whole point: the
+   * desktop refuses to remove files wholesale unless an access change was
+   * announced, and the live announcement (`acl-changed` -> `reauth`) only
+   * reaches a client that was CONNECTED when the owner changed the rules. Set a
+   * vault to Private while a member's app is closed and their next launch had
+   * nothing behind it, so the revoked notes stayed readable on their disk until
+   * some unrelated ACL change happened. This frame fires on EVERY connect, so a
+   * cold launch is covered. `revokedTruncated` means the list hit the cap.
+   *
+   * Bounded by the client's own manifest, never by the vault: a private-by-
+   * default vault with thousands of docs the member never had names none of
+   * them, because the client holds none of them.
+   *
+   * `tombstones` names the docs this client holds (manifest ∪ held ∪ files)
+   * that are SOFT-DELETED in this vault — in Trash, or deleted and awaiting
+   * purge. A tombstoned doc is never also in `revoked`: a delete is not an
+   * access change, and the client handles it as a delete (its unseen edits can
+   * still be pushed into the Trash copy until `purge_after`). Capped at 2000;
+   * `tombstonesTruncated` means more exist and the registry pull's tombstones
+   * remain the complete answer.
+   *
+   * `covered` names the manifest docs whose hello state vector the server's
+   * stored state fully covers: equal, or the server ahead (the backfill that
+   * preceded this frame delivered the rest). The client holds no op the server
+   * lacks, so it may record the server-acknowledged base for them. Never a doc
+   * in `behind`, `revoked` or `tombstones`; omitted in live-only mode (no
+   * backfill ran). Capped at 2000; `coveredTruncated` means more qualified.
+   *
+   * Every field is OMITTED when it has nothing to say, so the overwhelmingly
+   * common frame stays byte-identical to `{"t":"ready"}`. Old clients ignore
+   * unknown keys (`parseServerControl` switches on `t` and reads only what it
+   * knows), which is why these could be added without a capability flag —
+   * unlike a new *binary* frame, see {@link HelloFrame.caps}.
    */
-  | { t: "ready"; empty?: string[]; emptyTruncated?: true }
+  | {
+      t: "ready";
+      empty?: string[];
+      emptyTruncated?: true;
+      behind?: string[];
+      behindTruncated?: true;
+      revoked?: string[];
+      revokedTruncated?: true;
+      tombstones?: string[];
+      tombstonesTruncated?: true;
+      covered?: string[];
+      coveredTruncated?: true;
+    }
+  | { t: "revoked"; docIds: string[] }
+  | { t: "bootstrap" }
   | { t: "drop"; docId: string } // access lost / doc removed -> client evicts
+  /**
+   * The server DROPPED an edit this user sent on the doc's own Hocuspocus
+   * socket, because that connection is read-only (a view grant, a lock, a
+   * Read-only vault). Hocuspocus only answers such a message with a bare
+   * `syncStatus: false`, which the provider does not surface; this frame is the
+   * explicit signal so the desktop can park the unsent edit (keep it locally,
+   * marked unsynced) instead of believing it landed. Addressed to the user who
+   * sent it only, throttled per connection, and sent only for updates that
+   * carry ops the server lacks. Old clients ignore an unknown `t`.
+   */
+  | { t: "rejected"; docId: string; reason: "read_only" }
   | { t: "reauth" } // ACL changed in this vault -> client re-mints its open doc's token
-  | { t: "registry" } // folders/notes structure changed -> client re-pulls the registry
+  /**
+   * Folders/notes structure changed -> client re-pulls the registry. `meta`
+   * marks a window that carried ONLY "last edited by" stamps (no create, move,
+   * rename or delete): the tree and the readable set are unchanged, so a client
+   * may fold it into a throttled pull instead of pulling at once (#262). An
+   * older client ignores the field and pulls, which is what it always did.
+   */
+  | { t: "registry"; meta?: true }
+  /**
+   * Something the Activity feed lists changed in this vault: a note was
+   * soft-deleted, restored or purged, or a `pre-shrink` version was kept. The
+   * client refetches its trash / shrink listings on this instead of polling
+   * them (#260). Old clients ignore an unknown `t`.
+   */
+  | { t: "activity" }
   | { t: "member"; name: string } // a new teammate joined the vault -> refresh + celebrate
+  /**
+   * The vault's name or icon changed (#306). Carries the new values so the
+   * client patches its vault list in place; old clients ignore an unknown `t`.
+   */
+  | { t: "org"; name?: string; logo?: string | null }
+  /**
+   * The vault's shared appearance changed (owner/admin `PUT
+   * /api/orgs/:orgId/appearance`). Carries the whole settings object so the
+   * client applies it without a GET; old clients ignore an unknown `t`.
+   */
+  | { t: "appearance-changed"; orgId: string; settings: Record<string, unknown>; updatedAt: string }
+  /**
+   * The vault's delivered team skills changed (publish, delivery/pin change,
+   * delete, skill settings; docs/SKILLS.md). A hint to refetch
+   * `GET /api/skills/manifest`; old clients ignore an unknown `t`.
+   */
+  | { t: "skills-changed"; orgId: string }
   | ({ t: "presence" } & PresenceState) // a teammate's live viewing state changed
+  /**
+   * A new desktop release exists (`sync/release-watch.ts`, #269). A HINT to run
+   * the client's own update check now — the updater still fetches and verifies
+   * the release itself, so this can never deliver or force anything. Sent to
+   * every authenticated connection; older clients ignore an unknown `t`.
+   */
+  | { t: "version-available"; version: string }
+  /**
+   * The in-app messages for this user changed (`messages/events.ts`): an
+   * operator created, edited or archived one, or the user acted on one from
+   * another device. A hint to refetch `GET /api/messages`. Sent only to
+   * clients advertising the `messages` cap; old clients ignore an unknown `t`.
+   */
+  | { t: "messages-changed" }
+  /**
+   * User-addressed (sync/user-events.ts), sent only to clients advertising the
+   * `invitations` cap: an invitation to ANY vault arrived for this user, or one
+   * was accepted, declined or cancelled. A hint to re-read the invitation list.
+   */
+  | {
+      t: "invitation";
+      invitationId: string;
+      orgId: string;
+      orgName: string;
+      inviterName: string;
+      role: string;
+    }
+  | { t: "invitation-gone"; invitationId: string }
+  /**
+   * The shrink burst brake (#252) holds — or stopped holding — THIS user's
+   * content writes in this vault. Addressed to that user only. `held: true`
+   * carries when the hold lapses (`until`, ms epoch) and how many notes engaged
+   * it; `held: false` means it lifted (lapsed or released by an owner/admin).
+   * Deliberately NOT `rejected`/`readOnly`: the client keeps every local edit
+   * and only shows that sync is paused. Older clients ignore an unknown `t`.
+   */
+  | { t: "brake"; held: boolean; until?: number; count?: number }
+  /**
+   * THIS user is no longer a member of the vault (`orgId`): an owner/admin
+   * removed them (`removed`) or they left (`left`). Addressed to that user's
+   * connections only, and only to clients advertising the `member-removed`
+   * cap; the server closes the socket with `WS_CLOSE_UNAUTHORIZED` right after,
+   * cap or not, and every reconnect then fails at the token mint (403).
+   */
+  | { t: "member-removed"; orgId: string; userId: string; reason: MemberRemovedReason }
   | { t: "err"; message: string };
+
+export type MemberRemovedReason = "removed" | "left";
 
 /** Client's post-hello presence frame: declares what note it's currently on.
  *  `docId` is null when the client has no note open. `userId` is intentionally
@@ -98,7 +285,12 @@ export interface PresenceFrame {
   name: string;
   color: string;
   status: string;
+  /** See {@link PresenceState.moment}. */
+  moment?: string;
 }
+
+/** A moment id is a short lowercase word; anything else is dropped, never relayed. */
+const MOMENT_RE = /^[a-z]{1,16}$/;
 
 /** Parse a client presence text frame; null if it isn't one. */
 export function parsePresence(text: string): PresenceFrame | null {
@@ -121,6 +313,7 @@ export function parsePresence(text: string): PresenceFrame | null {
     name: o.name,
     color: o.color,
     status: o.status,
+    ...(typeof o.moment === "string" && MOMENT_RE.test(o.moment) ? { moment: o.moment } : {}),
   };
 }
 
@@ -147,8 +340,19 @@ export function parseHello(text: string): HelloFrame | null {
     token: f.token,
     manifest: f.manifest ?? {},
     priority: Array.isArray(f.priority) ? f.priority : undefined,
+    files: Array.isArray(f.files)
+      ? f.files.filter((d): d is string => typeof d === "string" && d !== "")
+      : undefined,
+    held: Array.isArray(f.held)
+      ? f.held.filter((d): d is string => typeof d === "string" && d !== "")
+      : undefined,
     origin: typeof f.origin === "string" && f.origin ? f.origin : undefined,
     caps: Array.isArray(f.caps) ? f.caps.filter((c): c is string => typeof c === "string") : undefined,
+    // Exactly one recognised value; anything else is an older or a confused
+    // client and gets the full backfill, which is always correct if slower.
+    mode: f.mode === "live-only" ? "live-only" : undefined,
+    // W3: optional vault key (base64, 32 bytes); verified by the channel.
+    vk: typeof f.vk === "string" && f.vk ? f.vk : undefined,
   };
 }
 
@@ -285,6 +489,71 @@ export const PS_MEMBER_JOINED = 0x04;
 export const PS_PRESENCE = 0x05;
 export const PS_PRESENCE_QUERY = 0x06;
 export const PS_VOICE = 0x07;
+export const PS_REJECTED = 0x08;
+/** "Last edited by" stamps only — see the `meta` flag on the `registry` frame. */
+export const PS_META_CHANGED = 0x09;
+/** Trash or shrink-event listings changed — see the `activity` frame. */
+export const PS_ACTIVITY_CHANGED = 0x0a;
+/** A user's shrink-brake hold engaged or lifted — see the `brake` frame. */
+export const PS_BRAKE = 0x0b;
+/** The vault's (organization's) name or icon changed — see the `org` frame. */
+export const PS_ORG_CHANGED = 0x0c;
+
+/** A user lost membership of the vault — see the `member-removed` frame.
+ *  Addressed to that user only; every instance closes their sockets. */
+export const PS_MEMBER_REMOVED = 0x0e;
+
+export type OrgChange = { name?: string; logo?: string | null };
+
+/** The vault's shared appearance changed — see the `appearance-changed` frame. */
+export const PS_APPEARANCE_CHANGED = 0x0d;
+
+export type AppearanceChange = {
+  orgId: string;
+  settings: Record<string, unknown>;
+  updatedAt: string;
+};
+
+/** The vault's team skills changed — see the `skills-changed` frame. */
+export const PS_SKILLS_CHANGED = 0x0f;
+
+/** In-app messages changed for everyone (`messages/events.ts` scope "all").
+ *  Published on {@link MESSAGES_TOPIC}, never a vault topic: every instance
+ *  subscribes once and tells its own `messages`-cap connections. No body. */
+export const PS_MESSAGES_CHANGED = 0x10;
+
+/** The one process-wide topic message hints travel on. */
+export const MESSAGES_TOPIC = "messages";
+
+export function encodePubsubMessagesChanged(): Uint8Array {
+  return new Uint8Array([PS_MESSAGES_CHANGED]);
+}
+
+/** JSON body after the type: `{orgId}`. */
+export function encodePubsubSkillsChanged(orgId: string): Uint8Array {
+  const body = enc.encode(JSON.stringify({ orgId }));
+  const out = new Uint8Array(1 + body.length);
+  out[0] = PS_SKILLS_CHANGED;
+  out.set(body, 1);
+  return out;
+}
+
+export function encodePubsubAppearanceChanged(change: AppearanceChange): Uint8Array {
+  const body = enc.encode(JSON.stringify(change));
+  const out = new Uint8Array(1 + body.length);
+  out[0] = PS_APPEARANCE_CHANGED;
+  out.set(body, 1);
+  return out;
+}
+
+/** JSON body after the type: only the fields that are present. */
+export function encodePubsubOrgChanged(change: OrgChange): Uint8Array {
+  const body = enc.encode(JSON.stringify(change));
+  const out = new Uint8Array(1 + body.length);
+  out[0] = PS_ORG_CHANGED;
+  out.set(body, 1);
+  return out;
+}
 
 export function encodePubsubUpdate(docId: string, update: Uint8Array): Uint8Array {
   const body = frameDocPayload(docId, update);
@@ -312,6 +581,19 @@ export function encodePubsubRegistryChanged(origins: string[] = []): Uint8Array 
   out[0] = PS_REGISTRY_CHANGED;
   out.set(body, 1);
   return out;
+}
+
+/** Last-edited stamps changed in a vault, and nothing structural. Carries no
+ *  origin: the stamp is written by the sync server, which has none. An older
+ *  instance decodes the unknown type as null and drops it (a stale "edited by"
+ *  for the length of a rolling deploy, nothing worse). */
+export function encodePubsubMetaChanged(): Uint8Array {
+  return new Uint8Array([PS_META_CHANGED]);
+}
+
+/** The vault's trash or shrink-event listings changed. */
+export function encodePubsubActivityChanged(): Uint8Array {
+  return new Uint8Array([PS_ACTIVITY_CHANGED]);
 }
 
 export function encodePubsubMemberJoined(name: string): Uint8Array {
@@ -344,6 +626,50 @@ export function encodePubsubVoice(frame: Uint8Array): Uint8Array {
   return out;
 }
 
+/** A read-only connection's edit was dropped; addressed to `userId` only. */
+export function encodePubsubRejected(userId: string, docId: string, reason: "read_only"): Uint8Array {
+  const body = enc.encode(JSON.stringify({ userId, docId, reason }));
+  const out = new Uint8Array(1 + body.length);
+  out[0] = PS_REJECTED;
+  out.set(body, 1);
+  return out;
+}
+
+/** A user's shrink-brake hold engaged (`held`, with `until` + `count`) or
+ *  lifted; addressed to `userId` only. */
+export function encodePubsubBrake(
+  userId: string,
+  held: boolean,
+  until?: number,
+  count?: number,
+): Uint8Array {
+  const body = enc.encode(
+    JSON.stringify({
+      userId,
+      held,
+      ...(held && until !== undefined ? { until } : {}),
+      ...(held && count !== undefined ? { count } : {}),
+    }),
+  );
+  const out = new Uint8Array(1 + body.length);
+  out[0] = PS_BRAKE;
+  out.set(body, 1);
+  return out;
+}
+
+/** `userId` stopped being a member of `orgId`; addressed to that user only. */
+export function encodePubsubMemberRemoved(
+  orgId: string,
+  userId: string,
+  reason: MemberRemovedReason,
+): Uint8Array {
+  const body = enc.encode(JSON.stringify({ orgId, userId, reason }));
+  const out = new Uint8Array(1 + body.length);
+  out[0] = PS_MEMBER_REMOVED;
+  out.set(body, 1);
+  return out;
+}
+
 /** Ask every connection in the vault to re-announce its presence — sent when a
  *  client joins so it learns who's already viewing what (stateless: no instance
  *  holds the whole roster, so newcomers pull it via a re-announce round). */
@@ -355,10 +681,19 @@ export type PubsubMessage =
   | { type: "update"; docId: string; update: Uint8Array }
   | { type: "acl-changed" }
   | { type: "registry-changed"; origins: string[] }
+  | { type: "meta-changed" }
+  | { type: "activity-changed" }
   | { type: "member-joined"; name: string }
+  | { type: "org-changed"; change: OrgChange }
+  | { type: "appearance-changed"; change: AppearanceChange }
+  | { type: "skills-changed"; orgId: string }
+  | { type: "messages-changed" }
   | { type: "presence"; presence: PresenceState }
   | { type: "presence-query" }
-  | { type: "voice"; frame: Uint8Array; speakerId: string };
+  | { type: "voice"; frame: Uint8Array; speakerId: string }
+  | { type: "rejected"; userId: string; docId: string; reason: "read_only" }
+  | { type: "brake"; userId: string; held: boolean; until?: number; count?: number }
+  | { type: "member-removed"; orgId: string; userId: string; reason: MemberRemovedReason };
 
 export function decodePubsub(bytes: Uint8Array): PubsubMessage | null {
   if (bytes.length < 1) return null;
@@ -382,8 +717,43 @@ export function decodePubsub(bytes: Uint8Array): PubsubMessage | null {
         return { type: "registry-changed", origins: [] };
       }
     }
+    case PS_META_CHANGED:
+      return { type: "meta-changed" };
+    case PS_ACTIVITY_CHANGED:
+      return { type: "activity-changed" };
     case PS_MEMBER_JOINED:
       return { type: "member-joined", name: dec.decode(bytes.subarray(1)) };
+    case PS_ORG_CHANGED: {
+      try {
+        const p = JSON.parse(dec.decode(bytes.subarray(1))) as { name?: unknown; logo?: unknown };
+        const change: OrgChange = {};
+        if (typeof p.name === "string") change.name = p.name;
+        if (typeof p.logo === "string" || p.logo === null) change.logo = p.logo;
+        return { type: "org-changed", change };
+      } catch {
+        return { type: "org-changed", change: {} };
+      }
+    }
+    case PS_APPEARANCE_CHANGED: {
+      try {
+        const p = JSON.parse(dec.decode(bytes.subarray(1))) as Partial<AppearanceChange>;
+        if (
+          typeof p.orgId !== "string" ||
+          typeof p.updatedAt !== "string" ||
+          !p.settings ||
+          typeof p.settings !== "object" ||
+          Array.isArray(p.settings)
+        ) {
+          return null;
+        }
+        return {
+          type: "appearance-changed",
+          change: { orgId: p.orgId, settings: p.settings, updatedAt: p.updatedAt },
+        };
+      } catch {
+        return null;
+      }
+    }
     case PS_PRESENCE: {
       try {
         const p = JSON.parse(dec.decode(bytes.subarray(1))) as PresenceState;
@@ -404,6 +774,66 @@ export function decodePubsub(bytes: Uint8Array): PubsubMessage | null {
       // person talking, so a frame without one is unusable, not merely odd.
       if (!parsed?.header.u) return null;
       return { type: "voice", frame, speakerId: parsed.header.u };
+    }
+    case PS_REJECTED: {
+      try {
+        const p = JSON.parse(dec.decode(bytes.subarray(1))) as {
+          userId?: unknown;
+          docId?: unknown;
+          reason?: unknown;
+        };
+        if (typeof p.userId !== "string" || typeof p.docId !== "string" || p.reason !== "read_only") {
+          return null;
+        }
+        return { type: "rejected", userId: p.userId, docId: p.docId, reason: "read_only" };
+      } catch {
+        return null;
+      }
+    }
+    case PS_BRAKE: {
+      try {
+        const p = JSON.parse(dec.decode(bytes.subarray(1))) as {
+          userId?: unknown;
+          held?: unknown;
+          until?: unknown;
+          count?: unknown;
+        };
+        if (typeof p.userId !== "string" || typeof p.held !== "boolean") return null;
+        return {
+          type: "brake",
+          userId: p.userId,
+          held: p.held,
+          ...(p.held && typeof p.until === "number" ? { until: p.until } : {}),
+          ...(p.held && typeof p.count === "number" ? { count: p.count } : {}),
+        };
+      } catch {
+        return null;
+      }
+    }
+    case PS_MESSAGES_CHANGED:
+      return { type: "messages-changed" };
+    case PS_SKILLS_CHANGED: {
+      try {
+        const p = JSON.parse(dec.decode(bytes.subarray(1))) as { orgId?: unknown };
+        if (typeof p?.orgId !== "string") return null;
+        return { type: "skills-changed", orgId: p.orgId };
+      } catch {
+        return null;
+      }
+    }
+    case PS_MEMBER_REMOVED: {
+      try {
+        const p = JSON.parse(dec.decode(bytes.subarray(1))) as {
+          orgId?: unknown;
+          userId?: unknown;
+          reason?: unknown;
+        };
+        if (typeof p.orgId !== "string" || typeof p.userId !== "string") return null;
+        if (p.reason !== "removed" && p.reason !== "left") return null;
+        return { type: "member-removed", orgId: p.orgId, userId: p.userId, reason: p.reason };
+      } catch {
+        return null;
+      }
     }
     default:
       return null;

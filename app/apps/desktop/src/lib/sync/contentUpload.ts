@@ -10,10 +10,12 @@
 // ── The idempotency guarantee (the single most important property) ────────────
 // Re-running this must NOT duplicate a note's text. It cannot, because the only
 // ways text ever enters a doc here are `NoteBridge.seedFromFileIfEmpty()` and —
-// on `ingestFromFile` runs — `NoteBridge.ingestNow()`, whose echo-hash +
+// on `ingestFromFile` runs — `NoteBridge.reconcileAfterPull()` (or
+// `ingestNow()` for a doc that was empty before the pull), whose echo-hash +
 // converged-content guards make a re-run of the same file bytes a no-op (it
-// applies a DIFF against the doc's current text, never an insert of the whole
-// file). For the seed path:
+// applies a DIFF, never an insert of the whole file; the reconcile diffs
+// against the doc as it was BEFORE the pull and skips a file that already
+// equals the pulled state, #200). For the seed path:
 //
 //   1. it inserts nothing when the Y.Text is already non-empty; and
 //   2. it is called ONLY after the provider's initial server sync has genuinely
@@ -35,10 +37,36 @@
 // creation, timers) is injected, so the whole engine runs under vitest in Node.
 
 import type * as Y from "yjs";
-import { encodeStateAsUpdate } from "yjs";
+import { encodeStateAsUpdate, encodeStateVector } from "yjs";
 import type { NoteBridge } from "../bridge";
 import { UPLOAD_CONCURRENCY, runPool } from "./pool";
 import { nullProgressSink, type SyncProgressSink } from "./progress";
+
+/**
+ * `DocPush.whenSynced` rejected because the doc reached a status no reconnect
+ * can fix (`DocSync`'s `isTerminalSyncStatus`: the server deleted it, access is
+ * gone, or it is over the size cap). Carries that status so the uploader can
+ * record the doc as a PERMANENT failure instead of a transient one.
+ *
+ * Defined here rather than in `syncManager.ts` so this engine stays free of the
+ * provider import; `DocSync` throws it.
+ */
+export class TerminalSyncError extends Error {
+  readonly terminal = true;
+  constructor(readonly status: string) {
+    super(status);
+    this.name = "TerminalSyncError";
+  }
+}
+
+function terminalStatusOf(e: unknown): string | null {
+  if (e instanceof TerminalSyncError) return e.status;
+  if (typeof e === "object" && e !== null && (e as { terminal?: unknown }).terminal === true) {
+    const st = (e as { status?: unknown }).status;
+    if (typeof st === "string") return st;
+  }
+  return null;
+}
 
 /** The network side of one doc's push. Implemented by `DocSync` in production. */
 export interface DocPush {
@@ -46,7 +74,12 @@ export interface DocPush {
   readonly readOnly: boolean;
   /** True once the initial server sync genuinely completed. */
   readonly isSynced: boolean;
-  /** Resolve when the initial sync lands, or after `timeoutMs` either way. */
+  /** The connection's current sync status (`DocSync.status`). Optional so test
+   *  doubles need not carry it; read after the initial-sync wait so a terminal
+   *  verdict that landed as the wait ended is not reported as a timeout. */
+  readonly status?: string;
+  /** Resolve when the initial sync lands, or after `timeoutMs` either way.
+   *  Rejects with a {@link TerminalSyncError} the moment the doc turns terminal. */
   whenSynced(timeoutMs: number): Promise<void>;
   /** Resolve true once the server has acked every local change; false on timeout. */
   whenFlushed(timeoutMs: number): Promise<boolean>;
@@ -67,6 +100,18 @@ export interface ContentUploadDeps {
    * short-circuit and the size ceiling.
    */
   readFile?(relPath: string): Promise<string>;
+  /**
+   * Keep a recoverable copy of a note's text under `.context/trash/<stamp>/`
+   * (`ipc.writeTrashCopy`, epoch-pinned), answering where it landed.
+   *
+   * Used for exactly one case: a doc this user may READ but not write, whose
+   * file on disk holds bytes the CRDT does not. The pull's `flushEgest` is about
+   * to put the server's copy there, and the server is the truth for a doc you
+   * cannot write — but destroying the local bytes without a copy is not
+   * something an app may do. Optional, like {@link readFile}: a host that can't
+   * make a copy reports the problem and leaves the durable file untouched.
+   */
+  writeTrashCopy?(relPath: string, stamp: string, content: string): Promise<string>;
 }
 
 /**
@@ -110,18 +155,29 @@ export function crdtBytes(doc: Y.Doc): number {
 
 const utf8 = new TextEncoder();
 
+/** What a note held by the server's shrink burst brake (#252) says. Shared by
+ *  both push paths: `docBatchPush.ts` gets it per item as `shrink_held`, this
+ *  engine infers it from a missing ack during a live pause. */
+export const SHRINK_HELD_REASON =
+  "Sync paused: many notes were emptied at once. This edit is safe on this device and syncs when the pause ends.";
+
 /** A doc whose content could not be pushed, after retries. */
 export interface UploadFailure {
   docId: string;
   relPath: string;
   reason: string;
+  /** Machine-readable cause for a terminal refusal. `permanent` only controls
+   * retry scheduling; it must never be used as the user-facing diagnosis. */
+  kind?: "too-large" | "no-write-access" | "shrink-held";
   /**
-   * The failure is a property of the FILE, not of the network: retrying on the
-   * next `ready` cannot fix it (today: the note is over {@link MAX_NOTE_BYTES}).
-   * The session remembers these so they are not re-queued every connect, and
-   * they never count toward the failure streak that pauses a run.
+   * Retrying the same bytes under the same access cannot fix this. The session
+   * remembers these so they are not re-queued every connect, and they never
+   * count toward the failure streak that pauses a run.
    */
   permanent?: boolean;
+  /** The terminal connection status behind a permanent refusal (`deleted`,
+   *  `no-access`), when that is what ended the push. */
+  status?: string;
 }
 
 export interface ContentUploaderOptions {
@@ -134,6 +190,14 @@ export interface ContentUploaderOptions {
   isPushed: (docId: string) => boolean;
   /** Record a confirmed push (checkpointed by the registry). */
   markPushed: (docId: string) => void;
+  /**
+   * Record the state vector the server is now known to cover
+   * (`registry.recordAck`), after a flushed, editable push — the same ack the
+   * batch pusher records. Without it a doc pushed only through this per-doc path
+   * has no `ackedSv` until a later `ready.covered`, so an inbound delete judges
+   * it `unseen`/`unknown` more often than it needs to.
+   */
+  markAcked?: (docId: string, sv: Uint8Array) => void;
   /** Docs to leave alone — currently the open note, whose own editor session
    *  owns its provider (two providers on one doc is the one thing to avoid). */
   skip?: (docId: string) => boolean;
@@ -177,9 +241,52 @@ export interface ContentUploaderOptions {
    *  apply already folded the external edit in), so "the file matches the doc"
    *  does not mean "nothing to send" — connect and flush regardless. */
   mustConnect?: (docId: string) => boolean;
+  /**
+   * True only when the file is a 0-byte placeholder this session created for a
+   * server note and could not hydrate yet. A read-only pull may replace that
+   * placeholder with canonical server text without making a recovery copy; an
+   * arbitrary empty file is still treated as a possible local deletion.
+   */
+  isUnhydratedPlaceholder?: (docId: string, relPath: string, fileText: string) => boolean;
   progress?: SyncProgressSink;
+  /**
+   * Called once per doc that could not be pushed, as it happens.
+   *
+   * {@link ContentUploader.failedDocs} already answers this at the END of a run,
+   * which is too late for a timeline: a run that is paused by the failure streak
+   * — or abandoned by a vault switch — never reports, and the user is left with
+   * a pill that says "not synced" and nothing that says why. Purely additive:
+   * the failure is recorded exactly as before whether or not anyone listens.
+   */
+  onFailure?: (failure: UploadFailure) => void;
+  /**
+   * Announce the run only when a note actually needs the network.
+   *
+   * For a local-change run the queue is a guess: the watcher saw a file change,
+   * but most such changes are this app's own background egest echoing back,
+   * which the ingest fast-path settles without a socket. Announcing "uploading
+   * 0/1" before that check made the corner pill flash "Syncing" on every note
+   * switch while nothing moved. With this set, the phase flips to `uploading`
+   * (with the notes still ahead as its total) the first time a note has to
+   * connect or fails, and a run that settles every note quietly leaves the
+   * phase — and the per-doc `queued` stamps — untouched. "Syncing" then means
+   * bytes are moving.
+   */
+  lazyPhase?: boolean;
   /** Abandon the run (vault switch). Checked before every doc. */
   shouldStop?: () => boolean;
+  /**
+   * True while the server's shrink burst brake holds this account's writes in
+   * this vault (#252; `SyncPauseTracker.current() != null`).
+   *
+   * A held socket is admitted read-only WITHOUT a `rejected` frame, so the
+   * server silently drops our update and the ack never comes: on its own that
+   * reads as "server did not acknowledge the content", with a Retry that cannot
+   * succeed until the hold lapses. Consulted only when an ack is missing, so a
+   * missing ack during a pause is reported as `shrink-held` — the same verdict
+   * the batch push gets per item — and requeued when the pause lifts.
+   */
+  syncPaused?: () => boolean;
   concurrency?: number;
   /** How long to wait for the initial server sync per doc. Default 10s. */
   syncTimeoutMs?: number;
@@ -212,6 +319,37 @@ export interface UploadRunResult {
   cancelled: boolean;
 }
 
+/**
+ * The writable half of "pull, then fold the file in", AFTER the server's state
+ * has landed in `bridge.doc` (over a socket here, over `bootstrap` `only` in
+ * the HTTP merge). Never diff logic of its own: the bridge's three-way
+ * `reconcileAfterPull` (a no-op when the bridge was not waiting), the orphan
+ * seed, then — when the file was not already ingested before the pull — one
+ * ingest of whatever the file holds that the pulled doc does not.
+ */
+export async function mergeFileAfterPull(
+  bridge: NoteBridge,
+  opts: { ingestFromFile: boolean; preIngested: boolean },
+): Promise<void> {
+  await bridge.reconcileAfterPull();
+  // Seeds ONLY a genuine orphan (empty Y.Text) — see the module header.
+  await bridge.seedFromFileIfEmpty();
+  if (opts.ingestFromFile && !opts.preIngested) await bridge.ingestNow();
+}
+
+/**
+ * Per-note HocuspocusProvider upload.
+ *
+ * RETIREMENT (plan "one-step-note-sync", PR3 → PR6): new notes no longer come
+ * here on a server advertising `notes-with-state` — they register WITH their
+ * state, and a conflict or adopt is merged over HTTP (`bootstrap` `only` +
+ * docs/batch). This class remains ONLY for: (1) servers without
+ * `notes-with-state` / `bootstrap-only`; (2) the HTTP merge's explicit
+ * fallback (bootstrap failed, or a docs/batch push could not run); and the
+ * pre-existing closed-note / read-only-rebase follow-ups not yet moved to
+ * HTTP. Delete it when `MIN_CLIENT_VERSION` retires servers without those
+ * features (PR6).
+ */
 export class ContentUploader {
   private readonly opts: ContentUploaderOptions;
   private readonly progress: SyncProgressSink;
@@ -225,6 +363,11 @@ export class ContentUploader {
   private streak = 0;
   private failures: UploadFailure[] = [];
   private running = false;
+  /** `lazyPhase` bookkeeping: has the phase been announced yet, and how many
+   *  notes settled quietly before it was (they are not part of its total). */
+  private announced = false;
+  private quietSkips = 0;
+  private queueLength = 0;
 
   constructor(opts: ContentUploaderOptions) {
     this.opts = opts;
@@ -286,8 +429,13 @@ export class ContentUploader {
           this.progress.doc(n.docId, "synced");
         }
       }
-      this.progress.phase("uploading", queue.length);
-      for (const n of queue) this.progress.doc(n.docId, "queued");
+      this.queueLength = queue.length;
+      this.quietSkips = 0;
+      this.announced = !this.opts.lazyPhase;
+      if (this.announced) {
+        this.progress.phase("uploading", queue.length);
+        for (const n of queue) this.progress.doc(n.docId, "queued");
+      }
       this.progress.flush();
       if (queue.length === 0) {
         return { total: 0, pushed: 0, failed: 0, aborted: false, cancelled: false };
@@ -370,9 +518,9 @@ export class ContentUploader {
       this.fail(
         docId,
         relPath,
-        `too large to sync (${mb} MB of edit history; the limit is ${cap} MB) — ` +
-          `reset this note's history to sync it again`,
-        { permanent: true },
+        `too large to sync (${mb} MB of edit history; the limit is ${cap} MB). ` +
+          `Reset this note's history to sync it again`,
+        { permanent: true, kind: "too-large" },
       );
       return false;
     }
@@ -400,6 +548,7 @@ export class ContentUploader {
           const cap = Math.round(MAX_NOTE_BYTES / (1024 * 1024));
           this.fail(docId, relPath, `too large to sync (${mb} MB; the limit is ${cap} MB)`, {
             permanent: true,
+            kind: "too-large",
           });
           return false;
         }
@@ -426,7 +575,7 @@ export class ContentUploader {
           this.streak = 0;
           this.opts.markPushed(docId);
           this.progress.doc(docId, "synced");
-          this.progress.item("ok");
+          this.quietOk();
           return true;
         }
       }
@@ -435,25 +584,35 @@ export class ContentUploader {
     let preIngested = false;
     if (this.opts.ingestFromFile && bridge.serialize().length > 0) {
       preIngested = true;
-      // Diff-merge the file into the already-populated doc BEFORE any network
-      // work. When nothing changed (our own background egest echoing back
-      // through the watcher, or an edit a previous run already merged) and the
-      // server has confirmed this doc before, there is nothing to send — skip
-      // the socket entirely. That check is what keeps a teammate's every remote
+      // The file is merged into this already-populated doc AFTER the pull, not
+      // before it (#200): a local CRDT behind the server, next to a file that
+      // already holds the server's text (a sync folder, an egest from an
+      // earlier launch), would otherwise re-insert that text under this
+      // client's id and the pull would double it. `beginPull` fixes the base —
+      // the doc as it is now — and holds the file (no ingest, no write) until
+      // `reconcileAfterPull` below.
+      bridge.beginPull();
+      // When nothing changed (our own background egest echoing back through
+      // the watcher, or an edit a previous run already merged) and the server
+      // has confirmed this doc before, there is nothing to send — skip the
+      // socket entirely. That check is what keeps a teammate's every remote
       // update (which we egest to disk, which fires the watcher) from costing a
-      // provider connect apiece.
-      const changed = await bridge.ingestNow();
+      // provider connect apiece. A read-only probe: nothing is merged yet.
+      const changed = await bridge.hasUnmergedFileChange();
       const serverHasIt =
         this.opts.isPushed(docId) && !(this.opts.include?.(docId) ?? false);
       if (!changed && serverHasIt && !(this.opts.mustConnect?.(docId) ?? false)) {
         await this.releaseQuietly(docId);
         this.streak = 0;
         this.progress.doc(docId, "synced");
-        this.progress.item("ok");
+        this.quietOk();
         return true;
       }
     }
 
+    // From here on the network is involved: this is the moment a lazy run
+    // becomes visible.
+    this.announce();
     const push = this.opts.deps.connect({ docId, vaultId: this.opts.vaultId, doc: bridge.doc });
     try {
       // PULL FIRST. This is the split-brain rule (spec 03 §5): the server's state
@@ -462,6 +621,14 @@ export class ContentUploader {
       await push.whenSynced(this.syncTimeoutMs);
       if (this.shouldStop()) return false;
       if (!push.isSynced) {
+        // A terminal verdict (token mint refused 403/404, over the cap) that the
+        // wait did not reject on — it landed as the timeout fired — is still a
+        // permanent refusal, never a "did not respond" that the session re-queues
+        // on every `ready` (four sockets every ~10 s, forever).
+        const st = push.status;
+        if (st === "no-access" || st === "deleted" || st === "too-large") {
+          throw new TerminalSyncError(st);
+        }
         // The timeout elapsed without a real sync (offline / server down). We
         // deliberately do NOT seed here: seeding on an unverified pull is exactly
         // how a local orphan is created that later merges into real server content
@@ -471,8 +638,14 @@ export class ContentUploader {
       }
 
       if (!push.readOnly) {
-        // Seeds ONLY a genuine orphan (empty Y.Text) — see the module header.
-        await bridge.seedFromFileIfEmpty();
+        // The pull has landed: fold the file in, three-way, against the pre-pull
+        // doc — on every run, because a signed-in bridge that opened with content
+        // has been holding its file since `hydrate` (a no-op for one that was
+        // not waiting, e.g. an empty doc). Before the flush wait below, so a
+        // genuine external edit is part of what the server acknowledges.
+        // The pure post-pull merge, shared with the HTTP pull-then-merge
+        // (`mergeFileAfterPull`, used by `docSession.ts` one-step creates).
+        await mergeFileAfterPull(bridge, { ingestFromFile: false, preIngested: true });
         // A doc that was empty before the pull couldn't take the pre-connect
         // ingest (that would seed before the server's state — the doubling
         // bug). Now the server's canonical state is in, fold in whatever the
@@ -483,22 +656,71 @@ export class ContentUploader {
         // stale file against the merged doc would DELETE those server ops.
         if (this.opts.ingestFromFile && !preIngested) await bridge.ingestNow();
       }
-      const flushed = await push.whenFlushed(this.flushTimeoutMs);
+      // A view-only grant has nothing to push: the seed and the ingest above were
+      // both skipped, and the server would refuse the write anyway — so there is
+      // no ack coming and waiting for one only ends in a spurious failure. The
+      // server's copy IS the content, which makes this doc confirmed.
+      //
+      // `confirmOpenDoc` has always taken this exemption; the bulk path did not,
+      // so a doc whose grant was downgraded while it still held local-only ops
+      // failed here on every pass, never reached `markPushed`, and came straight
+      // back on the next `ready.behind` — a re-sync that could never finish.
+      // A read-only doc skipped both the seed and the ingest, so anything the
+      // file holds that the doc does not is about to be overwritten by the
+      // flush below and is unsendable besides. Keep a copy and say so.
+      if (push.readOnly) {
+        const safeToReplace = await this.keepUnsendableEdit(docId, relPath, bridge);
+        // Never merge the file into a doc this user cannot write; release the
+        // pull wait, and let its deferred write go ahead only when it is safe.
+        bridge.abandonPull(safeToReplace);
+        if (!safeToReplace) {
+          // The file is still the durable copy. Do not flush the Remote Vault's
+          // state over it unless the differing bytes were preserved first.
+          bridge.cancelEgest();
+          this.progress.doc(docId, "error");
+          this.progress.item("failed");
+          return false;
+        }
+      }
+      const flushed = push.readOnly || (await push.whenFlushed(this.flushTimeoutMs));
       // Whatever the server had for this doc has landed in the Y.Doc by now;
       // write it out so the .md on disk matches. (The watcher will see this
       // write, but every ingest side runs behind the bridge's echo-hash guard —
       // the local-change path recognizes its own bytes and stays quiet.)
       await bridge.flushEgest();
       if (!flushed) {
-        this.fail(docId, relPath, "server did not acknowledge the content");
+        // Asked AFTER the wait, not before it: the pause may have been
+        // announced while we were waiting, and it is the pause, not a sick
+        // server, that swallowed the ack.
+        if (this.opts.syncPaused?.() ?? false) {
+          this.fail(docId, relPath, SHRINK_HELD_REASON, { kind: "shrink-held" });
+        } else {
+          this.fail(docId, relPath, "server did not acknowledge the content");
+        }
         return false;
       }
       this.streak = 0;
       this.opts.markPushed(docId);
+      // Flushed and editable: the server holds every op this doc had. A
+      // view-only doc is confirmed without a flush, so it proves nothing about
+      // local ops and records no ack (mirrors `confirmOpenDoc`).
+      if (!push.readOnly && bridge.doc) this.opts.markAcked?.(docId, encodeStateVector(bridge.doc));
       this.progress.doc(docId, "synced");
       this.progress.item("ok");
       return true;
     } catch (e) {
+      // A terminal status (deleted on the server, access gone, over the cap):
+      // retrying the same doc cannot help, so it fails ONCE and permanently —
+      // never re-queued by the session, never counted toward the pause streak.
+      const status = terminalStatusOf(e);
+      if (status !== null) {
+        this.fail(docId, relPath, terminalReason(status), {
+          permanent: true,
+          status,
+          ...(status === "too-large" ? { kind: "too-large" as const } : {}),
+        });
+        return false;
+      }
       this.fail(docId, relPath, msg(e));
       return false;
     } finally {
@@ -521,13 +743,110 @@ export class ContentUploader {
     }
   }
 
+  /** Flip a lazy run to `uploading` (once), sized to the notes not yet settled. */
+  private announce(): void {
+    if (this.announced) return;
+    this.announced = true;
+    this.progress.phase("uploading", Math.max(0, this.queueLength - this.quietSkips));
+    this.progress.flush();
+  }
+
+  /** A note settled without the network. Before the announcement it is not
+   *  work anyone was told about, so it must not bump the previous phase's
+   *  counters; after it, it is one more item done. */
+  private quietOk(): void {
+    if (!this.announced) {
+      this.quietSkips++;
+      return;
+    }
+    this.progress.item("ok");
+  }
+
+  /**
+   * The file diverges from a doc this user cannot write: save it, report it.
+   *
+   * `flushEgest` (right after this) writes the server's state over the file.
+   * That is the right answer for a view-only grant — the server's copy IS the
+   * content — but the bytes on disk were somebody's work, and the read-only
+   * path deliberately skips the ingest that would have merged them, so they
+   * exist nowhere else. A failed read or recovery copy stops the replacement:
+   * the durable file stays in place and the doc remains unconfirmed so Retry
+   * can attempt the preservation step again.
+   */
+  private async keepUnsendableEdit(
+    docId: string,
+    relPath: string,
+    bridge: NoteBridge,
+  ): Promise<boolean> {
+    const read = this.opts.deps.readFile;
+    if (!read) return false;
+    let fileText: string;
+    try {
+      fileText = await read(relPath);
+    } catch {
+      return false; // nothing readable to compare or safely replace
+    }
+    if (fileText === bridge.serialize()) return true; // converged — nothing to keep
+    // The registry created this file as an empty landing place for a remote
+    // note. It is not a local delete/edit, and keeping a copy of zero bytes both
+    // invents a warning and prevents the canonical pull from ever reaching
+    // disk. The caller's provenance callback is deliberately stricter than
+    // `fileText.length === 0`: a real user truncation must still be recovered.
+    if (this.opts.isUnhydratedPlaceholder?.(docId, relPath, fileText)) return true;
+    let dest: string | null = null;
+    try {
+      dest =
+        (await this.opts.deps.writeTrashCopy?.(relPath, trashStamp(), fileText)) ?? null;
+    } catch (e) {
+      console.warn(`[upload] couldn't keep a copy of ${relPath}`, e);
+    }
+    this.report({
+      docId,
+      relPath,
+      reason:
+        "edit could not be sent: no write access" +
+        (dest ? `; copy saved to ${dest}` : "; the local copy could not be saved either"),
+      permanent: true,
+      kind: "no-write-access",
+    });
+    return dest != null;
+  }
+
+  /** Record a failure WITHOUT touching the progress counters or the streak —
+   *  for a doc that still settles (a read-only push is confirmed by the
+   *  server's own copy) but whose local bytes had nowhere to go. */
+  private report(failure: UploadFailure): void {
+    this.failures.push(failure);
+    try {
+      this.opts.onFailure?.(failure);
+    } catch (e) {
+      console.warn("[upload] failure listener threw", e);
+    }
+  }
+
   private fail(
     docId: string,
     relPath: string,
     reason: string,
-    opts: { permanent?: boolean } = {},
+    opts: { permanent?: boolean; kind?: UploadFailure["kind"]; status?: string } = {},
   ): void {
-    this.failures.push({ docId, relPath, reason, ...(opts.permanent ? { permanent: true } : {}) });
+    // A failure is always news, so a lazy run announces itself before reporting it.
+    this.announce();
+    const failure: UploadFailure = {
+      docId,
+      relPath,
+      reason,
+      ...(opts.permanent ? { permanent: true } : {}),
+      ...(opts.kind ? { kind: opts.kind } : {}),
+      ...(opts.status ? { status: opts.status } : {}),
+    };
+    this.failures.push(failure);
+    // A listener must never be able to change what the run does next.
+    try {
+      this.opts.onFailure?.(failure);
+    } catch (e) {
+      console.warn("[upload] failure listener threw", e);
+    }
     this.progress.doc(docId, "error");
     this.progress.item("failed");
     // A permanent failure says nothing about the server's health, so it must
@@ -541,6 +860,19 @@ export class ContentUploader {
       );
     }
   }
+}
+
+/** One `.context/trash/<stamp>/` folder per save, the same shape the disk-delete
+ *  drain and the inbound trash executor use. */
+function trashStamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function terminalReason(status: string): string {
+  if (status === "deleted") return "this note was deleted on the server";
+  if (status === "no-access") return "you no longer have access to this note";
+  if (status === "too-large") return "too large to sync";
+  return `the server refused this note (${status})`;
 }
 
 function msg(e: unknown): string {

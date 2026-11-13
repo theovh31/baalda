@@ -1,18 +1,22 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence, useReducedMotion } from "motion/react";
 import type { VaultInfo, RecentVault } from "../lib/ipc";
 import * as ipc from "../lib/ipc";
 import {
-  readKnownVaults,
   readOrgVaults,
   requestJoinWithCode,
   requestOpenVault,
   useStore,
 } from "../store";
-import { AuthDialog } from "./AccountMenu";
 import { Wordmark } from "./Logo";
 import { Spinner } from "./Spinner";
-import { configOrgId } from "../lib/vault/rediscover";
+import { leaveWithGhost } from "../lib/exitMotion";
+import { useLocalFolderClasses } from "./useVaultLists";
+import { filterRecentsForWelcome } from "../lib/vault/vaultList";
+
+/* Its own handle on the same chunk every other sign-in mount uses — the
+   welcome screen must not drag the auth modal in just by rendering. */
+const AuthDialog = lazy(() => import("./AuthDialog").then((m) => ({ default: m.AuthDialog })));
 
 /**
  * A row in the welcome-screen list: either a local folder (a recent vault on
@@ -99,11 +103,23 @@ function tidyPath(path: string): string {
 }
 
 export function VaultPicker() {
+  // Redesign: when the workspace replaces this screen, fade a copy of it out
+  // on top instead of cutting straight to the app (lib/exitMotion).
+  const pickerRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => () => leaveWithGhost(pickerRef.current), []);
   const authStatus = useStore((s) => s.authStatus);
-  // The live vault list. Signed in, this is the truth and the cache below is
-  // only its mirror; signed out it is empty and the cache is all we have.
+  // A link-driven prompt (shared note / server invite / team invitation) mounts
+  // its OWN AuthDialog from App.tsx, over this same welcome screen. Two stacked
+  // sign-in modals is not a hypothetical: an invitation link clicked while the
+  // picker's own dialog is open would put one card on top of the other, each
+  // with its own idea of what happens after sign-in. The prompted one wins —
+  // it is the one that arrived with a reason attached.
+  const authPrompt = useStore((s) => s.authPrompt);
+  // The live vault list. Signed in, this is the truth; signed out the welcome
+  // list shows no synced vaults at all, so the cache is never read here.
   const organizations = useStore((s) => s.organizations);
-  const serverUrl = useStore((s) => s.serverUrl);
+  // Bumped by a vault delete once its folder is gone (see the recents effect).
+  const recentsVersion = useStore((s) => s.recentsVersion);
   // Sign-in succeeded and a vault is being resolved/created. There's no vault
   // yet, so App still renders this screen — and without saying so, a sign-in
   // that is working looks identical to one that silently did nothing.
@@ -111,6 +127,9 @@ export function VaultPicker() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [recents, setRecents] = useState<RecentVault[]>([]);
+  // The list stays unpainted until the first recents read lands AND every
+  // folder's stamp has settled, so no row appears and then vanishes.
+  const [recentsLoaded, setRecentsLoaded] = useState(false);
   // When a signed-out user clicks a remote vault we open the sign-in modal;
   // the vault to land in afterwards is stashed via requestOpenVault().
   const [signInOpen, setSignInOpen] = useState(false);
@@ -126,6 +145,10 @@ export function VaultPicker() {
   // New-vault flow: null = idle; a string = chosen parent, awaiting a name.
   const [newParent, setNewParent] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
+  // The naming step was opened for a brand-new account (sign-up), so the vault
+  // it creates turns sync on as well: one step, not create-then-"Turn on sync".
+  const [syncNewVault, setSyncNewVault] = useState(false);
+  const newVaultPrompt = useStore((s) => s.newVaultPrompt);
   // Which recent-vault card is being opened, by its key. A single boolean would
   // only tell the list to grey out; the point is to mark the row you clicked.
   const [opening, setOpening] = useState<string | null>(null);
@@ -155,36 +178,29 @@ export function VaultPicker() {
       } catch {
         /* no recents — ignore */
       }
+      if (alive) setRecentsLoaded(true);
     })();
     return () => {
       alive = false;
     };
-  }, [organizations, authStatus]);
+  }, [organizations, authStatus, recentsVersion]);
 
-  // { path → the vault (org) that folder's own `.context/config.json` is
-  // stamped for }. The on-disk truth behind the row tags: the localStorage
-  // caches (org list, org→folder bindings) are per-device and easy to lose,
-  // and every cache miss used to demote a synced folder to a plain "recent" —
-  // openable signed-out with no hint that its edits sync somewhere.
-  const [stamps, setStamps] = useState<Record<string, string>>({});
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const peeked = await Promise.all(
-        recents.map(async (r) => {
-          const raw = await ipc.peekVaultConfig(r.path).catch(() => null);
-          return [r.path, configOrgId(raw)] as const;
-        }),
-      );
-      if (!alive) return;
-      const next: Record<string, string> = {};
-      for (const [path, orgId] of peeked) if (orgId) next[path] = orgId;
-      setStamps(next);
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [recents]);
+  // Each folder's class from its own `.context/config.json` stamp (shared
+  // with the Vaults tab and the switcher, session-cached per path):
+  // `member` = stamped for a vault this account is in, `foreign` = stamped
+  // for a vault it cannot see, `local` = no stamp. The localStorage caches
+  // are per-device and easy to lose, so the stamp is what tags a row.
+  // Signed out there are no member vaults, so every stamped folder is foreign.
+  const signedIn = authStatus === "signed-in";
+  const memberOrgIds = useMemo(
+    () => (signedIn ? organizations.map((o) => o.id) : []),
+    [signedIn, organizations],
+  );
+  const {
+    classes: folderClasses,
+    resolved: foldersResolved,
+    stampedOrgIds,
+  } = useLocalFolderClasses(recents, memberOrgIds);
 
   // If this screen goes away mid-join (a vault opened by some other route),
   // the landing suppression must not outlive it. A *successful* join disarms
@@ -204,17 +220,24 @@ export function VaultPicker() {
   // to make the drive itself the vault is to say so in text (#75).
   const [pathOpen, setPathOpen] = useState(false);
   const [manualPath, setManualPath] = useState("");
+  // Its own error, not the card's shared one: the form is a modal, and an
+  // error rendered on the card underneath would sit behind the backdrop.
+  const [pathError, setPathError] = useState<string | null>(null);
+  function closePathOpen() {
+    setPathOpen(false);
+    setPathError(null);
+  }
   async function openByPath() {
     const path = manualPath.trim();
     if (!path) return;
     setBusy(true);
-    setError(null);
+    setPathError(null);
     try {
       // `openLocalVault`, not `adoptOpenedVault`: WE control this open, so the
       // store can tear down any active vault sync before Rust swaps the slot.
       await useStore.getState().openLocalVault(path);
     } catch (e) {
-      setError(String(e));
+      setPathError(String(e));
     } finally {
       setBusy(false);
     }
@@ -241,15 +264,24 @@ export function VaultPicker() {
   // anyway, so choosing its parent was ceremony. Adopting a folder you already
   // have is what "Open existing" is for, and that one keeps the folder exactly
   // where you picked it.
-  async function startNewVault() {
+  async function startNewVault(opts?: { sync?: boolean }) {
     setError(null);
     try {
       setNewParent(await ipc.getVaultsRoot());
       setNewName("");
+      setSyncNewVault(opts?.sync === true);
     } catch (e) {
       setError(String(e));
     }
   }
+
+  // Sign-up just made an account with no vault: go straight to naming it.
+  useEffect(() => {
+    if (!newVaultPrompt) return;
+    useStore.getState().clearNewVaultPrompt();
+    if (newParent === null && !joining) void startNewVault({ sync: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [newVaultPrompt]);
 
   // "New vault" step 2: create <vaults root>/<name> and open it.
   async function confirmNewVault() {
@@ -261,6 +293,10 @@ export function VaultPicker() {
       // Creating a vault is the one flow that seeds starter content; "Open
       // existing" above adopts the picked folder untouched.
       await openVault(vault, { seed: true });
+      // A new account's first vault syncs as it is made. A refusal (plan limit,
+      // offline) is reported by `turnOnSyncNow` and leaves the vault local.
+      const st = useStore.getState();
+      if (syncNewVault && st.authStatus === "signed-in") await st.turnOnSyncNow(newName.trim());
     } catch (e) {
       setError(String(e));
     } finally {
@@ -271,6 +307,7 @@ export function VaultPicker() {
   function cancelNewVault() {
     setNewParent(null);
     setNewName("");
+    setSyncNewVault(false);
     setError(null);
   }
 
@@ -412,41 +449,43 @@ export function VaultPicker() {
   // with two.
   const inFlow = naming || joining || landingVault;
 
-  // Merge synced (remote) vaults with local recents into one list. Remote
-  // vaults come from the locally-cached org list (survives sign-out) and are
-  // shown first; their bound folder — if any — comes from the org→folder map,
-  // healed by the folders' own config stamps when the map is missing. Local
-  // recents backing a synced vault are folded into the remote row (by path)
-  // so nothing shows twice; the ones left over carry their own stamp so a
-  // synced folder is *tagged* as synced even when its vault isn't in the
-  // cached list at all (other account, cleared cache, other server).
+  // Merge synced (remote) vaults with local recents into one list (owner
+  // decision 2026-10-07). Signed in: this account's vaults first (from the
+  // store's live list, never the cache, which would resurrect a vault deleted
+  // moments ago), then the recent folders `filterRecentsForWelcome` keeps —
+  // member and local ones; folders bound to another account are hidden.
+  // Signed out: ONLY local folders. No synced vault is listed at all, not even
+  // with a "sign in to open" hint; the sign-in line below the list covers it.
+  // A remote row's folder comes from the org→folder map, healed by the
+  // folders' own stamps when the map is missing; recents backing a remote row
+  // are folded into it (by path) so nothing shows twice.
   const entries = useMemo<PickerEntry[]>(() => {
-    // Signed in, the store's list is authoritative — reading the cache here
-    // would resurrect a vault deleted moments ago, because the cache is only
-    // rewritten by the next `refreshVault`. Signed out, the cache is the point:
-    // it is what lets this screen still offer your synced vaults.
-    const known =
-      authStatus === "signed-in"
-        ? organizations.map((o) => ({ id: o.id, name: o.name }))
-        : readKnownVaults(serverUrl);
+    const visible = filterRecentsForWelcome(recents, folderClasses, signedIn);
+    const known = signedIn ? organizations.map((o) => ({ id: o.id, name: o.name })) : [];
     const orgVaults = readOrgVaults();
     // Fallback folder per org from the folders' own stamps — recents are
     // newest-first, so the first stamped match wins (the one most recently
     // opened, i.e. the copy the user actually uses).
     const stampedPathByOrg: Record<string, string> = {};
-    for (const r of recents) {
-      const org = stamps[r.path];
+    for (const r of visible) {
+      const org = folderClasses.get(r.path) === "member" ? stampedOrgIds.get(r.path) : undefined;
       if (org && !(org in stampedPathByOrg)) stampedPathByOrg[org] = r.path;
     }
-    const remote: PickerEntry[] = known.map((w) => ({
-      kind: "remote",
-      key: `org:${w.id}`,
-      name: w.name,
-      path: orgVaults[w.id] ?? stampedPathByOrg[w.id] ?? null,
-      orgId: w.id,
-    }));
+    const remote: PickerEntry[] = known.map((w) => {
+      // A binding to a folder stamped for another account is not this vault's
+      // folder (the stamp outranks the binding).
+      const bound = orgVaults[w.id];
+      const boundOk = bound && folderClasses.get(bound) !== "foreign";
+      return {
+        kind: "remote",
+        key: `org:${w.id}`,
+        name: w.name,
+        path: (boundOk ? bound : undefined) ?? stampedPathByOrg[w.id] ?? null,
+        orgId: w.id,
+      };
+    });
     const consumed = new Set(remote.map((r) => r.path).filter(Boolean));
-    const local: PickerEntry[] = recents
+    const local: PickerEntry[] = visible
       .filter((r) => !consumed.has(r.path))
       .map((r) => ({
         kind: "local",
@@ -454,10 +493,13 @@ export function VaultPicker() {
         name: r.name,
         path: r.path,
         openedAt: r.openedAt,
-        syncedOrgId: stamps[r.path] ?? null,
+        syncedOrgId:
+          folderClasses.get(r.path) === "member" ? (stampedOrgIds.get(r.path) ?? null) : null,
       }));
     return [...remote, ...local];
-  }, [recents, stamps, organizations, authStatus, serverUrl]);
+  }, [recents, folderClasses, stampedOrgIds, organizations, signedIn]);
+  // Flash-free: paint nothing until the recents read and every stamp settled.
+  const listReady = recentsLoaded && foldersResolved;
 
   // Show the 3 most recent by default; the rest live in the "Show all" modal.
   const RECENT_LIMIT = 3;
@@ -468,7 +510,7 @@ export function VaultPicker() {
   // Every row carries a truthful state tag (docs' vault states): "Remote" =
   // synced, no local folder here yet; "Synced" = synced with a folder on this
   // device; "Local" = a plain folder that syncs nowhere. The tag comes from
-  // the folder's own config (via `stamps`), not just the localStorage caches,
+  // the folder's own config stamp, not just the localStorage caches,
   // so signing out can't demote a synced vault to an untagged "recent".
   const renderEntry = (e: PickerEntry) => {
     const synced = isSyncedEntry(e);
@@ -506,10 +548,8 @@ export function VaultPicker() {
             {opening === e.key
               ? "Opening…"
               : e.path
-                ? synced && authStatus !== "signed-in"
-                  ? `${tidyPath(e.path)} · sign in to open`
-                  : tidyPath(e.path)
-                : "Synced · sign in to open"}
+                ? tidyPath(e.path)
+                : "Not on this device yet"}
           </span>
         </button>
         {/* The remove × overlays the row's top-right corner on hover (the tag
@@ -532,7 +572,7 @@ export function VaultPicker() {
   };
 
   return (
-    <div className="vault-picker">
+    <div className="vault-picker" ref={pickerRef}>
       {/* The main app is draggable by its two header rows; this screen has no
           chrome of its own, so without a strip here the window couldn't be
           moved at all before a vault is open. */}
@@ -618,7 +658,7 @@ export function VaultPicker() {
                   autoComplete="off"
                 />
                 <p className="new-vault-loc">
-                  Ask a teammate for it — Vault settings → Members.
+                  Ask a teammate for it. It is in Vault settings → Members and access.
                 </p>
                 {joinError && <p className="error join-error">{joinError}</p>}
                 <div className="new-vault-buttons">
@@ -678,6 +718,7 @@ export function VaultPicker() {
                 />
                 <p className="new-vault-loc" title={newParent ?? undefined}>
                   in <code>{tidyPath(newParent ?? "")}</code>
+                  {syncNewVault && ", synced to your account"}
                 </p>
                 <div className="new-vault-buttons">
                   <button
@@ -717,7 +758,7 @@ export function VaultPicker() {
                 <motion.button
                   className="primary hero"
                   disabled={busy}
-                  onClick={startNewVault}
+                  onClick={() => void startNewVault()}
                   whileHover={reduceMotion ? undefined : { scale: 1.04, y: -1 }}
                   whileTap={reduceMotion ? undefined : { scale: 0.96 }}
                   transition={SPRING}
@@ -725,18 +766,20 @@ export function VaultPicker() {
                   New vault
                 </motion.button>
                 <motion.button
-                  className={`ghost-pill lg${busy ? " is-busy" : ""}`}
+                  className={`ghost-pill lg${busy && !opening ? " is-busy" : ""}`}
                   disabled={busy}
-                  aria-busy={busy || undefined}
+                  aria-busy={(busy && !opening) || undefined}
                   onClick={pickExisting}
                   whileHover={reduceMotion ? undefined : { scale: 1.03, y: -1 }}
                   whileTap={reduceMotion ? undefined : { scale: 0.97 }}
                   transition={SPRING}
                 >
+                  {/* A recent card opening shows its own spinner; this button
+                      only reports a folder it picked itself. */}
                   <span className="async-btn-label">
-                    {busy ? "Opening…" : "Open existing"}
+                    {busy && !opening ? "Opening…" : "Open existing"}
                   </span>
-                  {busy && <Spinner size="xs" tone="neutral" />}
+                  {busy && !opening && <Spinner size="xs" tone="neutral" />}
                 </motion.button>
                 {/*
                   Third peer action: create / open / JOIN. It sits up here with
@@ -764,7 +807,7 @@ export function VaultPicker() {
 
         {error && <p className="error">{error}</p>}
 
-        {!inFlow && entries.length > 0 && (
+        {!inFlow && listReady && entries.length > 0 && (
           <motion.div
             className="recent-list"
             initial={reduceMotion ? false : { opacity: 0, y: 8 }}
@@ -807,43 +850,6 @@ export function VaultPicker() {
               Open by path
             </button>
           </motion.p>
-        )}
-
-        {/* The escape hatch itself. Plain conditional (no enter animation): it
-            appears in direct response to the link above, and motion between a
-            question and its answer reads as lag. */}
-        {!inFlow && pathOpen && (
-          <form
-            className="open-by-path"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void openByPath();
-            }}
-          >
-            {/* eslint-disable-next-line jsx-a11y/no-autofocus */}
-            <input
-              className="new-vault-input open-by-path-input"
-              autoFocus
-              value={manualPath}
-              disabled={busy}
-              onChange={(e) => setManualPath(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") setPathOpen(false);
-              }}
-              placeholder={"Full folder or drive path, e.g. D:\\ or /Volumes/Notes"}
-              spellCheck={false}
-              autoComplete="off"
-            />
-            <button
-              type="submit"
-              className={`primary sm${busy ? " is-busy" : ""}`}
-              disabled={busy || !manualPath.trim()}
-              aria-busy={busy || undefined}
-            >
-              <span className="async-btn-label">{busy ? "Opening…" : "Open"}</span>
-              {busy && <Spinner size="xs" tone="on-accent" />}
-            </button>
-          </form>
         )}
 
         {/*
@@ -899,6 +905,70 @@ export function VaultPicker() {
           the centered card (see the showAllVaults comment above). Rows are the
           same recent-cards as the inline list, so opening/removing behaves
           identically. */}
+      {/* "Open by path" — the escape hatch for what the native folder dialog
+          can't select (a drive root as the vault, #75). A modal like "Show all":
+          revealing a form in place reflowed the centered card. */}
+      {pathOpen && (
+        <div className="modal-backdrop" onClick={closePathOpen}>
+          <div
+            className="modal open-by-path-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <span>Open by path</span>
+              <button className="icon-btn" aria-label="Close" onClick={closePathOpen}>
+                ✕
+              </button>
+            </div>
+            <form
+              className="open-by-path"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void openByPath();
+              }}
+            >
+              <p className="open-by-path-hint">
+                Type the full path of a folder of <code>.md</code> files. This
+                also works for a drive root or mounted volume the folder picker
+                can't select, like <code>D:\</code> or <code>/Volumes/Notes</code>.
+              </p>
+              {/* eslint-disable-next-line jsx-a11y/no-autofocus */}
+              <input
+                autoFocus
+                value={manualPath}
+                disabled={busy}
+                onChange={(e) => setManualPath(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") closePathOpen();
+                }}
+                placeholder="Folder path"
+                spellCheck={false}
+                autoComplete="off"
+              />
+              {pathError && <div className="auth-error">{pathError}</div>}
+              <div className="open-by-path-actions">
+                <button
+                  type="button"
+                  className="ghost-pill"
+                  disabled={busy}
+                  onClick={closePathOpen}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className={`primary${busy ? " is-busy" : ""}`}
+                  disabled={busy || !manualPath.trim()}
+                  aria-busy={busy || undefined}
+                >
+                  <span className="async-btn-label">{busy ? "Opening…" : "Open"}</span>
+                  {busy && <Spinner size="xs" tone="on-accent" />}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
       {showAllVaults && (
         <div className="modal-backdrop" onClick={() => setShowAllVaults(false)}>
           <div
@@ -935,27 +1005,29 @@ export function VaultPicker() {
         </div>
       )}
 
-      {signInOpen && (
-        <AuthDialog
-          // Someone arriving with a join code most likely has no account yet.
-          initialMode={signInFor === "join" ? "sign-up" : "sign-in"}
-          // Success: for the "open" route, keep the pending open target — the
-          // store's post-sign-in landing opens exactly that vault, so just
-          // dismiss. For the "join" route the landing was suppressed on
-          // purpose, and this screen is still up: show the code step.
-          onSignedIn={() => {
-            setSignInOpen(false);
-            if (signInFor === "join") setJoining(true);
-          }}
-          // Cancel: drop whichever intent sent us here, so a later sign-in from
-          // elsewhere doesn't surprise-open a vault or strand itself waiting on
-          // a code that is never coming.
-          onClose={() => {
-            if (signInFor === "join") cancelJoin();
-            else requestOpenVault(null);
-            setSignInOpen(false);
-          }}
-        />
+      {signInOpen && !authPrompt && (
+        <Suspense fallback={null}>
+          <AuthDialog
+            // Someone arriving with a join code most likely has no account yet.
+            initialMode={signInFor === "join" ? "sign-up" : "sign-in"}
+            // Success: for the "open" route, keep the pending open target — the
+            // store's post-sign-in landing opens exactly that vault, so just
+            // dismiss. For the "join" route the landing was suppressed on
+            // purpose, and this screen is still up: show the code step.
+            onSignedIn={() => {
+              setSignInOpen(false);
+              if (signInFor === "join") setJoining(true);
+            }}
+            // Cancel: drop whichever intent sent us here, so a later sign-in from
+            // elsewhere doesn't surprise-open a vault or strand itself waiting on
+            // a code that is never coming.
+            onClose={() => {
+              if (signInFor === "join") cancelJoin();
+              else requestOpenVault(null);
+              setSignInOpen(false);
+            }}
+          />
+        </Suspense>
       )}
     </div>
   );

@@ -3,22 +3,74 @@
 //! registered here and reacts to `files-changed` / `vault-opened` events.
 
 pub mod attachments;
-mod commands;
+pub mod checks;
+mod clipboard;
+// `pub` so the integration tests can drive the batch appliers
+// (`apply_bootstrap_entries`, `materialize_notes`) directly: they are the whole
+// policy of the bulk sync path — the eligibility table, the path allowlist —
+// and the `#[tauri::command]` wrappers around them are only frame decoding.
+pub mod commands;
+pub mod dashboard;
+mod dashboard_remote;
+mod agent_runner;
 mod error;
+pub mod folder_safety;
+pub mod extract;
+pub mod extract_worker;
 pub mod import_export;
 pub mod index;
 pub mod keychain;
+pub mod text_export;
 pub mod notefile;
 pub mod oauth;
 pub mod parse;
+mod relaunch;
+pub mod skills_sync;
 mod state;
+pub mod stats;
+pub mod trash;
 pub mod tree;
 pub mod vault;
 mod watcher;
 
 use state::AppState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Open the main window at a size that suits the screen it lands on: about
+/// 79% × 88% of the monitor's work area, centered, never smaller than the
+/// 1200×800 in `tauri.conf.json` unless the screen itself is, and capped so a
+/// 5K display does not get a 4,000-pixel-wide editor. The config's fixed
+/// 1200×800 was right for a laptop and opened as a small box in the middle of
+/// a 27" display. Logical pixels throughout, so Retina scaling is handled.
+#[cfg(desktop)]
+fn fit_window_to_screen(win: &tauri::WebviewWindow) {
+    let monitor = match win.current_monitor() {
+        Ok(Some(m)) => Some(m),
+        _ => win.primary_monitor().ok().flatten(),
+    };
+    let Some(monitor) = monitor else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    if scale <= 0.0 {
+        return;
+    }
+    let area = monitor.work_area();
+    let avail_w = area.size.width as f64 / scale;
+    let avail_h = area.size.height as f64 / scale;
+    let floor_w = 1200.0_f64.min(avail_w);
+    let floor_h = 800.0_f64.min(avail_h);
+    let w = (avail_w * 0.79).clamp(floor_w, 2000.0_f64.max(floor_w));
+    let h = (avail_h * 0.88).clamp(floor_h, 1400.0_f64.max(floor_h));
+    if let Err(e) = win.set_size(tauri::LogicalSize::new(w, h)) {
+        log::warn!("[window] could not size the window to the screen: {e}");
+        return;
+    }
+    let _ = win.center();
+    log::info!("[window] sized to {w:.0}×{h:.0} on a {avail_w:.0}×{avail_h:.0} work area");
+}
+
 pub fn run() {
     let builder = tauri::Builder::default();
 
@@ -31,37 +83,73 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}));
 
-    // The UI's own log, on the dev terminal. A `console.log` inside a WKWebView
-    // goes to the Web Inspector and nowhere else, so anything the React layer
-    // measures about itself is invisible to whoever is reading `tauri dev` —
-    // which is how two wrong diagnoses of "the sidebar blinks while it syncs"
-    // survived as long as they did. The frontend's `@tauri-apps/plugin-log`
-    // calls land on stdout next to the Rust ones, so both halves of a symptom
-    // read as one timeline. Debug builds only; a shipped app logs nothing new.
+    // The UI's own log. A `console.log` inside a WKWebView goes to the Web
+    // Inspector and nowhere else, so anything the React layer measures about
+    // itself is invisible to whoever is reading `tauri dev` — which is how two
+    // wrong diagnoses of "the sidebar blinks while it syncs" survived as long as
+    // they did. The frontend's `@tauri-apps/plugin-log` calls land next to the
+    // Rust ones, so both halves of a symptom read as one timeline.
+    //
+    // Note `targets()`, not `target()`: the latter APPENDS to the plugin's
+    // defaults (Stdout + LogDir), so the old `.target(Stdout)` here was really
+    // "stdout twice, plus a file" rather than the stdout-only it reads as.
+    //
+    // Debug: the terminal, which is where a developer already is.
     #[cfg(debug_assertions)]
     let builder = builder.plugin(
         tauri_plugin_log::Builder::new()
             .level(log::LevelFilter::Info)
-            .target(tauri_plugin_log::Target::new(
+            .targets([tauri_plugin_log::Target::new(
                 tauri_plugin_log::TargetKind::Stdout,
-            ))
+            )])
+            .build(),
+    );
+
+    // Release: a rotating FILE, because a shipped app's stdout goes nowhere —
+    // on Windows there is no console attached at all. Without it, a user whose
+    // vault refused to open (#128) had nothing to send us but a screenshot of
+    // the dialog, and the errors that matter most are the ones that happen on
+    // machines we cannot reproduce.
+    //
+    //   macOS   ~/Library/Logs/com.baalda.context/baalda.log
+    //   Windows %LOCALAPPDATA%\com.baalda.context\logs\baalda.log
+    //   Linux   ~/.local/share/com.baalda.context/logs/baalda.log
+    //
+    // Bounded on purpose: 2 MB per file, KeepOne (the rotated file replaces the
+    // previous one), so the app can never cost more than ~4 MB of disk here. At
+    // `Info` this is app lifecycle plus every warn/error — including the
+    // `io_ctx` failures from error.rs, which log themselves on the way to the
+    // UI, so a failed open is in the file whether or not the user reports it.
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(
+        tauri_plugin_log::Builder::new()
+            .level(log::LevelFilter::Info)
+            .max_file_size(2_000_000)
+            .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+            .targets([
+                // Kept so `open -a Baalda` / a terminal launch still shows the
+                // same lines live; it is a no-op where nothing is attached.
+                tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                    file_name: Some("baalda".into()),
+                }),
+            ])
             .build(),
     );
 
     builder
+        .manage(agent_runner::AgentRunnerState::default())
+        .register_asynchronous_uri_scheme_protocol("baalda-view", dashboard::handle_request)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init())
-        // Native clipboard: the webview's navigator.clipboard is tied to
-        // WebKit's transient user activation, which an await (e.g. minting a
-        // share link) outlives — a native call has no such rule.
-        .plugin(tauri_plugin_clipboard_manager::init())
         // `baalda://` links. A teammate pastes one into chat; clicking it hands
         // the URL to this app, which resolves it against the *recipient's* own
         // account and access — the link carries ids, never content or a grant.
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
+            agent_runner::warm_detection(app.handle());
             // Updater is desktop-only; register it here so mobile builds skip it.
             #[cfg(desktop)]
             app.handle()
@@ -74,10 +162,80 @@ pub fn run() {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 let _ = app.deep_link().register_all();
             }
+            // The window starts hidden (`visible: false` in tauri.conf.json) so
+            // nobody watches an empty frame while the bundle parses; the
+            // frontend calls show() on its first paint. This is the dead-man's
+            // switch: if the webview never gets that far — a JS crash, a broken
+            // bundle — the window still appears, with whatever the webview
+            // managed to render, instead of the app running invisibly. Tauri v2
+            // window methods are callable off the main thread and show() on a
+            // visible window is a no-op, so this needs no coordination.
+            // A silent update restarted us while another app was in front:
+            // hand focus straight back (see `relaunch.rs`).
+            relaunch::apply_on_launch(app.handle());
+            #[cfg(desktop)]
+            if let Some(win) = app.get_webview_window("main") {
+                // Windows draws the chrome in React so tabs and app controls
+                // share one row. Apply before reveal; macOS/Linux keep their
+                // existing window decorations and titlebar behavior.
+                #[cfg(windows)]
+                win.set_decorations(false)?;
+                // While it is still hidden, so the first frame is already the
+                // right size — resizing after reveal would visibly jump.
+                fit_window_to_screen(&win);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    if win.is_visible().unwrap_or(false) {
+                        return;
+                    }
+                    log::warn!(
+                        "[window] frontend never revealed the window in 1500ms; showing it anyway"
+                    );
+                    let _ = win.show();
+                    let background =
+                        win.app_handle().state::<relaunch::BackgroundLaunch>().get();
+                    if !background {
+                        let _ = win.set_focus();
+                    }
+                });
+            }
             Ok(())
         })
         .manage(AppState::default())
+        .manage(relaunch::BackgroundLaunch::default())
+        // Native clipboard (`clipboard_write`): the webview's navigator.clipboard
+        // is tied to WebKit's transient user activation, which an await (e.g.
+        // minting a share link) outlives — a native call has no such rule.
+        .manage(clipboard::ClipboardState::default())
         .invoke_handler(tauri::generate_handler![
+            agent_runner::detect_agents,
+            agent_runner::run_agent,
+            agent_runner::cancel_agent,
+            skills_sync::skills_targets,
+            skills_sync::skills_scan,
+            skills_sync::skills_install,
+            skills_sync::skills_remove,
+            skills_sync::skills_read_folder,
+            skills_sync::skills_read_zip,
+            skills_sync::skills_export_zip,
+            skills_sync::skills_backups_dir,
+            skills_sync::skills_scan_device,
+            skills_sync::skills_read_device_skill_md,
+            skills_sync::skills_list_device_skill_files,
+            skills_sync::skills_read_device_skill_file,
+            dashboard::query_notes,
+            dashboard::list_notes_by_tag,
+            dashboard::list_notes_by_property,
+            dashboard::dashboard_read_note,
+            dashboard::dashboard_mount_view,
+            dashboard::dashboard_unmount_view,
+            dashboard_remote::mount_dashboard_link,
+            dashboard_remote::update_dashboard_link,
+            dashboard_remote::unmount_dashboard_link,
+            clipboard::clipboard_write,
+            clipboard::clipboard_clear_if,
+            relaunch::set_background_relaunch,
+            relaunch::launched_in_background,
             commands::pick_vault,
             commands::open_vault,
             commands::get_last_vault,
@@ -85,21 +243,34 @@ pub fn run() {
             commands::get_recent_vaults,
             commands::remove_recent_vault,
             commands::delete_vault,
+            commands::reset_vault_local_copy,
+            commands::delete_departed_vault,
             commands::create_vault,
             commands::is_vault,
             commands::list_tree,
             commands::list_children,
             commands::read_note,
+            commands::note_exists,
+            commands::vault_root_state,
+            commands::write_trash_copy,
+            commands::copy_to_trash,
+            commands::rebind_note_id,
             commands::write_note,
             commands::write_note_if_missing,
+            commands::materialize_notes_batch,
+            commands::apply_bootstrap_batch,
             commands::create_note,
             commands::create_folder,
             commands::ensure_folder,
             commands::rename_path,
             commands::delete_path,
+            commands::delete_file,
+            commands::delete_files_batch,
             commands::delete_folder_if_empty,
             commands::trash_note,
             commands::search_notes,
+            commands::get_file_text,
+            commands::list_file_rows,
             commands::get_backlinks,
             commands::graph_edges,
             commands::graph_edges_for,
@@ -113,15 +284,32 @@ pub fn run() {
             commands::list_yjs_state_vectors,
             commands::prune_yjs_docs,
             commands::clear_yjs_doc,
+            commands::get_disk_base,
+            commands::set_disk_base,
+            commands::list_disk_drift,
             commands::read_binary_file,
+            commands::file_stat,
+            commands::binary_exists,
             commands::write_binary_file,
+            commands::write_tree_binary,
             commands::list_attachments,
+            commands::list_binaries,
+            commands::upload_attachment,
+            commands::download_attachment,
+            commands::vault_stats,
+            commands::vault_checks,
+            commands::empty_trash,
+            trash::list_trash_copies,
+            trash::read_trash_copy,
+            trash::delete_trash_copy,
+            commands::rebuild_index,
             commands::read_external_file,
             commands::get_server_url,
             commands::set_server_url,
             commands::get_vaults_root,
             commands::set_vaults_root,
             commands::pick_vaults_root,
+            commands::reset_vaults_root,
             commands::pick_folder,
             commands::pick_files,
             commands::save_file,
@@ -129,16 +317,28 @@ pub fn run() {
             commands::export_path,
             commands::open_vault_in_root,
             commands::folder_exists,
-            commands::peek_vault_config,
+            commands::peek_vault_stamp,
             commands::list_vaults_root_dirs,
             commands::get_vault_config,
             commands::set_vault_config,
+            commands::get_vault_types,
+            commands::set_vault_types,
+            commands::list_property_keys,
+            commands::list_property_values,
+            commands::list_tags,
+            commands::get_note_ui_state,
+            commands::set_note_ui_state,
             commands::get_vault_epoch,
             keychain::keychain_set,
             keychain::keychain_get,
             keychain::keychain_delete,
+            keychain::vault_secret_set,
+            keychain::vault_secret_get,
+            keychain::vault_secret_delete,
+            text_export::save_text_file,
             oauth::google_oauth_listen,
             oauth::google_oauth_await,
+            oauth::google_oauth_return_to_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

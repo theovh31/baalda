@@ -1,10 +1,14 @@
 import type pg from "pg";
+import { lapseEnforced, resolveAccountPlan, type AccountPlan } from "../billing/plan.js";
 import { pool as defaultPool } from "../db/pool.js";
 
 /**
  * Effective-permission resolver (spec 04 §3, plus locks).
  *
- *   1. Vault owner/admin  -> `edit` on everything in the vault.
+ *   1. Vault owner/admin  -> `edit` on everything in the vault, UNLESS the
+ *      vault's posture withdraws it: Read-only and `sealed` take the shortcut
+ *      AND the creator rule from everyone alike, and a vault that was simply
+ *      never shared takes the shortcut only.
  *   2. Else take the MAX of: a share on the file itself, a share on a
  *      containing folder (walking parent_id up to the root), and a
  *      vault-scoped grant (org-wide "Open"/"Read-only", or per-user).
@@ -13,13 +17,37 @@ import { pool as defaultPool } from "../db/pool.js";
  *
  * A plain `member` inherits the vault grant and so gets `edit` in a vault that
  * is Shared — which a new vault is, by default (`POST /api/vaults`). With no
- * grant at all (a vault set to Private, or one created while private-by-default
- * was the rule) a member has no content access beyond notes it created: `none`.
+ * grant at all (one created while private-by-default was the rule) people keep
+ * the notes they created and nothing else — owners and admins included, since
+ * nobody is exempt from a vault that was never shared. A vault someone actually
+ * SET to Private is a different row and a stricter rule: see `sealed` in
+ * {@link vaultBaseline}.
  *
  * Denies (permission = 'denied') come in two flavours, both resolved BEFORE the
  * rules above and both applying to owners and admins: a per-USER deny is
  * `none`, full stop; an ORG deny (the item set to Private) leaves only the
  * creator and explicit per-user grants. See {@link isDenied}.
+ *
+ * A PERSON'S VAULT LEVEL (a per-user row on the vault resource, principal
+ * 'user', permission edit/view/readonly/denied) is "person wins either way" at
+ * the whole-vault level. It REPLACES the vault-wide baseline for that one
+ * person — the org posture (Everyone row), the join snapshot, the owner/admin
+ * shortcut and the creator rule — and nothing else; owners and admins get no
+ * exemption. The item-level logic then runs unchanged on top of it:
+ *   - `edit`   → edit everywhere (a grant that lifts above Read-only, sealed or
+ *                a Private join snapshot);
+ *   - `view`   → view everywhere: it raises someone who had nothing AND caps
+ *                someone who would have had edit (posture, admin shortcut,
+ *                authorship, an `open` snapshot);
+ *   - `denied` → nothing from the vault itself (authorship withdrawn, like
+ *                `sealed`) AND no org grant on any item either (Everyone
+ *                folder/file shares are dropped, as under item-Private) —
+ *                only a per-user item grant can lift them.
+ * Item rows stay more specific than the person's vault level: a per-user
+ * folder/file grant still lifts above `view`/`denied` (an org item grant
+ * lifts above `view` only); a per-user
+ * item deny is still absolute; an item set Private still drops org grants; and
+ * locks/readonly still cap below `edit`. See {@link personalVaultLevel}.
  *
  * Locks (permission = 'locked') are a cap overlay resolved AFTER the rules
  * above: when a lock matches the doc or any ancestor folder — for this user
@@ -38,12 +66,695 @@ export function maxPermission(a: Permission, b: Permission): Permission {
 
 type Queryable = Pick<pg.Pool, "query">;
 
-interface DocLocation {
+/**
+ * A REQUEST-SCOPED memo for the inputs every doc in one batch shares.
+ *
+ * Read this before reaching for anything cleverer. The rule the whole ACL
+ * depends on is **one permission algebra**: a second, set-based "editable docs"
+ * query that disagreed with {@link effectivePermission} would not surface as a
+ * 403, it would be a healing LOOP — the client is told a doc is empty, pushes,
+ * is refused, and `ready.empty` names it again on the next connect, forever. So
+ * this memoises the resolver's INPUTS and never its verdict:
+ *
+ *   · `role`, `snapshot` and `baseline` are facts about the (VAULT, user),
+ *     identical for every item in a batch — read together by `membership`;
+ *   · `ancestors` is a fact about a FOLDER, shared by every doc in it;
+ *   · a doc's share ROWS (on it, its chain and its vault) are read once and the
+ *     two denies, the grant and the lock are answered from them in memory, by
+ *     predicates that mirror each SELECT clause for clause (`rowsDenied`,
+ *     `rowsLocked`, `rowsGrants`);
+ *   · `prefetch` loads location, chain and rows for a whole batch in three
+ *     queries, for the routes that are about to resolve every one of them.
+ *
+ * The branch logic of {@link effectivePermission} runs unchanged on top, in the
+ * same order. The answer for any one doc is bit-for-bit what an uncached call
+ * returns — `tests/resolver-cache-drift.test.ts` and
+ * `tests/resolver-prefetch-drift.test.ts` are the drift tests that say so.
+ *
+ * Scoped to one request deliberately: a longer-lived cache would keep serving a
+ * role that was revoked or a posture that was just changed. Create one per
+ * request, pass it down, throw it away.
+ */
+export interface ResolverCache {
+  role(db: Queryable, organizationId: string, userId: string): Promise<string | null>;
+  baseline(db: Queryable, organizationId: string): Promise<VaultPosture>;
+  snapshot(db: Queryable, organizationId: string, userId: string): Promise<MemberAccessSnapshot | null>;
+  /** The person's own vault level ({@link personalVaultLevel}), a fact about
+   *  the (vault, user) like the three above — read at most once per request. */
+  personal(db: Queryable, organizationId: string, userId: string): Promise<PersonalVaultLevel>;
+  /** The billing plan of the account this vault is attached to
+   *  (`billing/plan.ts resolveAccountPlan`), read at most once per request. */
+  planFor(db: Queryable, organizationId: string): Promise<AccountPlan>;
+  /** True when the vault's billing account is lapsed (account-wide read-only);
+   *  delegates to {@link planFor}, so it shares that memo. */
+  billingReadOnly(db: Queryable, organizationId: string): Promise<boolean>;
+  ancestors(db: Queryable, folderId: string | null): Promise<string[]>;
+  /**
+   * Role, join snapshot and vault posture for one (vault, user) in ONE query,
+   * seeding the three memos above. The values are exactly what the separate
+   * queries return; only the round trips change.
+   */
+  membership(db: Queryable, organizationId: string, userId: string): Promise<MembershipFacts>;
+  /**
+   * Load the location, ancestor chain and every share row for many docs in a
+   * constant number of queries (three), for a batch route that is about to
+   * resolve all of them. Optional: a doc that was not prefetched (or was not
+   * found by the prefetch) is resolved exactly as before, from the database.
+   */
+  prefetch(db: Queryable, docIds: readonly string[]): Promise<void>;
+  /** A doc loaded by {@link prefetch}, or undefined (resolve it live). */
+  preloaded(docId: string): PreloadedDoc | undefined;
+  /**
+   * Load, in three queries, everything `canEditFolder` reads for the given
+   * folders of one vault: the vault's org, each folder row and its full
+   * ancestor chain, and every share row on those folders and on the vault
+   * resource. `canEditFolder` then answers from these rows through the SAME
+   * in-memory predicates the {@link AccessIndex} path uses (each one the twin
+   * of its SELECT); its branch logic is untouched. A folder not covered (not
+   * found, chain leaving the preload, a cycle) is resolved live, as before.
+   */
+  preloadFolders(db: Queryable, vaultId: string, folderIds: readonly string[]): Promise<void>;
+  /** A folder covered by {@link preloadFolders} / {@link seedFolder}, or undefined. */
+  preloadedFolder(folderId: string): PreloadedFolder | undefined;
+  /**
+   * Record a folder THIS request just inserted (values from its RETURNING), so
+   * the next `canEditFolder` on it reads them instead of re-selecting. A new
+   * random id carries no share rows. No-op unless its vault was preloaded.
+   */
+  seedFolder(folder: {
+    id: string;
+    parentId: string | null;
+    vaultId: string;
+    createdBy: string | null;
+    createdAt: Date;
+  }): void;
+}
+
+/** A folder as {@link ResolverCache.preloadFolders} loaded it: the row
+ *  `canEditFolder` selects, its chain, and the org's partial index. */
+export interface PreloadedFolder {
+  row: { created_by: string | null; organization_id: string; created_at: Date };
+  chain: string[];
+  /** Holds the chain folders and their share rows plus the vault rows. Never
+   *  notes or files, so only folder-resource lookups may use it. */
+  index: AccessIndex;
+}
+
+/** The per-(vault, user) facts {@link ResolverCache.membership} returns. */
+export interface MembershipFacts {
+  role: string | null;
+  snapshot: MemberAccessSnapshot | null;
+  baseline: VaultPosture;
+}
+
+/** A doc's location and its full share-row set, as {@link ResolverCache.prefetch}
+ *  loaded them — everything `effectivePermission` would otherwise SELECT. */
+export interface PreloadedDoc {
+  loc: DocLocation;
+  folderIds: string[];
+  /** Every share row on the doc (as a file), on each folder in `folderIds`, and
+   *  on its vault resource. The predicates below filter them exactly as the
+   *  per-query SQL does. */
+  rows: ShareRow[];
+}
+
+/** Ids per {@link ResolverCache.prefetch} round (three queries each). */
+const PREFETCH_CHUNK = 2000;
+
+export function createResolverCache(): ResolverCache {
+  const roles = new Map<string, Promise<string | null>>();
+  const baselines = new Map<string, Promise<VaultPosture>>();
+  const snapshots = new Map<string, Promise<MemberAccessSnapshot | null>>();
+  const personals = new Map<string, Promise<PersonalVaultLevel>>();
+  const plans = new Map<string, Promise<AccountPlan>>();
+  const chains = new Map<string, Promise<string[]>>();
+  const memberships = new Map<string, Promise<MembershipFacts>>();
+  const preloadedDocs = new Map<string, PreloadedDoc>();
+  const folderIndexes = new Map<string, AccessIndex>(); // by organization id
+  const vaultOrgs = new Map<string, string>(); // vault id → organization id
+  const folderRows = new Map<string, PreloadedFolder["row"]>();
+  const vaultSharesLoaded = new Set<string>(); // organization ids
+  // The promise is cached, not the value, so N concurrent resolves of the same
+  // key share ONE in-flight query instead of racing to fill the entry.
+  const memo = <T>(m: Map<string, Promise<T>>, key: string, run: () => Promise<T>): Promise<T> => {
+    let hit = m.get(key);
+    if (!hit) {
+      hit = run();
+      m.set(key, hit);
+    }
+    return hit;
+  };
+  return {
+    role: (db, organizationId, userId) =>
+      memo(roles, `${organizationId}\u0000${userId}`, () => memberRole(db, organizationId, userId)),
+    baseline: (db, organizationId) =>
+      memo(baselines, organizationId, () => vaultBaseline(db, organizationId)),
+    snapshot: (db, organizationId, userId) =>
+      memo(snapshots, `${organizationId}\u0000${userId}`, () =>
+        memberAccessSnapshot(db, organizationId, userId),
+      ),
+    personal: (db, organizationId, userId) =>
+      memo(personals, `${organizationId}\u0000${userId}`, () =>
+        personalVaultLevel(db, organizationId, userId),
+      ),
+    planFor: (db, organizationId) =>
+      memo(plans, organizationId, () => resolveAccountPlan(db, { orgId: organizationId })),
+    billingReadOnly: async (db, organizationId) =>
+      lapseEnforced() &&
+      (await memo(plans, organizationId, () => resolveAccountPlan(db, { orgId: organizationId }))).lapsed,
+    ancestors: (db, folderId) =>
+      folderId === null
+        ? Promise.resolve([])
+        : memo(chains, folderId, () => ancestorFolderIds(db, folderId)),
+    membership: (db, organizationId, userId) => {
+      const key = `${organizationId}\u0000${userId}`;
+      return memo(memberships, key, async () => {
+        const facts = await membershipFacts(db, organizationId, userId);
+        // Seed the single-fact memos so a later `role()` / `snapshot()` /
+        // `baseline()` in the same request reads the SAME answer rather than a
+        // second, possibly newer, one. An entry already there wins: whatever
+        // this request saw first is what it keeps seeing.
+        if (!roles.has(key)) roles.set(key, Promise.resolve(facts.role));
+        if (!snapshots.has(key)) snapshots.set(key, Promise.resolve(facts.snapshot));
+        if (!baselines.has(organizationId)) baselines.set(organizationId, Promise.resolve(facts.baseline));
+        return {
+          role: await roles.get(key)!,
+          snapshot: await snapshots.get(key)!,
+          baseline: await baselines.get(organizationId)!,
+        };
+      });
+    },
+    prefetch: async (db, docIds) => {
+      const wanted = [...new Set(docIds)].filter((id) => !preloadedDocs.has(id));
+      // Sliced so one listing of a whole vault is several bounded statements,
+      // never one array the size of the vault.
+      for (let i = 0; i < wanted.length; i += PREFETCH_CHUNK) {
+        const slice = wanted.slice(i, i + PREFETCH_CHUNK);
+        for (const [id, doc] of await prefetchDocs(db, slice)) preloadedDocs.set(id, doc);
+      }
+    },
+    preloaded: (docId) => preloadedDocs.get(docId),
+    preloadFolders: async (db, vaultId, folderIds) => {
+      const { rows: vaults } = await db.query<{ organization_id: string }>(
+        `SELECT organization_id FROM vaults WHERE id = $1`,
+        [vaultId],
+      );
+      const organizationId = vaults[0]?.organization_id;
+      if (!organizationId) return;
+      vaultOrgs.set(vaultId, organizationId);
+      let index = folderIndexes.get(organizationId);
+      if (!index) {
+        index = { organizationId, shares: new Map(), folders: new Map(), notes: new Map(), files: new Map() };
+        folderIndexes.set(organizationId, index);
+      }
+      const wanted = [...new Set(folderIds)].filter((id) => !index!.folders.has(id));
+      // The same walk as `ancestorFolderIds` (parent_id, no vault filter), for
+      // every start folder at once: each folder read once, a cycle ends (and
+      // `indexedAncestors` then reports it, so it resolves live).
+      const walked = await folderAncestry<{
+        id: string;
+        parent_id: string | null;
+        vault_id: string;
+        created_by: string | null;
+        created_at: Date;
+      }>(db, wanted, "f.id, f.parent_id, f.vault_id, f.created_by, f.created_at");
+      const vaultIds = [...new Set(walked.map((r) => r.vault_id))];
+      const orgOf = new Map<string, string>();
+      if (vaultIds.length > 0) {
+        const { rows: vrows } = await db.query<{ id: string; organization_id: string }>(
+          `SELECT id, organization_id FROM vaults WHERE id = ANY($1::text[])`,
+          [vaultIds],
+        );
+        for (const v of vrows) orgOf.set(v.id, v.organization_id);
+      }
+      const chain = {
+        rows: walked.map((r) => ({ ...r, organization_id: orgOf.get(r.vault_id) ?? null })),
+      };
+      const fresh = chain.rows.filter((r) => !index!.folders.has(r.id));
+      for (const r of fresh) {
+        index.folders.set(r.id, { parentId: r.parent_id, vaultId: r.vault_id, createdAt: r.created_at });
+        // The row `canEditFolder` selects (`JOIN vaults`): only for this org,
+        // so a preloaded folder always pairs with its own org's index.
+        if (r.organization_id === organizationId) {
+          folderRows.set(r.id, { created_by: r.created_by, organization_id: r.organization_id, created_at: r.created_at });
+        }
+      }
+      // Every share row on those folders and on the vault resource, unfiltered
+      // by principal: the in-memory predicates apply each SELECT's filters.
+      const loaded = fresh.map((r) => r.id);
+      const vaultLoaded = vaultSharesLoaded.has(organizationId);
+      const { rows: shares } = await db.query<ShareRow>(
+        `SELECT resource_type, resource_id, principal_type, principal_id, permission, access_revision
+           FROM shares
+          WHERE (resource_type = 'folder' AND resource_id = ANY($1::text[]))
+             OR ($3::boolean AND resource_type = 'vault' AND resource_id = $2)`,
+        [loaded, organizationId, !vaultLoaded],
+      );
+      vaultSharesLoaded.add(organizationId);
+      for (const r of shares) {
+        const key = shareKey(r.resource_type, r.resource_id);
+        const list = index.shares.get(key);
+        if (list) list.push(r);
+        else index.shares.set(key, [r]);
+      }
+    },
+    preloadedFolder: (folderId) => {
+      const row = folderRows.get(folderId);
+      if (!row) return undefined;
+      const index = folderIndexes.get(row.organization_id);
+      if (!index) return undefined;
+      const chain = indexedAncestors(index, folderId);
+      return chain ? { row, chain, index } : undefined;
+    },
+    seedFolder: (folder) => {
+      const organizationId = vaultOrgs.get(folder.vaultId);
+      const index = organizationId ? folderIndexes.get(organizationId) : undefined;
+      if (!organizationId || !index || index.folders.has(folder.id)) return;
+      index.folders.set(folder.id, { parentId: folder.parentId, vaultId: folder.vaultId, createdAt: folder.createdAt });
+      folderRows.set(folder.id, { created_by: folder.createdBy, organization_id: organizationId, created_at: folder.createdAt });
+    },
+  };
+}
+
+/**
+ * One organization's share rows and structure, loaded ONCE for a bulk read (the
+ * Access panel's summaries resolve every note in a vault for several people).
+ *
+ * This is the same idea as {@link ResolverCache} one step further: it preloads
+ * the rows `isDenied` / `isLocked` / `sharePermission` would each have SELECTed
+ * and answers them with the same predicates in memory. Every branch of the
+ * verdict still runs through {@link resolveAccessForUser}; only where the rows
+ * come from changes. `accessIndexMatchesQueries` in `tests/access-index.test.ts`
+ * is the drift test.
+ *
+ * Scoped to one request for the same reason the cache is.
+ */
+export interface ShareRow {
+  resource_type: string;
+  resource_id: string;
+  principal_type: string;
+  principal_id: string;
+  permission: string;
+  access_revision: string | number;
+}
+
+export interface AccessIndex {
+  organizationId: string;
+  /** `${resource_type}\u0000${resource_id}` → share rows on that resource. */
+  shares: Map<string, ShareRow[]>;
+  folders: Map<string, { parentId: string | null; vaultId: string; createdAt: Date }>;
+  /** Live notes (deleted ones are absent, as `locateDoc` never sees them). */
+  notes: Map<string, { vaultId: string; folderId: string | null; createdBy: string | null; createdAt: Date }>;
+  files: Map<string, { vaultId: string; folderId: string | null; createdBy: string | null; createdAt: Date }>;
+}
+
+const shareKey = (type: string, id: string) => `${type}\u0000${id}`;
+
+export async function loadAccessIndex(db: Queryable, organizationId: string): Promise<AccessIndex> {
+  const [folders, notes, files, shares] = await Promise.all([
+    db.query<{ id: string; parent_id: string | null; vault_id: string; created_at: Date }>(
+      `SELECT f.id, f.parent_id, f.vault_id, f.created_at
+         FROM folders f JOIN vaults v ON v.id = f.vault_id
+        WHERE v.organization_id = $1`,
+      [organizationId],
+    ),
+    db.query<{ id: string; folder_id: string | null; vault_id: string; created_by: string | null; created_at: Date }>(
+      `SELECT n.id, n.folder_id, n.vault_id, n.created_by, n.created_at
+         FROM notes n JOIN vaults v ON v.id = n.vault_id
+        WHERE v.organization_id = $1 AND n.deleted_at IS NULL`,
+      [organizationId],
+    ),
+    db.query<{ id: string; folder_id: string | null; vault_id: string; created_by: string | null; created_at: Date }>(
+      `SELECT fi.id, fi.folder_id, fi.vault_id, fi.created_by, fi.created_at
+         FROM files fi JOIN vaults v ON v.id = fi.vault_id
+        WHERE v.organization_id = $1`,
+      [organizationId],
+    ),
+    // Keyed by RESOURCE, not by shares.org_id: the per-doc queries match on
+    // resource ids alone, so the index must hold exactly those rows.
+    db.query<ShareRow>(
+      `SELECT s.resource_type, s.resource_id, s.principal_type, s.principal_id,
+              s.permission, s.access_revision
+         FROM shares s
+        WHERE (s.resource_type = 'vault' AND s.resource_id = $1)
+           OR (s.resource_type = 'folder' AND s.resource_id IN (
+                 SELECT f.id FROM folders f JOIN vaults v ON v.id = f.vault_id
+                  WHERE v.organization_id = $1))
+           OR (s.resource_type = 'file' AND s.resource_id IN (
+                 SELECT n.id FROM notes n JOIN vaults v ON v.id = n.vault_id
+                  WHERE v.organization_id = $1
+                 UNION
+                 SELECT fi.id FROM files fi JOIN vaults v ON v.id = fi.vault_id
+                  WHERE v.organization_id = $1))`,
+      [organizationId],
+    ),
+  ]);
+  const index: AccessIndex = {
+    organizationId,
+    shares: new Map(),
+    folders: new Map(folders.rows.map((r) => [r.id, { parentId: r.parent_id, vaultId: r.vault_id, createdAt: r.created_at }])),
+    notes: new Map(notes.rows.map((r) => [r.id, { vaultId: r.vault_id, folderId: r.folder_id, createdBy: r.created_by, createdAt: r.created_at }])),
+    files: new Map(files.rows.map((r) => [r.id, { vaultId: r.vault_id, folderId: r.folder_id, createdBy: r.created_by, createdAt: r.created_at }])),
+  };
+  for (const row of shares.rows) {
+    const key = shareKey(row.resource_type, row.resource_id);
+    const list = index.shares.get(key);
+    if (list) list.push(row);
+    else index.shares.set(key, [row]);
+  }
+  return index;
+}
+
+/** The folder itself and its ancestors, like {@link ancestorFolderIds}; null
+ *  when the chain leaves the index (the caller then asks the database). */
+export function indexedAncestors(index: AccessIndex, folderId: string | null): string[] | null {
+  if (!folderId) return [];
+  const chain: string[] = [];
+  const seen = new Set<string>();
+  let id: string | null = folderId;
+  while (id !== null) {
+    const folder = index.folders.get(id);
+    if (!folder || seen.has(id)) return null;
+    seen.add(id);
+    chain.push(id);
+    id = folder.parentId;
+  }
+  return chain;
+}
+
+/** Share rows on a doc (as a file resource) and on each folder in the chain. */
+function indexedRows(index: AccessIndex, docId: string | null, folderIds: string[], vault?: string): ShareRow[] {
+  const rows: ShareRow[] = [];
+  if (docId !== null) rows.push(...(index.shares.get(shareKey("file", docId)) ?? []));
+  for (const folderId of folderIds) rows.push(...(index.shares.get(shareKey("folder", folderId)) ?? []));
+  if (vault !== undefined) rows.push(...(index.shares.get(shareKey("vault", vault)) ?? []));
+  return rows;
+}
+
+/**
+ * The per-query predicates, over an already-loaded row list. Each mirrors one
+ * SELECT below clause for clause — {@link isDenied}, {@link isLocked} and the
+ * grant read in {@link sharePermission} — and both the {@link AccessIndex} and
+ * the {@link ResolverCache} paths answer through these, so there is exactly one
+ * in-memory copy of each rule to keep in step with its SQL.
+ *
+ * `rows` may hold rows on resources the SQL would not consider (a vault row for
+ * the deny/lock checks); the resource filter here drops them, so a caller can
+ * pass one superset to all three.
+ */
+/**
+ * The SAME person's rows on an item and its ancestors decide by DEPTH: the
+ * deepest per-user row wins. A per-user file row beats a per-user row on any
+ * ancestor folder, and a deeper folder row beats a shallower one (a per-user
+ * folder/file row also beats that person's VAULT row — see
+ * {@link personalVaultLevel} — because item rows are applied on top of it).
+ *
+ * Walking from the doc up (`folderIds` is ordered: the folder itself first,
+ * then each parent — {@link ancestorFolderIds}):
+ *   - `locked`   caps at view and does NOT decide: the walk goes on for a grant;
+ *   - `denied`   → no access (owners and admins included);
+ *   - `readonly` → view AND a cap (the board's "Can view");
+ *   - `view`     → view (a grant). It shields from ancestor per-user
+ *                  denies/caps, but an ancestor per-user `edit` still wins —
+ *                  a plain `view` share can only RAISE (spec 04 §3);
+ *   - `edit`     → edit (a grant), lifting any ancestor per-user readonly or
+ *                  deny.
+ * Org rows are NOT part of this: org locks/readonly still cap everyone, org
+ * denies are item-Private, org grants combine highest-wins.
+ */
+interface UserItemVerdict {
+  deny: boolean;
+  grant: Permission;
+  cap: boolean;
+}
+
+function userItemVerdict(
+  rows: readonly ShareRow[],
+  userId: string,
+  docId: string | null,
+  folderIds: readonly string[],
+): UserItemVerdict {
+  const order: Array<[string, string]> = [];
+  if (docId !== null) order.push(["file", docId]);
+  for (const f of folderIds) order.push(["folder", f]);
+  let cap = false;
+  let viewFound = false;
+  for (const [type, id] of order) {
+    const r = rows.find((x) =>
+      x.resource_type === type && x.resource_id === id &&
+      x.principal_type === "user" && x.principal_id === userId,
+    );
+    if (!r) continue;
+    if (viewFound) {
+      // Below a found `view`, only an ancestor `edit` grant still counts.
+      if (r.permission === "edit") return { deny: false, grant: "edit", cap };
+      continue;
+    }
+    if (r.permission === "locked") {
+      cap = true;
+      continue;
+    }
+    if (r.permission === "denied") return { deny: true, grant: "none", cap };
+    if (r.permission === "readonly") return { deny: false, grant: "view", cap: true };
+    if (r.permission === "view") {
+      viewFound = true;
+      continue;
+    }
+    if (r.permission === "edit") return { deny: false, grant: "edit", cap };
+  }
+  return { deny: false, grant: viewFound ? "view" : "none", cap };
+}
+
+function rowsDenied(
+  rows: readonly ShareRow[],
+  principalType: "user" | "org",
+  principalId: string,
+  docId: string | null,
+  folderIds: readonly string[],
+): boolean {
+  if (principalType === "user") return userItemVerdict(rows, principalId, docId, folderIds).deny;
+  return rows.some((r) =>
+    (r.resource_type === "file" || r.resource_type === "folder") &&
+    r.permission === "denied" && r.principal_type === "org" && r.principal_id === principalId,
+  );
+}
+
+function rowsLocked(rows: readonly ShareRow[], userId: string, docId: string | null, folderIds: readonly string[]): boolean {
+  return (
+    rows.some((r) =>
+      (r.resource_type === "file" || r.resource_type === "folder") &&
+      (r.permission === "locked" || r.permission === "readonly") &&
+      r.principal_type === "org",
+    ) || userItemVerdict(rows, userId, docId, folderIds).cap
+  );
+}
+
+/**
+ * Highest-wins grant for a doc/folder over a row superset: the person's vault
+ * row, org grants (when `orgClause`), and the per-user item verdict (deepest
+ * per-user row — {@link userItemVerdict}). Org grants a join snapshot already
+ * accounts for are skipped by {@link grantFromRows}.
+ */
+function rowsGrant(
+  rows: readonly ShareRow[],
+  userId: string,
+  docId: string | null,
+  folderIds: readonly string[],
+  organizationId: string,
+  orgClause: boolean,
+  /** False when the person's own vault level replaces the org posture: the
+   *  org-principal VAULT row is then skipped (org item rows still count). */
+  orgVaultClause = true,
+  snapshot?: MemberAccessSnapshot | null,
+  resourceCreatedAt?: Date,
+): Permission {
+  const base = rows.filter((r) =>
+    (r.permission === "view" || r.permission === "edit" || r.permission === "readonly") &&
+    ((r.principal_type === "user" && r.principal_id === userId &&
+      r.resource_type === "vault" && r.resource_id === organizationId) ||
+      (orgClause && r.principal_type === "org" && r.principal_id === organizationId &&
+        (r.resource_type === "file" || r.resource_type === "folder" ||
+          (orgVaultClause && r.resource_type === "vault" && r.resource_id === organizationId)))),
+  );
+  return maxPermission(
+    grantFromRows(base, snapshot, resourceCreatedAt),
+    userItemVerdict(rows, userId, docId, folderIds).grant,
+  );
+}
+
+/**
+ * A person's own level for the whole vault — see {@link personalVaultLevel}.
+ * In-memory twin of its SELECT, over any superset of rows.
+ */
+function rowsPersonalVault(rows: readonly ShareRow[], userId: string, organizationId: string): PersonalVaultLevel {
+  const row = rows.find((r) =>
+    r.resource_type === "vault" && r.resource_id === organizationId &&
+    r.principal_type === "user" && r.principal_id === userId &&
+    (r.permission === "edit" || r.permission === "view" || r.permission === "readonly" || r.permission === "denied"),
+  );
+  return personalLevelOf(row?.permission);
+}
+
+/** In-memory {@link personalVaultLevel} from an {@link AccessIndex}. */
+function indexedPersonalVault(index: AccessIndex, userId: string): PersonalVaultLevel {
+  return rowsPersonalVault(index.shares.get(shareKey("vault", index.organizationId)) ?? [], userId, index.organizationId);
+}
+
+/** In-memory {@link isDenied}. The file branch matches `resource_type = 'file'`. */
+export function indexedIsDenied(
+  index: AccessIndex,
+  principalType: "user" | "org",
+  principalId: string,
+  docId: string | null,
+  folderIds: string[],
+): boolean {
+  return rowsDenied(indexedRows(index, docId, folderIds), principalType, principalId, docId, folderIds);
+}
+
+/** In-memory {@link isLocked}: an org row matches whatever its principal id. */
+export function indexedIsLocked(index: AccessIndex, userId: string, docId: string | null, folderIds: string[]): boolean {
+  return rowsLocked(indexedRows(index, docId, folderIds), userId, docId, folderIds);
+}
+
+/**
+ * Every share row {@link isDenied}, {@link isLocked} and {@link sharePermission}
+ * could match for one doc — on the doc as a file, on each folder in its chain,
+ * and on its vault resource — in ONE read, for the cached path to filter in
+ * memory instead of asking four times.
+ *
+ * Narrowed to org rows and THIS user's rows: every one of the four predicates
+ * names either an org principal or `principal_id = userId`, so another
+ * member's per-user rows can never match and need not cross the wire.
+ */
+async function docShareRows(
+  db: Queryable,
+  userId: string,
+  docId: string,
+  folderIds: string[],
+  organizationId: string,
+): Promise<ShareRow[]> {
+  const { rows } = await db.query<ShareRow>(
+    `SELECT resource_type, resource_id, principal_type, principal_id, permission, access_revision
+       FROM shares
+      WHERE ((resource_type = 'file' AND resource_id = $1)
+          OR (resource_type = 'folder' AND resource_id = ANY($2::text[]))
+          OR (resource_type = 'vault' AND resource_id = $3))
+        AND (principal_type = 'org' OR (principal_type = 'user' AND principal_id = $4))`,
+    [docId, folderIds, organizationId, userId],
+  );
+  return rows;
+}
+
+/**
+ * {@link ResolverCache.prefetch}: locations, ancestor chains and share rows for
+ * many docs in three queries, whatever the count or the depth.
+ *
+ * Conservative by construction — a doc is preloaded only when the batch read
+ * provably saw what the per-doc reads would have:
+ *   · a live note or a files row (never a soft-deleted note: those resolve live,
+ *     through `includeDeleted`), joined to its vault exactly like `locateDoc`;
+ *   · NOT when the id has both a note and a files row, where `locateDoc`'s
+ *     `UNION ALL … LIMIT 1` is the authority on which one wins;
+ *   · NOT when its folder chain loops (the per-doc walk would never finish, and
+ *     a guess here would be a verdict nobody else reaches).
+ * Anything left out is simply resolved the old way.
+ */
+async function prefetchDocs(db: Queryable, docIds: string[]): Promise<Map<string, PreloadedDoc>> {
+  const out = new Map<string, PreloadedDoc>();
+  const { rows: located } = await db.query<{
+    id: string;
+    vault_id: string;
+    folder_id: string | null;
+    created_by: string | null;
+    created_at: Date;
+    organization_id: string;
+  }>(
+    `SELECT n.id, n.vault_id, n.folder_id, n.created_by, n.created_at, v.organization_id
+       FROM notes n JOIN vaults v ON v.id = n.vault_id
+      WHERE n.id = ANY($1::text[]) AND n.deleted_at IS NULL
+     UNION ALL
+     SELECT fi.id, fi.vault_id, fi.folder_id, fi.created_by, fi.created_at, v.organization_id
+       FROM files fi JOIN vaults v ON v.id = fi.vault_id
+      WHERE fi.id = ANY($1::text[])`,
+    [docIds],
+  );
+  const seen = new Map<string, number>();
+  for (const r of located) seen.set(r.id, (seen.get(r.id) ?? 0) + 1);
+  const unique = located.filter((r) => seen.get(r.id) === 1);
+  if (unique.length === 0) return out;
+
+  const startFolders = [...new Set(unique.map((r) => r.folder_id).filter((f): f is string => f !== null))];
+  const parents = new Map<string, string | null>();
+  if (startFolders.length > 0) {
+    // Shared ancestors are read once, and a cycle ends.
+    const rows = await folderAncestry<{ id: string; parent_id: string | null }>(db, startFolders, "f.id, f.parent_id");
+    for (const r of rows) parents.set(r.id, r.parent_id);
+  }
+  // The same walk as `ancestorFolderIds`: the folder itself, then each parent
+  // that still exists, stopping at the root or at a parent with no row.
+  const chainOf = (folderId: string | null): string[] | null => {
+    const chain: string[] = [];
+    const visited = new Set<string>();
+    let id = folderId;
+    while (id !== null && parents.has(id)) {
+      if (visited.has(id)) return null;
+      visited.add(id);
+      chain.push(id);
+      id = parents.get(id) ?? null;
+    }
+    return chain;
+  };
+
+  const docs: Array<{ row: (typeof unique)[number]; folderIds: string[] }> = [];
+  for (const row of unique) {
+    const folderIds = chainOf(row.folder_id);
+    if (folderIds) docs.push({ row, folderIds });
+  }
+  if (docs.length === 0) return out;
+
+  const folderIds = [...new Set(docs.flatMap((d) => d.folderIds))];
+  const orgIds = [...new Set(docs.map((d) => d.row.organization_id))];
+  const { rows: shareRows } = await db.query<ShareRow>(
+    `SELECT resource_type, resource_id, principal_type, principal_id, permission, access_revision
+       FROM shares
+      WHERE (resource_type = 'file' AND resource_id = ANY($1::text[]))
+         OR (resource_type = 'folder' AND resource_id = ANY($2::text[]))
+         OR (resource_type = 'vault' AND resource_id = ANY($3::text[]))`,
+    [docs.map((d) => d.row.id), folderIds, orgIds],
+  );
+  const byResource = new Map<string, ShareRow[]>();
+  for (const r of shareRows) {
+    const key = shareKey(r.resource_type, r.resource_id);
+    const list = byResource.get(key);
+    if (list) list.push(r);
+    else byResource.set(key, [r]);
+  }
+  for (const { row, folderIds: chain } of docs) {
+    const rows: ShareRow[] = [...(byResource.get(shareKey("file", row.id)) ?? [])];
+    for (const f of chain) rows.push(...(byResource.get(shareKey("folder", f)) ?? []));
+    rows.push(...(byResource.get(shareKey("vault", row.organization_id)) ?? []));
+    out.set(row.id, {
+      loc: {
+        vaultId: row.vault_id,
+        folderId: row.folder_id,
+        organizationId: row.organization_id,
+        createdBy: row.created_by,
+        createdAt: row.created_at,
+      },
+      folderIds: chain,
+      rows,
+    });
+  }
+  return out;
+}
+
+export interface DocLocation {
   vaultId: string;
   folderId: string | null;
   organizationId: string;
-  /** Creator of the note (null for files, which have no creator column). */
+  /** Creator of the note or tree file (null when its uploader is unknown). */
   createdBy: string | null;
+  createdAt: Date;
 }
 
 /**
@@ -54,22 +765,26 @@ interface DocLocation {
 async function locateDoc(
   db: Queryable,
   docId: string,
+  /** Also locate a soft-deleted note (Trash reads, restores, pushes into a
+   *  tombstoned doc). Everything else keeps treating a deleted doc as absent. */
+  includeDeleted = false,
 ): Promise<DocLocation | null> {
   const { rows } = await db.query<{
     vault_id: string;
     folder_id: string | null;
     organization_id: string;
     created_by: string | null;
+    created_at: Date;
   }>(
-    `SELECT loc.vault_id, loc.folder_id, loc.created_by, v.organization_id
+    `SELECT loc.vault_id, loc.folder_id, loc.created_by, loc.created_at, v.organization_id
        FROM (
-         SELECT vault_id, folder_id, created_by FROM notes  WHERE id = $1 AND deleted_at IS NULL
+         SELECT vault_id, folder_id, created_by, created_at FROM notes  WHERE id = $1 AND (deleted_at IS NULL OR $2::boolean)
          UNION ALL
-         SELECT vault_id, folder_id, NULL::text FROM files  WHERE id = $1
+         SELECT vault_id, folder_id, created_by, created_at FROM files  WHERE id = $1
        ) loc
        JOIN vaults v ON v.id = loc.vault_id
       LIMIT 1`,
-    [docId],
+    [docId, includeDeleted],
   );
   const row = rows[0];
   if (!row) return null;
@@ -78,7 +793,76 @@ async function locateDoc(
     folderId: row.folder_id,
     organizationId: row.organization_id,
     createdBy: row.created_by,
+    createdAt: row.created_at,
   };
+}
+
+export interface MemberAccessSnapshot {
+  mode: "private" | "readonly" | "open";
+  accessRevision: number;
+  snapshotAt: Date;
+}
+
+/** Null is intentional: memberships predating migration 032 keep legacy ACLs. */
+export async function memberAccessSnapshot(
+  db: Queryable,
+  organizationId: string,
+  userId: string,
+): Promise<MemberAccessSnapshot | null> {
+  const { rows } = await db.query<{
+    mode: MemberAccessSnapshot["mode"];
+    access_revision: string | number;
+    snapshot_at: Date;
+  }>(
+    `SELECT mode, access_revision, snapshot_at
+       FROM member_access_snapshots
+      WHERE organization_id = $1 AND user_id = $2`,
+    [organizationId, userId],
+  );
+  const row = rows[0];
+  return row
+    ? {
+        mode: row.mode,
+        accessRevision: Number(row.access_revision),
+        snapshotAt: row.snapshot_at,
+      }
+    : null;
+}
+
+/**
+ * Every existing folder reachable from `startIds` by following `parent_id`
+ * upward (the start folders included), each returned once.
+ *
+ * Read level by level, one `id = ANY(...)` primary-key lookup per level. The
+ * `WITH RECURSIVE` form it replaces gave Postgres no row estimate for the
+ * working table, so with a few hundred start ids it chose a hash join over a
+ * sequential scan of ALL folders (every vault) at EVERY level, and spilled it
+ * to disk. Same rows: a parent that has no row ends that chain, a folder
+ * already read is not read again (so a cycle ends), and like the old walk
+ * there is no vault filter. `columns` is a fixed list from this module, never
+ * caller input.
+ */
+export async function folderAncestry<R extends { id: string; parent_id: string | null }>(
+  db: Queryable,
+  startIds: Iterable<string>,
+  columns: string,
+): Promise<R[]> {
+  const out: R[] = [];
+  const asked = new Set<string>(startIds);
+  let frontier = [...asked];
+  while (frontier.length > 0) {
+    const { rows } = await db.query<R>(`SELECT ${columns} FROM folders f WHERE f.id = ANY($1::text[])`, [frontier]);
+    const next: string[] = [];
+    for (const r of rows) {
+      out.push(r);
+      if (r.parent_id !== null && !asked.has(r.parent_id)) {
+        asked.add(r.parent_id);
+        next.push(r.parent_id);
+      }
+    }
+    frontier = next;
+  }
+  return out;
 }
 
 /** Walk parent_id up from a folder, collecting all ancestor folder ids (inclusive). */
@@ -88,14 +872,16 @@ export async function ancestorFolderIds(
 ): Promise<string[]> {
   if (!folderId) return [];
   const { rows } = await db.query<{ id: string }>(
+    // Ordered: the folder itself first, then each parent — the per-user rows
+    // on this chain decide by depth ({@link userItemVerdict}).
     `WITH RECURSIVE chain AS (
-        SELECT id, parent_id FROM folders WHERE id = $1
+        SELECT id, parent_id, 0 AS depth FROM folders WHERE id = $1
         UNION ALL
-        SELECT f.id, f.parent_id
+        SELECT f.id, f.parent_id, c.depth + 1
           FROM folders f
           JOIN chain c ON f.id = c.parent_id
      )
-     SELECT id FROM chain`,
+     SELECT id FROM chain ORDER BY depth`,
     [folderId],
   );
   return rows.map((r) => r.id);
@@ -137,6 +923,12 @@ async function sharePermission(
   isMember: boolean,
   /** False when an org deny covers this resource — see {@link isDenied}. */
   orgGrantsApply = true,
+  snapshot?: MemberAccessSnapshot | null,
+  resourceCreatedAt?: Date,
+  index?: AccessIndex,
+  /** False when the person's own vault level replaces the org posture — the
+   *  org VAULT row is skipped, org item rows still apply. */
+  orgVaultClause = true,
 ): Promise<Permission> {
   // Team (org-wide) grants apply ONLY to actual vault members — never to
   // outsiders who merely know a doc id. They can target a specific folder/file
@@ -147,32 +939,78 @@ async function sharePermission(
   // Shared: the org branch drops out for that resource, so the vault-wide grant
   // stops reaching it while explicit personal grants still do.
   const orgGrantClause = isMember && orgGrantsApply
-    ? `OR (principal_type = 'org' AND principal_id = $4 AND (
+    ? `OR (principal_type = 'org' AND principal_id = $4 AND permission IN ('view', 'edit', 'readonly') AND (
             ($2::text IS NOT NULL AND resource_type = 'file' AND resource_id = $2)
             OR (resource_type = 'folder' AND resource_id = ANY($3::text[]))
-            OR (resource_type = 'vault' AND resource_id = $4)
+            ${orgVaultClause ? "OR (resource_type = 'vault' AND resource_id = $4)" : ""}
           ))`
     : "";
   // $2 (the doc id) is always referenced with an explicit cast + null guard so
   // Postgres can infer its type even for a folder resource, where docId is null
   // and the file branch is inert.
-  const { rows } = await db.query<{ permission: string }>(
-    `SELECT permission FROM shares
-      WHERE permission IN ('view', 'edit')
-        AND (
-          (principal_type = 'user' AND principal_id = $1 AND (
-            ($2::text IS NOT NULL AND resource_type = 'file' AND resource_id = $2)
-            OR (resource_type = 'folder' AND resource_id = ANY($3::text[]))
-            OR (resource_type = 'vault' AND resource_id = $4)
-          ))
-          ${orgGrantClause}
-        )`,
-    [userId, docId, folderIds, organizationId],
+  // Per-user rows on the item and its chain are read in EVERY permission so
+  // the deepest one can decide ({@link userItemVerdict}); the per-user VAULT
+  // row and org rows only as grants.
+  const rows = index
+    ? indexedRows(index, docId, folderIds, organizationId)
+    : (
+        await db.query<ShareRow>(
+          `SELECT resource_type, resource_id, principal_type, principal_id, permission, access_revision
+             FROM shares
+            WHERE (principal_type = 'user' AND principal_id = $1 AND (
+                    ($2::text IS NOT NULL AND resource_type = 'file' AND resource_id = $2)
+                    OR (resource_type = 'folder' AND resource_id = ANY($3::text[]))
+                    OR (resource_type = 'vault' AND resource_id = $4
+                        AND permission IN ('view', 'edit', 'readonly'))
+                  ))
+                  ${orgGrantClause}`,
+          [userId, docId, folderIds, organizationId],
+        )
+      ).rows;
+  return rowsGrant(
+    rows, userId, docId, folderIds, organizationId, isMember && orgGrantsApply, orgVaultClause,
+    snapshot, resourceCreatedAt,
   );
+}
+
+/** This person's rows on a doc (as a file) and on each folder in its chain. */
+async function userItemRows(
+  db: Queryable,
+  userId: string,
+  docId: string | null,
+  folderIds: string[],
+): Promise<ShareRow[]> {
+  const { rows } = await db.query<ShareRow>(
+    `SELECT resource_type, resource_id, principal_type, principal_id, permission, access_revision
+       FROM shares
+      WHERE principal_type = 'user' AND principal_id = $1
+        AND (
+          ($2::text IS NOT NULL AND resource_type = 'file' AND resource_id = $2)
+          OR (resource_type = 'folder' AND resource_id = ANY($3::text[]))
+        )`,
+    [userId, docId, folderIds],
+  );
+  return rows;
+}
+
+/** Highest-wins over {@link sharePermission}'s matching rows, skipping the org
+ *  grants a join snapshot already accounts for. */
+function grantFromRows(
+  rows: ReadonlyArray<Pick<ShareRow, "permission" | "principal_type" | "access_revision">>,
+  snapshot?: MemberAccessSnapshot | null,
+  resourceCreatedAt?: Date,
+): Permission {
   let best: Permission = "none";
   for (const r of rows) {
-    if (r.permission === "edit" || r.permission === "view") {
-      best = maxPermission(best, r.permission);
+    const existingAtJoin = !!snapshot && !!resourceCreatedAt && resourceCreatedAt <= snapshot.snapshotAt;
+    if (
+      r.principal_type === "org" &&
+      existingAtJoin &&
+      Number(r.access_revision) <= snapshot.accessRevision
+    ) continue;
+    if (r.permission === "edit") best = maxPermission(best, "edit");
+    else if (r.permission === "view" || r.permission === "readonly") {
+      best = maxPermission(best, "view");
     }
   }
   return best;
@@ -195,21 +1033,22 @@ export async function isLocked(
 ): Promise<boolean> {
   // $2 (doc id) is always referenced with a cast + null guard so Postgres can
   // infer its type for a folder resource (docId null → file branch inert).
-  const { rows } = await db.query<{ ok: number }>(
-    `SELECT 1 AS ok FROM shares
-      WHERE permission = 'locked'
-        AND (
-          principal_type = 'org'
-          OR (principal_type = 'user' AND principal_id = $1)
-        )
+  // One read: org locks/readonly cap everyone; per-user rows cap only when no
+  // deeper per-user row lifts them ({@link userItemVerdict}).
+  const { rows } = await db.query<ShareRow>(
+    `SELECT resource_type, resource_id, principal_type, principal_id, permission, access_revision
+       FROM shares
+      WHERE (
+              (principal_type = 'org' AND permission IN ('locked', 'readonly'))
+              OR (principal_type = 'user' AND principal_id = $1)
+            )
         AND (
           ($2::text IS NOT NULL AND resource_type = 'file' AND resource_id = $2)
           OR (resource_type = 'folder' AND resource_id = ANY($3::text[]))
-        )
-      LIMIT 1`,
+        )`,
     [userId, docId, folderIds],
   );
-  return rows.length > 0;
+  return rowsLocked(rows, userId, docId, folderIds);
 }
 
 /**
@@ -224,20 +1063,131 @@ export async function isLocked(
  * shortcuts are skipped and the ordinary highest-wins grant lookup decides —
  * which still lets a folder marked Shared, or a personal edit grant, lift an
  * individual out of it. That is exactly what the panel offers.
+ *
+ * `sealed` — an org-principal `denied` row on the vault resource — is the
+ * Access panel's **Private**, and it is the same rule with nothing left at the
+ * bottom: the role shortcut and authorship are both skipped and the vault
+ * confers nothing, so only a GRANT reaches a doc. Nobody reads anything, the
+ * person who created the vault and wrote every note in it included, until
+ * something is shared by name or a folder is shared with the team.
+ *
+ * It is a row rather than the ABSENCE of one because absence already means
+ * something else. "Never shared" and "deliberately sealed" were the same state
+ * — no row — and they want opposite answers about the notes people wrote: the
+ * first is the private-by-default space `created_by` exists for, the second is
+ * a setting whose whole point is that it applies to the person who chose it.
+ * Writing the row is also what lets an old vault keep working until someone
+ * presses the button, at which point it means what it says.
+ *
+ * The one thing an item set Private does that `sealed` does not is drop ORG
+ * grants on that item. Here they still lift: a sealed vault is a floor you
+ * raise things out of one at a time, while an item set Private withdraws one
+ * thing from a team that can otherwise reach it.
+ *
+ * The management path is untouched and role-based (`canManage` in
+ * `http/routes/shares.ts`), so an owner who cannot read a note can still
+ * change the posture back.
  */
+export type VaultPosture = "edit" | "view" | "sealed" | null;
+
 export async function vaultBaseline(
   db: Queryable,
   organizationId: string,
-): Promise<Permission | null> {
+): Promise<VaultPosture> {
   const { rows } = await db.query<{ permission: string }>(
     `SELECT permission FROM shares
       WHERE resource_type = 'vault' AND resource_id = $1
-        AND principal_type = 'org' AND permission IN ('view', 'edit')
+        AND principal_type = 'org' AND permission IN ('view', 'edit', 'denied')
       LIMIT 1`,
     [organizationId],
   );
-  const p = rows[0]?.permission;
-  return p === "edit" || p === "view" ? p : null;
+  return postureOf(rows[0]?.permission);
+}
+
+function postureOf(p: string | null | undefined): VaultPosture {
+  if (p === "edit" || p === "view") return p;
+  return p === "denied" ? "sealed" : null;
+}
+
+/**
+ * The person's OWN level for the whole vault: their per-user row on the vault
+ * resource (`readonly` reads as `view`), or null when they have none and the
+ * org posture decides.
+ *
+ * "Person wins either way": when present it REPLACES, for this one person, the
+ * whole vault-wide baseline — the org posture row, the join snapshot, the
+ * owner/admin shortcut and the creator rule. `view` therefore caps as well as
+ * grants, and `denied` withdraws authorship like `sealed`. Item-level rows run
+ * unchanged on top of it (see the header of this file). Owners and admins are
+ * not exempt; management stays role-based so they can always undo it.
+ *
+ * At most one row exists: the table is unique on (resource_type, resource_id,
+ * principal_type, principal_id).
+ */
+export type PersonalVaultLevel = "edit" | "view" | "denied" | null;
+
+function personalLevelOf(p: string | null | undefined): PersonalVaultLevel {
+  if (p === "edit") return "edit";
+  if (p === "view" || p === "readonly") return "view";
+  return p === "denied" ? "denied" : null;
+}
+
+export async function personalVaultLevel(
+  db: Queryable,
+  organizationId: string,
+  userId: string,
+): Promise<PersonalVaultLevel> {
+  const { rows } = await db.query<{ permission: string }>(
+    `SELECT permission FROM shares
+      WHERE resource_type = 'vault' AND resource_id = $1
+        AND principal_type = 'user' AND principal_id = $2
+        AND permission IN ('edit', 'view', 'readonly', 'denied')
+      LIMIT 1`,
+    [organizationId, userId],
+  );
+  return personalLevelOf(rows[0]?.permission);
+}
+
+/**
+ * {@link memberRole}, {@link memberAccessSnapshot} and {@link vaultBaseline} as
+ * ONE round trip. Each column is that function's own SELECT, verbatim, as a
+ * scalar subquery (the snapshot is keyed by its primary key, so the LEFT JOIN
+ * yields at most one row) — the values cannot differ, only the latency.
+ */
+async function membershipFacts(
+  db: Queryable,
+  organizationId: string,
+  userId: string,
+): Promise<MembershipFacts> {
+  const { rows } = await db.query<{
+    role: string | null;
+    baseline: string | null;
+    mode: MemberAccessSnapshot["mode"] | null;
+    access_revision: string | number | null;
+    snapshot_at: Date | null;
+  }>(
+    `SELECT
+        (SELECT role FROM member
+          WHERE "organizationId" = $1 AND "userId" = $2 LIMIT 1) AS role,
+        (SELECT permission FROM shares
+          WHERE resource_type = 'vault' AND resource_id = $1
+            AND principal_type = 'org' AND permission IN ('view', 'edit', 'denied')
+          LIMIT 1) AS baseline,
+        s.mode, s.access_revision, s.snapshot_at
+       FROM (SELECT 1) AS one
+       LEFT JOIN member_access_snapshots s
+         ON s.organization_id = $1 AND s.user_id = $2`,
+    [organizationId, userId],
+  );
+  const row = rows[0];
+  return {
+    role: row?.role ?? null,
+    baseline: postureOf(row?.baseline),
+    snapshot:
+      row && row.mode !== null && row.snapshot_at !== null
+        ? { mode: row.mode, accessRevision: Number(row.access_revision), snapshotAt: row.snapshot_at }
+        : null,
+  };
 }
 
 /**
@@ -275,6 +1225,10 @@ export async function isDenied(
   docId: string | null,
   folderIds: string[],
 ): Promise<boolean> {
+  // A per-user deny decides only when it is the deepest per-user row.
+  if (principalType === "user") {
+    return userItemVerdict(await userItemRows(db, principalId, docId, folderIds), principalId, docId, folderIds).deny;
+  }
   const { rows } = await db.query<{ ok: number }>(
     `SELECT 1 AS ok FROM shares
       WHERE permission = 'denied'
@@ -289,15 +1243,78 @@ export async function isDenied(
   return rows.length > 0;
 }
 
+/**
+ * Billing lapse cap (pricing rev §3.4): a vault whose account is lapsed is
+ * read-only for everyone — `edit` becomes `view`, every other answer passes
+ * through. Reads stay intact (no `ready.revoked` storm); management routes do
+ * not consult this resolver, so the owner can still trim, resume or detach.
+ */
 export async function effectivePermission(
   userId: string,
   docId: string,
   db: Queryable = defaultPool,
+  /** Optional request-scoped memo for the per-vault / per-folder inputs. Changes
+   *  nothing about the answer — see {@link ResolverCache}. */
+  cache?: ResolverCache,
+  /** Resolve a soft-deleted note as if it were live (see `trash/access.ts`). */
+  opts: { includeDeleted?: boolean } = {},
 ): Promise<Permission> {
-  const loc = await locateDoc(db, docId);
-  if (!loc) return "none";
+  const out: { organizationId?: string } = {};
+  const perm = await effectivePermissionInner(userId, docId, db, cache, opts, out);
+  if (perm !== "edit" || !out.organizationId) return perm;
+  const memo = cache ?? createResolverCache();
+  return (await memo.billingReadOnly(db, out.organizationId)) ? "view" : perm;
+}
 
-  const folderIds = await ancestorFolderIds(db, loc.folderId);
+async function effectivePermissionInner(
+  userId: string,
+  docId: string,
+  db: Queryable,
+  cache: ResolverCache | undefined,
+  opts: { includeDeleted?: boolean },
+  /** Receives the doc's vault so the wrapper reuses this lookup. */
+  out: { organizationId?: string },
+): Promise<Permission> {
+  // A doc the batch prefetched answers from what that read loaded; anything
+  // else — no cache, not prefetched, or a soft-deleted lookup — reads live.
+  const pre = cache && opts.includeDeleted !== true ? cache.preloaded(docId) : undefined;
+  const loc = pre ? pre.loc : await locateDoc(db, docId, opts.includeDeleted === true);
+  if (!loc) return "none";
+  out.organizationId = loc.organizationId;
+
+  const folderIds = pre
+    ? pre.folderIds
+    : cache
+      ? await cache.ancestors(db, loc.folderId)
+      : await ancestorFolderIds(db, loc.folderId);
+
+  // With a cache, the four share questions below (two denies, the grant, the
+  // lock) are answered from ONE read of every row on this doc, its chain and
+  // its vault, filtered by the same predicates the SQL spells out. Without one,
+  // each asks the database itself — the reference path the drift tests compare
+  // against.
+  const rows = pre ? pre.rows : cache ? await docShareRows(db, userId, docId, folderIds, loc.organizationId) : null;
+  const denied = async (principalType: "user" | "org", principalId: string) =>
+    rows
+      ? rowsDenied(rows, principalType, principalId, docId, folderIds)
+      : isDenied(db, principalType, principalId, docId, folderIds);
+  const locked = async () => (rows ? rowsLocked(rows, userId, docId, folderIds) : isLocked(db, userId, docId, folderIds));
+  const grant = async (
+    isMember: boolean,
+    orgGrantsApply: boolean,
+    snapshot?: MemberAccessSnapshot | null,
+    resourceCreatedAt?: Date,
+    orgVaultClause = true,
+  ) =>
+    rows
+      ? rowsGrant(
+          rows, userId, docId, folderIds, loc.organizationId, isMember && orgGrantsApply, orgVaultClause,
+          snapshot, resourceCreatedAt,
+        )
+      : sharePermission(
+          db, userId, docId, folderIds, loc.organizationId, isMember, orgGrantsApply,
+          snapshot, resourceCreatedAt, undefined, orgVaultClause,
+        );
 
   // Denies are first and unconditional. Both kinds outrank the role branch
   // below: what you set in the Access panel applies to you too, or a vault
@@ -305,12 +1322,56 @@ export async function effectivePermission(
   // on trust. The escape hatch is elsewhere and role-based — managing shares
   // (`canManage` in http/routes/shares.ts) is gated on owner/admin, never on
   // effective permission, so an owner can always lift what they set.
-  if (await isDenied(db, "user", userId, docId, folderIds)) return "none";
-  const itemPrivate = await isDenied(db, "org", loc.organizationId, docId, folderIds);
+  if (await denied("user", userId)) return "none";
+  const itemPrivate = await denied("org", loc.organizationId);
 
-  const role = await memberRole(db, loc.organizationId, userId);
-  // A Read-only vault caps EVERY shortcut below it (see `vaultBaseline`).
-  const readOnlyVault = (await vaultBaseline(db, loc.organizationId)) === "view";
+  const facts = cache ? await cache.membership(db, loc.organizationId, userId) : null;
+  const role = facts ? facts.role : await memberRole(db, loc.organizationId, userId);
+
+  // The person's own vault level replaces the whole vault-wide baseline (org
+  // posture, join snapshot, role shortcut, authorship) — see
+  // {@link personalVaultLevel}. What remains is the item-level logic: the
+  // person's own vault row (edit/view) and every item grant, highest-wins, with
+  // the org VAULT row skipped and org item rows dropped under item-Private; the
+  // per-user item deny above already returned; locks cap below.
+  const personal = rows
+    ? rowsPersonalVault(rows, userId, loc.organizationId)
+    : await personalVaultLevel(db, loc.organizationId, userId);
+  if (personal !== null) {
+    // A personal `denied` drops org ITEM grants too, exactly like an item set
+    // Private: only per-user item grants can lift a person out of "No access".
+    const granted = await grant(role !== null, !itemPrivate && personal !== "denied", undefined, undefined, false);
+    if (granted !== "none" && (await locked())) return "view";
+    return granted;
+  }
+
+  const snapshot = facts ? facts.snapshot : await memberAccessSnapshot(db, loc.organizationId, userId);
+  const existingAtJoin = !!snapshot && loc.createdAt <= snapshot.snapshotAt;
+
+  // A join default is a one-time view of content that already existed. It does
+  // not rewrite the organization's live posture, and it is not an immutable
+  // deny: an org grant written at a later ACL revision can raise it.
+  if (existingAtJoin) {
+    const direct = await grant(role !== null, !itemPrivate, snapshot, loc.createdAt);
+    let snapped: Permission = itemPrivate
+      ? "none"
+      : snapshot.mode === "open"
+        ? "edit"
+        : snapshot.mode === "readonly"
+          ? "view"
+          : "none";
+    snapped = maxPermission(snapped, direct);
+    if (snapped !== "none" && (await locked())) return "view";
+    return snapped;
+  }
+  // The vault's posture caps EVERY shortcut below it (see `vaultBaseline`).
+  // Read-only and Private both skip the role AND the creator rule; they differ
+  // only in what the vault itself then confers — `view` for one, nothing at all
+  // for the other.
+  const baseline = facts ? facts.baseline : await vaultBaseline(db, loc.organizationId);
+  const readOnlyVault = baseline === "view";
+  const sealedVault = baseline === "sealed";
+  const ungrantedVault = baseline === null;
   let granted: Permission;
   if (itemPrivate) {
     // Private = "nobody, until you name them". ONLY explicit per-user grants
@@ -321,25 +1382,29 @@ export async function effectivePermission(
     // that spares the author is a Private you can never observe, and "it works,
     // trust me" is not a thing to ship in an access panel. Naming yourself in
     // the list below is how you get back in.
-    granted = await sharePermission(
-      db,
-      userId,
-      docId,
-      folderIds,
-      loc.organizationId,
-      false,
-      false,
-    );
-  } else if (readOnlyVault) {
-    granted = await sharePermission(
-      db,
-      userId,
-      docId,
-      folderIds,
-      loc.organizationId,
-      role !== null,
-    );
-  } else if (role === "owner" || role === "admin") {
+    granted = await grant(false, false);
+  } else if (readOnlyVault || sealedVault) {
+    // The two postures that take BOTH shortcuts away from everyone: the
+    // owner/admin blanket edit, and authorship.
+    //
+    // `sealed` is the Private button, and it had to stop sparing the author to
+    // mean anything. In a vault you set up yourself you wrote nearly every note
+    // in it, so a Private that spares the author is one you can never observe —
+    // press it and the vault looks untouched, which from the seat that pressed
+    // it is indistinguishable from a control that does not work.
+    //
+    // What still reaches through is a GRANT: a per-user share, or an org share
+    // on a folder or note ("share this one folder with the team"). That is the
+    // shape of a sealed vault — a floor you lift things out of one at a time by
+    // naming them. It is also the one difference from an item set Private,
+    // which drops org grants on that item too, because there the point is the
+    // opposite: withdrawing one thing from a team that can otherwise reach it.
+    granted = await grant(role !== null, true);
+  } else if (!ungrantedVault && (role === "owner" || role === "admin")) {
+    // The blanket role shortcut. A vault that was never shared withdraws it —
+    // an owner is not exempt from a vault nobody has been given — but leaves
+    // the creator rule below standing, because "no grant" is also the state
+    // every private-by-default vault sits in, where people keep what they wrote.
     granted = "edit";
   } else if (role !== null && loc.createdBy && loc.createdBy === userId) {
     // Private-by-default: a member always has edit on a note they created, even
@@ -349,18 +1414,11 @@ export async function effectivePermission(
     // notes they authored and can re-mint sync tokens indefinitely.
     granted = "edit";
   } else {
-    granted = await sharePermission(
-      db,
-      userId,
-      docId,
-      folderIds,
-      loc.organizationId,
-      role !== null, // isMember — gates the org-wide grant
-    );
+    granted = await grant(role !== null, true); // isMember — gates the org-wide grant
   }
 
   // Cap overlay: a matching lock caps at view; it never grants.
-  if (granted !== "none" && (await isLocked(db, userId, docId, folderIds))) {
+  if (granted !== "none" && (await locked())) {
     return "view";
   }
   return granted;
@@ -388,6 +1446,7 @@ export interface AccessContext {
    * either answer alone.
    */
   createdBy: string | null;
+  createdAt: Date;
 }
 
 export interface ResolvedAccess {
@@ -403,31 +1462,74 @@ export async function buildAccessContext(
   resourceType: "folder" | "file",
   resourceId: string,
   db: Queryable = defaultPool,
+  cache?: ResolverCache,
 ): Promise<AccessContext | null> {
+  const chain = (folderId: string | null) =>
+    cache ? cache.ancestors(db, folderId) : ancestorFolderIds(db, folderId);
   if (resourceType === "file") {
     const loc = await locateDoc(db, resourceId);
     if (!loc) return null;
     return {
       organizationId: loc.organizationId,
       docId: resourceId,
-      folderIds: await ancestorFolderIds(db, loc.folderId),
+      folderIds: await chain(loc.folderId),
       createdBy: loc.createdBy,
+      createdAt: loc.createdAt,
     };
   }
   // folder: resolve its owning vault (organization), then walk itself + ancestors.
-  const { rows } = await db.query<{ organization_id: string }>(
-    `SELECT v.organization_id
+  const { rows } = await db.query<{ organization_id: string; created_at: Date }>(
+    `SELECT v.organization_id, f.created_at
        FROM folders f JOIN vaults v ON v.id = f.vault_id
       WHERE f.id = $1 LIMIT 1`,
     [resourceId],
   );
-  const org = rows[0]?.organization_id;
-  if (!org) return null;
+  const row = rows[0];
+  if (!row) return null;
   return {
-    organizationId: org,
+    organizationId: row.organization_id,
     docId: null,
-    folderIds: await ancestorFolderIds(db, resourceId),
+    folderIds: await chain(resourceId),
     createdBy: null, // folders have no creator column in the ACL context
+    createdAt: row.created_at,
+  };
+}
+
+/**
+ * {@link buildAccessContext} for many resources of one organization, from the
+ * index: the same rows (`locateDoc` prefers a live note over a files row) and
+ * the same ancestor chain. A resource the index does not hold falls back to
+ * the per-resource read, so an answer never silently changes shape.
+ */
+export async function buildAccessContextFromIndex(
+  index: AccessIndex,
+  resourceType: "folder" | "file",
+  resourceId: string,
+  db: Queryable = defaultPool,
+  cache?: ResolverCache,
+): Promise<AccessContext | null> {
+  if (resourceType === "file") {
+    const note = index.notes.get(resourceId);
+    const loc = note ?? index.files.get(resourceId);
+    const chain = loc ? indexedAncestors(index, loc.folderId) : null;
+    if (!loc || !chain) return buildAccessContext(resourceType, resourceId, db, cache);
+    return {
+      organizationId: index.organizationId,
+      docId: resourceId,
+      folderIds: chain,
+      createdBy: loc.createdBy,
+      createdAt: loc.createdAt,
+    };
+  }
+  const folder = index.folders.get(resourceId);
+  const chain = folder ? indexedAncestors(index, resourceId) : null;
+  if (!folder || !chain) return buildAccessContext(resourceType, resourceId, db, cache);
+  return {
+    organizationId: index.organizationId,
+    docId: null,
+    folderIds: chain,
+    createdBy: null,
+    createdAt: folder.createdAt,
   };
 }
 
@@ -437,29 +1539,126 @@ export async function resolveAccessForUser(
   userId: string,
   role: string | null,
   db: Queryable = defaultPool,
+  cache?: ResolverCache,
+  /** Preloaded rows for `ctx.organizationId` — see {@link AccessIndex}. */
+  accessIndex?: AccessIndex,
 ): Promise<ResolvedAccess> {
-  if (await isDenied(db, "user", userId, ctx.docId, ctx.folderIds)) {
+  const resolved = await resolveAccessForUserInner(ctx, userId, role, db, cache, accessIndex);
+  if (resolved.permission !== "edit") return resolved;
+  // Billing lapse cap, exactly as in {@link effectivePermission}.
+  const memo = cache ?? createResolverCache();
+  return (await memo.billingReadOnly(db, ctx.organizationId))
+    ? { ...resolved, permission: "view" }
+    : resolved;
+}
+
+async function resolveAccessForUserInner(
+  ctx: AccessContext,
+  userId: string,
+  role: string | null,
+  db: Queryable,
+  cache: ResolverCache | undefined,
+  accessIndex: AccessIndex | undefined,
+): Promise<ResolvedAccess> {
+  const index = accessIndex?.organizationId === ctx.organizationId ? accessIndex : undefined;
+  const denied = (principalType: "user" | "org", principalId: string) =>
+    index
+      ? Promise.resolve(indexedIsDenied(index, principalType, principalId, ctx.docId, ctx.folderIds))
+      : isDenied(db, principalType, principalId, ctx.docId, ctx.folderIds);
+  const lockedFor = () =>
+    index
+      ? Promise.resolve(indexedIsLocked(index, userId, ctx.docId, ctx.folderIds))
+      : isLocked(db, userId, ctx.docId, ctx.folderIds);
+  if (await denied("user", userId)) {
     return { permission: "none", capped: false, denied: true };
   }
-  const itemPrivate = await isDenied(db, "org", ctx.organizationId, ctx.docId, ctx.folderIds);
+  const itemPrivate = await denied("org", ctx.organizationId);
+  // The person's own vault level — mirrors `effectivePermission` exactly.
+  const personal = index
+    ? indexedPersonalVault(index, userId)
+    : cache
+      ? await cache.personal(db, ctx.organizationId, userId)
+      : await personalVaultLevel(db, ctx.organizationId, userId);
+  if (personal !== null) {
+    const granted = await sharePermission(
+      db,
+      userId,
+      ctx.docId,
+      ctx.folderIds,
+      ctx.organizationId,
+      role !== null,
+      !itemPrivate && personal !== "denied",
+      undefined,
+      undefined,
+      index,
+      false,
+    );
+    if (granted === "none") return { permission: "none", capped: false, denied: itemPrivate || personal === "denied" };
+    const locked = await lockedFor();
+    if (locked && granted === "edit") return { permission: "view", capped: true };
+    if (locked) return { permission: "view", capped: false };
+    return { permission: granted, capped: false };
+  }
+  const snapshot = cache
+    ? await cache.snapshot(db, ctx.organizationId, userId)
+    : await memberAccessSnapshot(db, ctx.organizationId, userId);
+  const existingAtJoin = !!snapshot && ctx.createdAt <= snapshot.snapshotAt;
+  if (existingAtJoin) {
+    const direct = await sharePermission(
+      db,
+      userId,
+      ctx.docId,
+      ctx.folderIds,
+      ctx.organizationId,
+      role !== null,
+      !itemPrivate,
+      snapshot,
+      ctx.createdAt,
+      index,
+    );
+    let permission: Permission = itemPrivate
+      ? "none"
+      : snapshot.mode === "open"
+        ? "edit"
+        : snapshot.mode === "readonly"
+          ? "view"
+          : "none";
+    permission = maxPermission(permission, direct);
+    if (permission === "none") return { permission, capped: false, denied: itemPrivate };
+    const locked = await lockedFor();
+    if (locked && permission === "edit") return { permission: "view", capped: true };
+    if (locked) return { permission: "view", capped: false };
+    return { permission, capped: false };
+  }
   // Mirrors `effectivePermission` branch for branch. They MUST agree: this one
   // renders the "who can access" list, and a list that disagrees with the
   // enforcer is worse than no list.
-  const readOnlyVault = (await vaultBaseline(db, ctx.organizationId)) === "view";
+  const baseline = cache
+    ? await cache.baseline(db, ctx.organizationId)
+    : await vaultBaseline(db, ctx.organizationId);
+  const readOnlyVault = baseline === "view";
+  const sealedVault = baseline === "sealed";
+  const ungrantedVault = baseline === null;
   const isCreator = role !== null && !!ctx.createdBy && ctx.createdBy === userId;
   const granted: Permission = itemPrivate
     ? // Private: only explicit per-user grants survive — authorship included.
-      await sharePermission(db, userId, ctx.docId, ctx.folderIds, ctx.organizationId, false, false)
-    : readOnlyVault
-      ? await sharePermission(
+      await sharePermission(db, userId, ctx.docId, ctx.folderIds, ctx.organizationId, false, false, undefined, undefined, index)
+    : readOnlyVault || sealedVault
+      ? // Both postures skip the role AND authorship; only a grant reaches
+        // through. Mirrors `effectivePermission` branch for branch.
+        await sharePermission(
           db,
           userId,
           ctx.docId,
           ctx.folderIds,
           ctx.organizationId,
           role !== null,
+          true,
+          undefined,
+          undefined,
+          index,
         )
-      : role === "owner" || role === "admin"
+      : !ungrantedVault && (role === "owner" || role === "admin")
         ? "edit"
         : isCreator
           ? "edit"
@@ -470,11 +1669,15 @@ export async function resolveAccessForUser(
               ctx.folderIds,
               ctx.organizationId,
               role !== null, // isMember — gates the org-wide grant
+              true,
+              undefined,
+              undefined,
+              index,
             );
 
   if (granted === "none") return { permission: "none", capped: false, denied: itemPrivate };
 
-  const locked = await isLocked(db, userId, ctx.docId, ctx.folderIds);
+  const locked = await lockedFor();
   if (locked && granted === "edit") return { permission: "view", capped: true };
   if (locked) return { permission: "view", capped: false };
   return { permission: granted, capped: false };

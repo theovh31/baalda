@@ -1,5 +1,8 @@
 import {
   createContext,
+  lazy,
+  Suspense,
+  useCallback,
   useContext,
   useEffect,
   useLayoutEffect,
@@ -7,7 +10,10 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
+import { StatusMoment } from "./StatusMoment";
+import { NOT_CREATOR_MESSAGE, canDeleteItem } from "../lib/sync/deletePolicy";
 import {
   Tree,
   type NodeApi,
@@ -17,7 +23,12 @@ import {
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { TreeNode } from "../lib/ipc";
 import * as ipc from "../lib/ipc";
-import { ITEM_COLORS, itemColorValue } from "../lib/appearance";
+import {
+  automaticTreeColors,
+  ITEM_COLORS,
+  itemColorFill,
+  itemColorValue,
+} from "../lib/appearance";
 import {
   applyOrder,
   childrenAt,
@@ -29,19 +40,27 @@ import {
   renameInOrder,
 } from "../lib/ordering";
 import { pinModified, sortTree, TREE_SORTS } from "../lib/tree/sort";
-import { LOCK_TITLES, lockScopesByPath, type LockScope } from "../lib/locks";
-import { previewKind } from "../lib/preview";
+import { isHomeNavigation, pinKey } from "../lib/pins";
+import { requestNewDashboard } from "../lib/homeEvents";
+import { isBlankTreeTarget } from "../lib/tree/blankTarget";
+import { LOCK_TITLES, effectiveLockForPath, lockScopesByPath, type LockScope } from "../lib/locks";
+import { ancestorPaths } from "../lib/accessTree";
+import { nodeAt } from "../lib/tree/lazyTree";
+import { displayName } from "../lib/notePath";
 import {
   buildTreeSyncIndex,
   FolderWaveTracker,
   rowSyncMark,
+  sidebarMarksVisible,
   type TreeSyncIndex,
 } from "../lib/syncRollup";
 import { embedDroppedFile } from "../lib/attachments";
+import { isNoteExt, isOpenable } from "../lib/formats";
+import { iconKeyForPath, type TreeIconKey } from "../lib/treeIcons";
 import { toast } from "../lib/toast";
 import { deletePaths } from "../lib/vault/mutatePaths";
 import { AsyncButton } from "./AsyncButton";
-import { Spinner } from "./Spinner";
+import { OpeningGlyph } from "./OpeningGlyph";
 import {
   activeNoteEditable,
   insertIntoActiveNote,
@@ -56,13 +75,52 @@ import {
   ringShowsColor,
   statusTone,
 } from "../lib/presence/color";
-import { characterSvg } from "./Identity";
-import { ShareDialog, type ShareTarget } from "./ShareDialog";
+import { Face } from "./Face";
+import { NothingShared } from "./EditorPlaceholders";
+import { useEmptyVaultView } from "./useEmptyVaultView";
+import type { ShareTarget } from "./ShareDialog";
+
+/* Lazy: the sharing sheet is a context-menu action, and keeping it out of the
+   eager graph is also what lets it static-import the avatar chunk. */
+/** The row menu's Share… is hidden until per-item sharing is reworked;
+ *  Members and access is where access is managed meanwhile. */
+const SHOW_SHARE_ITEM = false;
+
+/**
+ * Redesign: give a just-opened folder's child rows `.rd-row-new` (a short fade,
+ * redesign.css) as they mount. Watches for ~400ms so lazily loaded children
+ * fade too; each row fades once. Scrolling and other rows are untouched.
+ */
+function fadeInChildren(folder: string): void {
+  const prefix = `${folder}/`;
+  const seen = new Set<string>();
+  const until = performance.now() + 400;
+  const tick = () => {
+    for (const row of document.querySelectorAll<HTMLElement>(".filetree-scroll [data-tree-path]")) {
+      const path = row.dataset.treePath ?? "";
+      if (!path.startsWith(prefix) || seen.has(path)) continue;
+      seen.add(path);
+      row.classList.add("rd-row-new");
+      window.setTimeout(() => row.classList.remove("rd-row-new"), 260);
+    }
+    if (performance.now() < until) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+const ShareDialog = lazy(() =>
+  import("./ShareDialog").then((m) => ({ default: m.ShareDialog })),
+);
 import { placeMenu, type Placement } from "../lib/menuPlacement";
+import { fileDropsClaimed } from "../lib/dropClaim";
+
+/** A refusal reason carrying the creator-rule sentence (`registry.deletePath`). */
+const isNotCreatorReason = (reason: unknown) =>
+  typeof reason === "string" && reason.includes(NOT_CREATOR_MESSAGE);
 
 /** Tooltip on every root-create affordance while the vault's root is frozen. */
 const ROOT_FROZEN_HINT =
-  "This vault's root is frozen — new notes and folders go inside a folder.";
+  "This vault's root is frozen. New notes and folders go inside a folder.";
 
 interface Dimensions {
   width: number;
@@ -91,11 +149,6 @@ function parentDir(path: string): string {
 
 function basename(path: string): string {
   return path.split("/").pop() ?? path;
-}
-
-/** Files the in-app editor can render: markdown notes and HTML pages. */
-function isOpenablePath(path: string): boolean {
-  return /\.(md|html?)$/i.test(path);
 }
 
 /** Resolve a client (CSS px) point to the vault-relative dir under it, using the
@@ -137,6 +190,10 @@ interface MenuState {
   flipY?: number;
   node: NodeApi<TreeNode> | null;
 }
+
+/** How long a revealed row wears `.revealed`: the `tree-reveal` animation in
+ *  App.css (900ms) plus a margin, so the class never drops mid-pulse. */
+const REVEAL_PULSE_MS = 1000;
 
 /* Toolbar glyphs — file+ / folder+ mirror the tree's own icons so the "create"
    actions read as "a new one of these"; the chevron pairs fold in / fan out. */
@@ -201,29 +258,116 @@ const ICON_TRASH = (
 
 export function FileTree() {
   const tree = useStore((s) => s.tree);
+  const emptyView = useEmptyVaultView();
   const openNote = useStore((s) => s.openNote);
+  const homeHighlighted = useStore((s) => !s.homeSectionHidden && isHomeNavigation(s));
   const syncEnabled = useStore((s) => s.syncEnabled);
+  const syncStatus = useStore((s) => s.syncStatus);
   const locks = useStore((s) => s.locks);
+  const lifts = useStore((s) => s.lifts);
   const vaultPresence = useStore((s) => s.vaultPresence);
   const session = useStore((s) => s.session);
   const members = useStore((s) => s.members);
   const itemColors = useStore((s) => s.itemColors);
+  const automaticItemColors = useStore((s) => s.automaticItemColors);
+  const vault = useStore((s) => s.vault);
   const rootFrozen = useStore((s) => s.rootFrozen);
   const itemOrder = useStore((s) => s.itemOrder);
   const treeSort = useStore((s) => s.treeSort);
+  const folderSorts = useStore((s) => s.folderSorts);
   const docSyncState = useStore((s) => s.docSyncState);
+  // The same fact for files that sync as blobs (`.pdf`, `.docx`, `.mp4`): the
+  // attachment mirror's own map, keyed by path rather than docId.
+  const fileSyncState = useStore((s) => s.fileSyncState);
   const docIdByPath = useStore((s) => s.docIdByPath);
   const titles = useStore((s) => s.titles);
   const [containerRef, dim] = useDimensions();
+  // `automaticItemColors` is the EFFECTIVE value (personal ?? vault ?? default,
+  // store.applyAppearance). This used to re-read the legacy per-account key on
+  // mount, which overwrote the effective value and ignored vault defaults.
   const treeRef = useRef<TreeApi<TreeNode> | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
+  // Grouped context-menu rows are one line each; their options
+  // open in a fly-out to the right. The fly-out is its OWN fixed layer (the
+  // menu scrolls, so anything positioned inside it would be clipped), opened on
+  // hover or click and kept open while the pointer crosses the gap into it.
+  type SubmenuKind = "sort" | "color" | "dashboard" | "pin" | "home";
+  const [sub, setSub] = useState<{ kind: SubmenuKind; rect: DOMRect } | null>(null);
+  const [subPos, setSubPos] = useState<{ left: number; top: number } | null>(null);
+  const subRef = useRef<HTMLUListElement | null>(null);
+  const subTimer = useRef<number | undefined>(undefined);
+  const subTrigger = useRef<HTMLElement | null>(null);
+  const focusSub = useRef(false);
+  useEffect(() => setSub(null), [menu]);
+  const openSub = (kind: SubmenuKind, row: HTMLElement) => {
+    window.clearTimeout(subTimer.current);
+    subTrigger.current = row;
+    setSub({ kind, rect: row.getBoundingClientRect() });
+  };
+  const keepSub = () => window.clearTimeout(subTimer.current);
+  const closeSubSoon = () => {
+    window.clearTimeout(subTimer.current);
+    subTimer.current = window.setTimeout(() => setSub(null), 180);
+  };
+  useEffect(() => () => window.clearTimeout(subTimer.current), []);
+  // Right of its row; flips left when the window edge is in the way, and is
+  // kept inside the window vertically. Layout effect: placed before paint.
+  useLayoutEffect(() => {
+    if (!sub) {
+      setSubPos(null);
+      return;
+    }
+    const el = subRef.current;
+    if (!el) return;
+    const box = el.getBoundingClientRect();
+    const gap = 6;
+    let left = sub.rect.right + gap;
+    if (left + box.width > window.innerWidth - 8) left = Math.max(8, sub.rect.left - box.width - gap);
+    const top = Math.max(8, Math.min(sub.rect.top - 4, window.innerHeight - 8 - box.height));
+    setSubPos({ left, top });
+  }, [sub]);
+  useLayoutEffect(() => {
+    if (subPos && focusSub.current && subRef.current) {
+      const first = subRef.current.querySelector<HTMLElement>("li:not(.disabled):not(.menu-heading)");
+      if (first) { first.tabIndex = -1; first.focus(); }
+      focusSub.current = false;
+    }
+  }, [subPos]);
   // Resolved once the menu has been measured; null means "not placed yet", which
   // is also what keeps it invisible for that one frame.
   const menuRef = useRef<HTMLUListElement | null>(null);
+  const menuKeys = (event: ReactKeyboardEvent<HTMLUListElement>, child = false) => {
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(":scope > li:not(.disabled):not(.menu-heading)"));
+    const current = (event.target as HTMLElement).closest("li") as HTMLElement | null;
+    const index = current ? items.indexOf(current) : -1;
+    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault(); event.stopPropagation();
+      const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : event.key === "ArrowDown" ? (index + 1) % items.length : (index < 0 ? items.length - 1 : (index - 1 + items.length) % items.length);
+      if (items[next]) { items[next].tabIndex = -1; items[next].focus(); }
+    } else if (event.key === "Tab") {
+      setMenu(null);
+    } else if (event.key === "Escape" || (child && event.key === "ArrowLeft")) {
+      event.preventDefault(); event.stopPropagation();
+      if (child) { setSub(null); subTrigger.current?.focus(); } else setMenu(null);
+    } else if (current && ["Enter", " ", "ArrowRight"].includes(event.key)) {
+      if (event.key === "ArrowRight" && current.getAttribute("aria-haspopup") !== "menu") return;
+      event.preventDefault(); event.stopPropagation();
+      focusSub.current = current.getAttribute("aria-haspopup") === "menu";
+      current.click();
+    }
+  };
   const [menuPos, setMenuPos] = useState<Placement | null>(null);
+  useLayoutEffect(() => {
+    if (menuPos) menuRef.current?.focus({ preventScroll: true });
+  }, [menuPos]);
   const [shareTarget, setShareTarget] = useState<ShareTarget | null>(null);
   // Which way the fold toggle points: false → "collapse all", true → "expand all".
-  const [treeCollapsed, setTreeCollapsed] = useState(false);
+  // Folders start closed (`openByDefault={false}` on the Tree), so the toggle
+  // starts out offering "expand". Kept in step with the real tree on every
+  // click and fold, so it never takes a dead click to get in sync.
+  const [treeCollapsed, setTreeCollapsed] = useState(true);
+  const anyFolderOpen = () =>
+    treeRef.current?.visibleNodes.some((n) => n.isInternal && n.isOpen) ?? false;
   // The sort popover under the toolbar's sort button.
   const [sortOpen, setSortOpen] = useState(false);
   // True while an OS drag hovers the tree, for the drop-target highlight.
@@ -286,6 +430,11 @@ export function FileTree() {
   // that rate was pure allocation churn on the main thread — the same thread
   // the sidebar's clicks are queued on.
   const localNotePaths = useMemo(() => titles.map((t) => t.path), [titles]);
+  const removingAccess = useStore((s) => s.syncProgress?.phase === "removing");
+  // The ONE switch between the two sidebar looks (see `rowSyncMark`): wave
+  // counters while a run is moving — the same condition under which the corner
+  // pill reads "Syncing N/M" — and a column of green dots otherwise.
+  const runActive = useStore((s) => isBulkPhase(s.syncProgress?.phase));
   const syncIndex = useMemo<TreeSyncIndex | null>(() => {
     const waveKey = syncEnabled ? vaultPath : null;
     if (lastWaveKeyRef.current !== waveKey) {
@@ -293,14 +442,46 @@ export function FileTree() {
       lastWaveKeyRef.current = waveKey;
     }
     if (!syncEnabled) return null;
+    // Removing a revoked copy is not an upload completing. The header owns
+    // cleanup progress; discard the old wave so removal cannot advance it.
+    if (removingAccess) {
+      wavesRef.current.reset();
+      return null;
+    }
+    // No server contact yet this session ⇒ no marks (see `sidebarMarksVisible`).
+    // The wave tracker is left alone so the counters resume where they were
+    // once the channel comes back, rather than restarting at "0/N".
+    if (!sidebarMarksVisible(syncStatus)) return null;
     const index = buildTreeSyncIndex({
       docIdByPath,
       docSyncState,
       localNotePaths,
+      fileSyncState,
+      // Unreported mapped notes read as synced even before `ready`: the
+      // least noisy of the two honest pre-`ready` looks, and the post-`ready`
+      // rule anyway (see `TreeSyncInput.serverSettled`).
+      serverSettled: true,
+      // Failures are the Health page's; the sidebar never shows an error.
+      failuresAsSynced: true,
     });
-    wavesRef.current.apply(index);
+    // A wave belongs to one run. With none moving there is no counter to draw,
+    // and forgetting it here is what stops a finished run's leftovers from
+    // pinning "0/14" on a folder until the next one.
+    if (runActive) wavesRef.current.apply(index);
+    else wavesRef.current.reset();
+    index.runActive = runActive;
     return index;
-  }, [syncEnabled, docIdByPath, docSyncState, localNotePaths, vaultPath]);
+  }, [
+    syncEnabled,
+    runActive,
+    removingAccess,
+    syncStatus,
+    docIdByPath,
+    docSyncState,
+    fileSyncState,
+    localNotePaths,
+    vaultPath,
+  ]);
 
   // ---- Row-order stability while something is syncing ------------------
   //
@@ -316,8 +497,9 @@ export function FileTree() {
   // and the true order is restored the moment both clear. Only "recent" needs
   // it; "name" has no live sort key.
   const [pointerInTree, setPointerInTree] = useState(false);
-  const syncBusy = useStore((s) => isBulkPhase(s.syncProgress?.phase));
-  const orderPinned = treeSort === "recent" && (pointerInTree || syncBusy);
+  const syncBusy = runActive;
+  const anyRecent = treeSort === "recent" || Object.values(folderSorts).includes("recent");
+  const orderPinned = anyRecent && (pointerInTree || syncBusy);
   const pinnedMtimes = useRef(new Map<string, number>());
   // Safety net for a pin that never got its `pointerleave` — the window losing
   // focus with the cursor still over the tree (cmd-tab, a dialog stealing it).
@@ -331,13 +513,33 @@ export function FileTree() {
   // Resolve lock rows (server resource ids) to tree paths for the badges.
   const lockByPath = useMemo(
     () =>
-      syncEnabled ? lockScopesByPath(tree, locks, session?.user.id) : new Map(),
-    [tree, locks, syncEnabled, session?.user.id],
+      syncEnabled
+        ? lockScopesByPath(tree, locks, session?.user.id, lifts)
+        : new Map<string, LockScope>(),
+    [tree, locks, lifts, syncEnabled, session?.user.id],
   );
 
-  // Owners/admins can lock and unlock straight from the row menu.
+  /**
+   * True when a path's padlock comes ONLY from the whole-vault Read-only
+   * posture — there is no lock row on the item to unlock.
+   *
+   * Unlock speaks to an item's own row, so on these rows it has nothing to act
+   * on. The vault posture is changed in Members and access, not here.
+   */
+  const vaultLockedOnly = (path: string) => lockByPath.get(path) === "vault";
+
+  // Owners/admins can remove a legacy item lock straight from the row menu.
+  // Creating one is retired from the UI: per-item team locks conflict with the
+  // per-person access model, so only Unlock remains for vaults that have them.
   const myRole = members.find((m) => m.userId === session?.user.id)?.role;
   const canManage = myRole === "owner" || myRole === "admin";
+  // Creator-only delete: a plain member may delete only what they created
+  // (`lib/sync/deletePolicy.ts`). Read straight from the registry's authorship
+  // ids at render time, so no request; the server stays the authority.
+  const canDeletePath = (path: string, isDir: boolean) =>
+    !syncEnabled ||
+    canDeleteItem(myRole, () => syncManager.registry.isAuthoredByMe(path, isDir));
+
 
   /** Resolve a path (+ kind) to a server share resource, if the vault is synced. */
   function shareTargetForPath(
@@ -372,14 +574,35 @@ export function FileTree() {
     const level = tree?.children ?? [];
     if (!orderPinned) {
       pinnedMtimes.current.clear();
-      return applyOrder(sortTree(level, treeSort), "", itemOrder);
+      return applyOrder(sortTree(level, treeSort, folderSorts), "", itemOrder);
     }
     return applyOrder(
-      sortTree(pinModified(level, pinnedMtimes.current), treeSort),
+      sortTree(pinModified(level, pinnedMtimes.current), treeSort, folderSorts),
       "",
       itemOrder,
     );
-  }, [tree, itemOrder, treeSort, orderPinned]);
+  }, [tree, itemOrder, treeSort, folderSorts, orderPinned]);
+
+  // Assign each sibling group as a unit. Identity hashing keeps colours stable,
+  // while the group pass prevents adjacent rows from landing on the same small
+  // patch of colour. Nested folders restart the adjacency window because their
+  // children are a separate visual list. FOLDERS ONLY: files stay neutral
+  // unless someone gives one a colour by hand, so the colour marks the
+  // structure instead of turning every row into confetti.
+  const automaticColors = useMemo(() => {
+    if (!automaticItemColors) return {};
+    const owner = session?.user.id ?? "local";
+    const vaultIdentity = session?.activeOrganizationId ?? vault?.path ?? "vault";
+    return automaticTreeColors(owner, vaultIdentity, data, docIdByPath, itemColors);
+  }, [
+    automaticItemColors,
+    data,
+    docIdByPath,
+    itemColors,
+    session?.activeOrganizationId,
+    session?.user.id,
+    vault?.path,
+  ]);
 
   // Flatten the (arranged) tree so bulk actions can resolve any path — even a
   // collapsed one — to its node, and so "Select all" knows every path.
@@ -406,16 +629,22 @@ export function FileTree() {
     if (node?.isDir && node.childrenLoaded !== true) {
       void useStore.getState().loadChildren(id);
     }
+    // Arborist applies the fold after this callback; read it next frame.
+    requestAnimationFrame(() => setTreeCollapsed(!anyFolderOpen()));
+    // Redesign: the folder's children fade in as they appear (redesign.css).
+    fadeInChildren(id);
   };
 
-  function toggleSelect(path: string) {
+  // Stable: it goes into the row context (`rowShared`), whose identity must
+  // only change when a row-visible value does.
+  const toggleSelect = useCallback((path: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
       return next;
     });
-  }
+  }, []);
 
   function toggleSelectAll() {
     setSelected(allSelected ? new Set() : new Set(nodeByPath.keys()));
@@ -433,6 +662,12 @@ export function FileTree() {
     setConfirmDelete(false);
   }, [selected]);
 
+  // Every pick must be deletable by this user: a mixed selection would leave
+  // some items behind with a refusal, so the whole button is disabled instead.
+  const bulkDeleteAllowed = [...selected].every((p) =>
+    canDeletePath(p, !!nodeByPath.get(p)?.isDir),
+  );
+
   async function bulkDelete() {
     const paths = [...selected];
     const store = useStore.getState();
@@ -447,15 +682,28 @@ export function FileTree() {
       epoch: store.vault?.epoch,
       deleteDisk: (p, epoch) => ipc.deletePath(p, epoch),
       unregister: (p) => syncManager.registry.deletePath(p),
+      // Taken only above the bulk threshold (see `mutatePaths`): 30 selected
+      // notes become ONE request instead of 30, each of which used to re-resolve
+      // the permission algebra and broadcast a `registry-changed` that every
+      // teammate's app re-pulled the whole vault on. Folders stay on their own
+      // single cascading delete, inside `registry.deletePaths`.
+      unregisterMany: async (ps) =>
+        (await syncManager.registry.deletePaths(ps)).map((o) => ({
+          path: o.path,
+          ok: o.status === "deleted",
+          reason: o.reason,
+        })),
       onProgress: (done, total) => setBulkProgress({ done, total }),
     });
     // A refused delete (offline, or no permission on the server) leaves the item
     // in place everywhere — silence here is what used to read as "it came back".
-    if (failed.length > 0) {
+    if (failed.length > 0 && failed.every((f) => isNotCreatorReason(f.reason))) {
+      toast(NOT_CREATOR_MESSAGE, "error");
+    } else if (failed.length > 0) {
       toast(
         failed.length === 1
-          ? `Couldn't delete "${failed[0].path}" — ${failed[0].reason}`
-          : `Couldn't delete ${failed.length} items — ${failed[0].reason}`,
+          ? `Couldn't delete "${failed[0].path}": ${failed[0].reason}`
+          : `Couldn't delete ${failed.length} items: ${failed[0].reason}`,
         "error",
       );
     }
@@ -476,23 +724,16 @@ export function FileTree() {
     exitSelect();
   }
 
-  async function bulkLock() {
-    const store = useStore.getState();
-    for (const p of selected) {
-      const n = nodeByPath.get(p);
-      if (!n) continue;
-      const target = shareTargetForPath(p, n.isDir, n.name);
-      if (!target) continue;
-      // Skip anything already locked directly (avoids a duplicate share row).
-      if (locks.some((l) => shareResourceId(l) === target.resourceId)) continue;
-      try {
-        await store.createLock(target.resourceType, target.resourceId, null);
-      } catch (e) {
-        console.error("bulk lock failed", p, e);
-      }
-    }
-    exitSelect();
-  }
+  /**
+   * Whether the selection bar's Unlock has anything to do: at least one
+   * selected row carries a legacy lock row of its own. Locks can no longer be
+   * created from the UI, so the button only exists to clear old ones.
+   */
+  const bulkUnlockUseful = [...selected].some((p) => {
+    const n = nodeByPath.get(p);
+    const target = n ? shareTargetForPath(p, n.isDir, n.name) : null;
+    return !!target && locks.some((l) => shareResourceId(l) === target.resourceId);
+  });
 
   async function bulkUnlock() {
     const store = useStore.getState();
@@ -521,6 +762,25 @@ export function FileTree() {
     return () => window.removeEventListener("click", close);
   }, []);
 
+  /**
+   * Open the context menu scoped to the vault ROOT, from a right-click on the
+   * tree's blank space.
+   *
+   * A null node is the whole of what makes it a root menu: every node-specific
+   * item is already gated on `menu.node`, and `menuDir` already falls back to
+   * `""` (the vault root) without one — which also means the frozen-root
+   * refusal (`menuCreateBlocked`) applies here for free.
+   *
+   * The sort popover closes first for the same reason its own opener closes
+   * this menu: the two are separate floating layers and only one should be up.
+   * Re-opening while a menu is already showing is just another `setMenu`, so
+   * the placement effect re-measures at the new cursor.
+   */
+  function openRootMenu(x: number, y: number) {
+    setSortOpen(false);
+    setMenu({ x, y, node: null });
+  }
+
   // Measure the menu, then decide where it actually goes. This has to be a
   // LAYOUT effect: it runs (and the re-render it schedules runs) before the
   // browser paints, so the menu is never visibly drawn at the unplaced position.
@@ -548,7 +808,7 @@ export function FileTree() {
   }
 
   /**
-   * After an import, register the new markdown notes on the server under their
+   * After an import, register the new notes on the server under their
    * LOCAL index doc_ids (via the same id the editor's bridge uses), so sync
    * doesn't fork a second identity for them. Without this an imported note lives
    * only on disk until the seed race, which the background feed could lose.
@@ -560,7 +820,10 @@ export function FileTree() {
     const under = (p: string) =>
       roots.some((r) => p === r || p.startsWith(`${r}/`));
     for (const t of useStore.getState().titles) {
-      if (!t.path.toLowerCase().endsWith(".md") || !under(t.path)) continue;
+      // The whole CRDT note family (`formats.ts NOTE_EXTS`), not just `.md`:
+      // `flattenTree` registers all seven, so an imported `.txt` left out here
+      // would wait for the seed race to give it a server identity.
+      if (!isNoteExt(t.path) || !under(t.path)) continue;
       try {
         await syncManager.registry.registerNote(t.path, t.title, t.id);
       } catch (e) {
@@ -643,6 +906,11 @@ export function FileTree() {
         // outright — including the `drop`, whose `paths` are empty anyway, so
         // reacting could only ever mean flashing the frame or a stray import.
         if (rowDrag.current) return;
+        // A page on top takes this drop itself (Skills: a .zip or .skill).
+        if (fileDropsClaimed()) {
+          setDropActive(false);
+          return;
+        }
         const p = event.payload;
         if (p.type === "enter" || p.type === "over") {
           setDropActive(insideTree(p.position.x, p.position.y) !== null);
@@ -656,14 +924,26 @@ export function FileTree() {
           // live) → attach the files INTO that note's content rather than
           // importing them as sidebar entries.
           if (!pt && activeNoteEditable()) {
-            try {
-              const embeds: string[] = [];
-              for (const path of p.paths)
+            // Per file, not per drop: one refusal (an oversize video — see
+            // `attachments.ts saveAttachment`, which raises its own toast) must
+            // not throw away the four files dropped alongside it.
+            const embeds: string[] = [];
+            let failed = 0;
+            for (const path of p.paths) {
+              try {
                 embeds.push(await embedDroppedFile(path));
+              } catch (e) {
+                failed++;
+                console.error("attach (drop) failed", path, e);
+              }
+            }
+            if (embeds.length > 0) {
               insertIntoActiveNote(embeds.join("\n"));
               await refreshAll();
-            } catch (e) {
-              console.error("attach (drop) failed", e);
+            }
+            // The size gate speaks for itself; only say something when the
+            // failure had no voice of its own.
+            if (failed > 0 && embeds.length === 0) {
               flashStatus("Couldn't attach file", "error");
             }
             return;
@@ -681,11 +961,11 @@ export function FileTree() {
             await refreshAll();
             await registerImported(summary);
             announceImport(summary);
-            // A single image/PDF dropped on the empty main area → preview it.
+            // A single openable file dropped on the empty main area → open it.
             if (
               !pt &&
               summary.imported.length === 1 &&
-              previewKind(summary.imported[0]) != null
+              isOpenable(summary.imported[0])
             ) {
               await useStore.getState().openNoteByPath(summary.imported[0]);
             }
@@ -763,6 +1043,28 @@ export function FileTree() {
     }
   }
 
+  /**
+   * Open the vault's own folder — the root menu's counterpart to `revealNode`,
+   * and the same thing the sidebar header's button does.
+   *
+   * `openInFileManager`, deliberately not `revealInFileManager`: opening the
+   * vault means stepping INSIDE the folder to see the notes, where revealing
+   * would select it in its parent. The two helpers have mirrored fallback
+   * orders for that reason (see `lib/ipc.ts`), and this one's fallback is what
+   * covers a vault living on an external volume.
+   */
+  async function openVaultRoot() {
+    setMenu(null);
+    const root = useStore.getState().vault?.path;
+    if (!root) return;
+    try {
+      await ipc.openInFileManager(root);
+    } catch (e) {
+      console.error("open vault failed", e);
+      toast("Couldn't open that in the file manager", "error");
+    }
+  }
+
   /** Export a node: a folder → chosen destination dir; a note → Save dialog. */
   async function exportNode(node: NodeApi<TreeNode>) {
     setMenu(null);
@@ -793,12 +1095,11 @@ export function FileTree() {
       return;
     }
     if (!node.data.isDir) {
-      // Notes/pages render in the editor; images/PDFs open in the file preview.
-      // Any other binary is listed but not opened (nothing can render it).
-      if (
-        isOpenablePath(node.data.path) ||
-        previewKind(node.data.path) != null
-      ) {
+      // One gate, the registry's: notes/pages render in the editor, everything
+      // else opens the viewer its format names — at worst the file card. A type
+      // the sidebar surfaces but nothing opened used to be a DEAD CLICK, which
+      // is exactly how `.txt`, `.markdown`, `.mdx` and `.canvas` behaved.
+      if (isOpenable(node.data.path)) {
         void useStore.getState().openNoteByPath(node.data.path);
       }
     }
@@ -868,7 +1169,7 @@ export function FileTree() {
     // Reordering things already at the root is fine — the shape doesn't change.
     if (destDir === "" && rootFrozen && dragIds.some((p) => p.includes("/"))) {
       toast(
-        "This vault's root is frozen — drop this inside a folder.",
+        "This vault's root is frozen. Drop this inside a folder.",
         "error",
       );
       return;
@@ -1084,10 +1385,11 @@ export function FileTree() {
     };
   }
 
-  /** Arm a press. It only becomes a drag once the pointer actually travels. */
-  function beginProbe(path: string, x: number, y: number) {
+  /** Arm a press. It only becomes a drag once the pointer actually travels.
+   *  Stable (ref write only) so the row context it rides in stays put. */
+  const beginProbe = useCallback((path: string, x: number, y: number) => {
     probe.current = { path, x, y };
-  }
+  }, []);
 
   // One window-level listener pair for the whole tree, live only while a press
   // is armed or a drag is running. Window scope because the pointer routinely
@@ -1178,6 +1480,95 @@ export function FileTree() {
   }, [data, nodeByPath]);
 
   /**
+   * "Show me this path" — the one reveal mechanism (store `requestReveal`).
+   * Expand every folder above it, scroll it into view, optionally open its
+   * inline rename box, and pulse the row once. Lives here because the arborist
+   * handle does, and lazily-listed children must be loaded in ancestor order
+   * before arborist has the row at all.
+   *
+   * Never `tree.select(path)`: arborist selection is unused (the `<Tree>` takes
+   * no `selection` prop) and the row highlight comes from
+   * `RowShared.selectedPath`.
+   */
+  const revealRequest = useStore((s) => s.revealRequest);
+  useEffect(() => {
+    if (!revealRequest) return;
+    const { path, edit } = revealRequest;
+    let cancelled = false;
+    void (async () => {
+      // Ancestor order, because `setChildrenAt` can only place a listing under
+      // a folder node that already exists. Folders already listed are skipped —
+      // the same `childrenLoaded` guard `onToggle` uses. Without it every open
+      // re-listed every ancestor and committed a fresh `tree` per level, and
+      // each of those re-sorted and re-rendered the whole sidebar mid-click.
+      for (const dir of ancestorPaths(path)) {
+        if (cancelled) return;
+        const root = useStore.getState().tree;
+        if (root && nodeAt(root, dir)?.childrenLoaded === true) continue;
+        try {
+          await useStore.getState().loadChildren(dir);
+        } catch {
+          // An unreadable folder just leaves the reveal short.
+        }
+      }
+      if (cancelled) return;
+      // rAF retry: a refresh only SCHEDULES the re-render, so the row may not be
+      // in arborist's data yet. 30 frames (~500ms) is the budget the old
+      // `beginRename` used; the folder listings are already awaited above, so it
+      // only has to cover React's render.
+      //
+      // The gate is the STORE tree, not `tree.get(path)`: arborist's `get` only
+      // knows VISIBLE rows, so a note inside a collapsed folder is "missing" until
+      // that folder opens — gating on it meant a reveal into a closed folder gave
+      // up every time. `openParents`/`scrollTo` search the whole tree, and
+      // `scrollTo` waits for the row to become visible before scrolling to it.
+      const land = (tries = 0) => {
+        if (cancelled) return;
+        const tree = treeRef.current;
+        const known = treeHasPath(useStore.getState().tree, path);
+        if (tree && known) {
+          const t = tree; // narrowed copy for the closure below
+          // Was the row already on screen before we touched anything? Then the
+          // user is looking at it (they probably clicked it), the selection
+          // highlight is the whole signal, and a pulse would only make the row
+          // it was just clicked on blink. `idToIndex` covers rows whose parents
+          // are open; the start/stop indices are react-window's viewport.
+          const idx = t.idToIndex[path];
+          const wasOnScreen =
+            idx != null && idx >= t.visibleStartIndex && idx <= t.visibleStopIndex;
+          t.openParents(path);
+          // Let the expansion commit and its rows start their `top` glide before
+          // the list scrolls, so the camera and the layout move on one clock
+          // rather than the scroll jumping into a half-settled list. "smart"
+          // leaves an already-visible row alone and otherwise scrolls the least
+          // distance that brings it into view.
+          requestAnimationFrame(() => {
+            if (cancelled) return;
+            void t.scrollTo(path, "smart")?.then(() => {
+              if (cancelled) return;
+              // Only a visible row can be edited, so this waits for the scroll.
+              if (edit) void t.edit(path);
+              if (wasOnScreen) return;
+              useStore.getState().setRevealedPath(path);
+              window.setTimeout(() => {
+                if (useStore.getState().revealedPath === path) {
+                  useStore.getState().setRevealedPath(null);
+                }
+              }, REVEAL_PULSE_MS);
+            });
+          });
+          return;
+        }
+        if (tries < 30) requestAnimationFrame(() => land(tries + 1));
+      };
+      land();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [revealRequest]);
+
+  /**
    * Refuse a create/import at the vault root when the root is frozen.
    *
    * Client-side first, purely so the user gets a sentence instead of a failed
@@ -1187,42 +1578,10 @@ export function FileTree() {
   function rootBlocked(dir: string): boolean {
     if (dir !== "" || !rootFrozen) return false;
     toast(
-      "This vault's root is frozen — create this inside a folder instead.",
+      "This vault's root is frozen. Create this inside a folder instead.",
       "error",
     );
     return true;
-  }
-
-  async function createUniqueNote(dir: string) {
-    if (rootBlocked(dir)) return;
-    let name = "Untitled";
-    for (let i = 0; i < 50; i++) {
-      const candidate = i === 0 ? name : `${name} ${i}`;
-      try {
-        const path = await ipc.createNote(dir, candidate);
-        await refreshAll();
-        await useStore.getState().openNoteByPath(path);
-        return;
-      } catch {
-        // name taken → try next
-      }
-    }
-  }
-
-  // Put a freshly created node straight into rename mode — same instant-rename
-  // affordance a new note gets by opening in the editor. refreshAll() only
-  // schedules the tree re-render, so poll a few frames until react-arborist has
-  // the new row in its store, then reveal + select + edit it.
-  function beginRename(path: string, tries = 0) {
-    const tree = treeRef.current;
-    if (tree?.get(path)) {
-      tree.openParents(path);
-      tree.select(path);
-      void tree.scrollTo(path);
-      void tree.edit(path);
-      return;
-    }
-    if (tries < 30) requestAnimationFrame(() => beginRename(path, tries + 1));
   }
 
   async function createUniqueFolder(dir: string) {
@@ -1240,7 +1599,10 @@ export function FileTree() {
           console.warn("[sync] registerFolder failed", path, e);
         }
         await refreshAll();
-        beginRename(path);
+        // Straight into rename mode, through the same reveal path a new note
+        // takes (the effect above waits out both the folder listings and
+        // arborist's render).
+        useStore.getState().requestReveal(path, { edit: true });
         return;
       } catch {
         // taken → next
@@ -1258,9 +1620,11 @@ export function FileTree() {
       deleteDisk: (p, epoch) => ipc.deletePath(p, epoch),
       unregister: (p) => syncManager.registry.deletePath(p),
     });
-    if (failed.length > 0) {
+    if (failed.length > 0 && isNotCreatorReason(failed[0].reason)) {
+      toast(NOT_CREATOR_MESSAGE, "error");
+    } else if (failed.length > 0) {
       toast(
-        `Couldn't delete "${failed[0].path}" — ${failed[0].reason}`,
+        `Couldn't delete "${failed[0].path}": ${failed[0].reason}`,
         "error",
       );
     }
@@ -1284,23 +1648,49 @@ export function FileTree() {
     : "";
   // Create/import from this menu would land at a frozen root.
   const menuCreateBlocked = menuDir === "" && rootFrozen;
+  const navigationGroups: ("dashboard" | "pin" | "home")[] = ["dashboard"];
+  if (menu?.node && (menu.node.data.isDir || isNoteExt(menu.node.data.path))) {
+    navigationGroups.push("pin");
+    if (!menu.node.data.isDir) navigationGroups.push("home");
+  }
+  const navigationActions = (kind: "dashboard" | "pin" | "home"): { label: string; run: () => void; checked?: boolean }[] => {
+    if (kind === "dashboard") return [
+      { label: "New dashboard…", run: () => requestNewDashboard() },
+      { label: "Add dashboard link…", run: () => requestNewDashboard("link") },
+    ];
+    if (!menu?.node) return [];
+    const { path, isDir } = menu.node.data;
+    const state = useStore.getState();
+    const docId = state.titles.find((note) => note.path === path)?.id;
+    const orgId = syncEnabled ? session?.activeOrganizationId : null;
+    const appearance = orgId ? state.vaultAppearance[orgId] : undefined;
+    const fail = (error: unknown) => toast(error instanceof Error ? error.message : String(error), "error");
+    if (kind === "pin") {
+      const key = isDir ? pinKey({ kind: "folder", path }) : docId ? pinKey({ kind: "note", docId }) : null;
+      const personal = key && state.personalPins.some((pin) => pinKey(pin) === key);
+      const shared = key && appearance?.pinnedItems?.some((pin) => pinKey(pin) === key);
+      return [
+        { label: "For me", checked: !!personal, run: () => void state.togglePin(path, isDir).catch(fail) },
+        ...(canManage && orgId ? [{ label: "For everyone", checked: !!shared, run: () => void state.togglePin(path, isDir, "vault").catch(fail) }] : []),
+      ];
+    }
+    const personalHome = !!docId && state.personalHomeDocId === docId;
+    const sharedHome = !!docId && appearance?.homeDocId === docId;
+    return [
+      { label: personalHome ? appearance?.homeDocId ? "Use vault Home instead" : "Unset my Home" : "Set as my home", run: () => void state.setHome(personalHome ? null : path, "personal").catch(fail) },
+      ...(canManage && orgId ? [{ label: sharedHome ? "Unset vault Home for everyone" : "Set as vault home", run: () => void state.setHome(sharedHome ? null : path, "vault").catch(fail) }] : []),
+    ];
+  };
 
-  // The lock applied DIRECTLY to the menu's node (not inherited), so the menu
-  // can offer Unlock with the right share id.
+  // The legacy lock applied DIRECTLY to the menu's node (not inherited), so the
+  // menu can offer Unlock with the right share id. There is no Lock entry: new
+  // per-item team locks are retired from the UI.
   const menuTarget = menu?.node ? shareTargetFor(menu.node) : null;
   const menuLock = menuTarget
     ? (locks.find((l) => shareResourceId(l) === menuTarget.resourceId) ?? null)
     : null;
-
-  async function lockFromMenu(target: ShareTarget) {
-    try {
-      await useStore
-        .getState()
-        .createLock(target.resourceType, target.resourceId, null);
-    } catch (e) {
-      console.error("lock failed", e);
-    }
-  }
+  // The padlock on this row comes from the vault posture and nothing else.
+  const menuVaultLockedOnly = !!menu?.node && vaultLockedOnly(menu.node.data.path);
 
   async function unlockFromMenu(shareId: string) {
     try {
@@ -1309,6 +1699,51 @@ export function FileTree() {
       console.error("unlock failed", e);
     }
   }
+
+  const onRowMenu = useCallback(
+    (x: number, y: number, node: NodeApi<TreeNode>, flipY?: number) =>
+      setMenu({ x, y, flipY, node }),
+    [],
+  );
+  // Context is the ONLY channel to the rows (arborist memoizes its row
+  // container), so a fresh object literal here re-rendered all 6,000 of them on
+  // every FileTree render — and FileTree renders on every note open, because it
+  // subscribes to `openNote`. Memoized on the row-visible values only.
+  // The visible Home shortcut owns the active highlight for its page.
+  const selectedPath = homeHighlighted ? null : openNote?.path ?? null;
+  const dragPath = drag?.path ?? null;
+  const rowShared = useMemo<RowShared>(
+    () => ({
+      selectedPath,
+      lockByPath,
+      syncIndex,
+      presenceByDoc,
+      itemColors,
+      automaticColors,
+      onMenu: onRowMenu,
+      selectMode,
+      selected,
+      onToggleCheck: toggleSelect,
+      onDragProbe: beginProbe,
+      dragPath,
+      dropInto,
+    }),
+    [
+      selectedPath,
+      lockByPath,
+      syncIndex,
+      presenceByDoc,
+      itemColors,
+      automaticColors,
+      onRowMenu,
+      selectMode,
+      selected,
+      toggleSelect,
+      beginProbe,
+      dragPath,
+      dropInto,
+    ],
+  );
 
   return (
     // `row-dragging` is added/removed imperatively by the drag listener above,
@@ -1321,6 +1756,21 @@ export function FileTree() {
       // toolbar, must not thaw the order and re-sort mid-aim.
       onPointerEnter={() => setPointerInTree(true)}
       onPointerLeave={() => setPointerInTree(false)}
+      // Right-click on blank space gets the vault-root menu. On the CONTAINER,
+      // not the scroll area: with an empty vault there is no `<Tree>` at all,
+      // only `.filetree-empty`, and that is exactly the case where "New note"
+      // needs to be reachable.
+      //
+      // Rows also `stopPropagation` in their own `onContextMenu`, so this can
+      // never double-fire for one — but that coupling is implicit, so
+      // `isBlankTreeTarget` re-states the rule in a form that survives the
+      // stopPropagation call being removed. `contextmenu` is not `click`, so
+      // the window-level dismiss above does not fire alongside it.
+      onContextMenu={(e) => {
+        if (!isBlankTreeTarget(e.target as Element | null)) return;
+        e.preventDefault();
+        openRootMenu(e.clientX, e.clientY);
+      }}
     >
       <div className="filetree-head">
         <span className="section-label">Notes</span>
@@ -1334,7 +1784,7 @@ export function FileTree() {
             title={rootFrozen ? ROOT_FROZEN_HINT : "New note"}
             aria-label="New note"
             aria-disabled={rootFrozen}
-            onClick={() => createUniqueNote("")}
+            onClick={() => void useStore.getState().createNoteIn("")}
           >
             {ICON_NEW_NOTE}
           </button>
@@ -1359,9 +1809,13 @@ export function FileTree() {
               treeCollapsed ? "Expand all folders" : "Collapse all folders"
             }
             onClick={() => {
-              if (treeCollapsed) treeRef.current?.openAll();
-              else treeRef.current?.closeAll();
-              setTreeCollapsed(!treeCollapsed);
+              // Decide from the tree, not from our flag: if anything is open,
+              // collapse; otherwise expand. A flag that drifted from the tree
+              // is what made the first click do nothing.
+              const open = anyFolderOpen();
+              if (open) treeRef.current?.closeAll();
+              else treeRef.current?.openAll();
+              setTreeCollapsed(open);
             }}
           >
             <span className="fold-icon fold-collapse" aria-hidden="true">
@@ -1470,42 +1924,34 @@ export function FileTree() {
           <span className="selbar-count">{selected.size} selected</span>
           {selected.size > 0 && (
             <div className="selbar-actions">
-              {canManage && syncEnabled && (
-                <>
-                  {/* One server round trip per selected item, so a lock over a
-                      large selection is a real wait. `replaceLabel` swaps the
-                      padlock for the spinner — an icon button has no room for
-                      both, and a 28px control that grows would push its
-                      neighbours under the cursor mid-click. */}
-                  <AsyncButton
-                    className="selbar-icon"
-                    onClick={bulkLock}
-                    replaceLabel
-                    title="Lock selected"
-                    aria-label="Lock selected"
-                  >
-                    {ICON_LOCK}
-                  </AsyncButton>
-                  <AsyncButton
-                    className="selbar-icon"
-                    onClick={bulkUnlock}
-                    replaceLabel
-                    title="Unlock selected"
-                    aria-label="Unlock selected"
-                  >
-                    {ICON_UNLOCK}
-                  </AsyncButton>
-                </>
+              {canManage && syncEnabled && bulkUnlockUseful && (
+                // One server round trip per selected item, so an unlock over a
+                // large selection is a real wait. `replaceLabel` swaps the
+                // padlock for the spinner — an icon button has no room for
+                // both, and a 28px control that grows would push its
+                // neighbours under the cursor mid-click.
+                <AsyncButton
+                  className="selbar-icon"
+                  onClick={bulkUnlock}
+                  replaceLabel
+                  title="Unlock selected"
+                  aria-label="Unlock selected"
+                >
+                  {ICON_UNLOCK}
+                </AsyncButton>
               )}
               <button
                 className={`selbar-icon danger${confirmDelete ? " armed" : ""}`}
+                disabled={!bulkDeleteAllowed}
                 onClick={() =>
                   confirmDelete ? void bulkDelete() : setConfirmDelete(true)
                 }
                 title={
-                  confirmDelete
-                    ? `Delete ${selected.size}? Click to confirm`
-                    : "Delete selected"
+                  !bulkDeleteAllowed
+                    ? NOT_CREATOR_MESSAGE
+                    : confirmDelete
+                      ? `Delete ${selected.size}? Click to confirm`
+                      : "Delete selected"
                 }
                 aria-label={
                   confirmDelete ? "Confirm delete" : "Delete selected"
@@ -1518,34 +1964,25 @@ export function FileTree() {
         </div>
       ) : null}
       {data.length === 0 ? (
-        <div className="filetree-empty">No notes yet</div>
+        <div className="filetree-empty">
+          {emptyView.state === "nothing-shared" ? (
+            <NothingShared ownerName={emptyView.ownerName} vaultName={emptyView.vaultName} />
+          ) : (
+            "No notes yet"
+          )}
+        </div>
       ) : (
-        <RowSharedContext.Provider
-          value={{
-            selectedPath: openNote?.path ?? null,
-            lockByPath,
-            syncIndex,
-            presenceByDoc,
-            itemColors,
-            onMenu: (x, y, node, flipY) => setMenu({ x, y, flipY, node }),
-            selectMode,
-            selected,
-            onToggleCheck: toggleSelect,
-            onDragProbe: beginProbe,
-            dragPath: drag?.path ?? null,
-            dropInto,
-          }}
-        >
+        <RowSharedContext.Provider value={rowShared}>
           <Tree<TreeNode>
             ref={treeRef}
             className="filetree-scroll"
             data={data}
             idAccessor="id"
             openByDefault={false}
-            width={dim.width}
+            width="100%"
             height={dim.height - 34 - (selectMode ? 36 : 0)}
             indent={14}
-            rowHeight={32}
+            rowHeight={36}
             onToggle={onToggle}
             onActivate={onActivate}
             onRename={onRename}
@@ -1575,8 +2012,10 @@ export function FileTree() {
 
       {menu && (
         <ul
-          className="context-menu"
+          className="context-menu tree-context-menu"
           ref={menuRef}
+          role="menu" tabIndex={-1}
+          onKeyDown={(event) => menuKeys(event)}
           style={
             menuPos
               ? {
@@ -1594,7 +2033,7 @@ export function FileTree() {
           <li
             className={menuCreateBlocked ? "disabled" : undefined}
             title={menuCreateBlocked ? ROOT_FROZEN_HINT : undefined}
-            onClick={() => createUniqueNote(menuDir)}
+            onClick={() => void useStore.getState().createNoteIn(menuDir)}
           >
             New note
           </li>
@@ -1605,6 +2044,17 @@ export function FileTree() {
           >
             New folder
           </li>
+          {navigationGroups.map((kind) => (
+            <li key={kind} role="menuitem" tabIndex={0}
+              className={`menu-sub-row${sub?.kind === kind ? " open" : ""}`}
+              aria-haspopup="menu" aria-expanded={sub?.kind === kind}
+              onMouseEnter={(event) => openSub(kind, event.currentTarget)}
+              onMouseLeave={closeSubSoon}
+              onClick={(event) => { event.stopPropagation(); openSub(kind, event.currentTarget); }}>
+              <span className="menu-sub-label">{kind === "dashboard" ? "Dashboard" : kind === "pin" ? "Pin" : "Home"}</span>
+              <span className="menu-sub-chevron" aria-hidden="true">›</span>
+            </li>
+          ))}
           <li
             className={
               menuCreateBlocked ? "menu-sep-item disabled" : "menu-sep-item"
@@ -1621,6 +2071,13 @@ export function FileTree() {
           >
             Import folder…
           </li>
+          {/* Root menu only, and it sits where a row's reveal item sits, so the
+              "get me to this on disk" action is always in the same place. */}
+          {!menu.node && (
+            <li className="menu-sep-item" onClick={() => void openVaultRoot()}>
+              {ipc.openVaultLabel()}
+            </li>
+          )}
           {menu.node && (
             <li onClick={() => void exportNode(menu.node!)}>Export…</li>
           )}
@@ -1630,25 +2087,36 @@ export function FileTree() {
             </li>
           )}
           {menu.node && <li onClick={() => menu.node!.edit()}>Rename</li>}
-          {/* The same vault-wide sort as the header button. A per-folder sort
-              would be a third arrangement layer fighting the other two, so
-              there is one setting and it is reachable from both places. */}
-          <li className="menu-heading menu-sep-item">Sort notes by</li>
-          {TREE_SORTS.map((s) => (
-            <li
-              key={s.id}
-              role="menuitemradio"
-              aria-checked={treeSort === s.id}
-              className={treeSort === s.id ? "is-on" : undefined}
-              title={s.hint}
-              onClick={() => useStore.getState().setTreeSort(s.id)}
-            >
-              <span className="menu-tick" aria-hidden="true">
-                {treeSort === s.id ? "✓" : ""}
-              </span>
-              {s.label}
-            </li>
-          ))}
+          {/* At the vault root this is the vault-wide sort (the same setting
+              as the header button). Inside a folder it is THAT folder's sort:
+              it replaces the vault-wide one for the folder and everything under
+              it (until a deeper folder sets its own) — the same base layer,
+              scoped, never a third one: a hand-made arrangement still sits on
+              top of it. "Vault default" drops the override. */}
+          <li
+            className={`menu-sub-row menu-sep-item${sub?.kind === "sort" ? " open" : ""}`}
+            aria-haspopup="menu"
+            aria-expanded={sub?.kind === "sort"}
+            title={menuDir === "" ? "How the whole vault is sorted" : "How this folder is sorted"}
+            onMouseEnter={(e) => openSub("sort", e.currentTarget)}
+            onMouseLeave={closeSubSoon}
+            onClick={(e) => {
+              e.stopPropagation();
+              openSub("sort", e.currentTarget);
+            }}
+          >
+            <span className="menu-sub-label">Sort by</span>
+            <span className="menu-sub-value">
+              {menuDir === ""
+                ? TREE_SORTS.find((t) => t.id === treeSort)?.label
+                : folderSorts[menuDir]
+                  ? TREE_SORTS.find((t) => t.id === folderSorts[menuDir])?.label
+                  : "Vault default"}
+            </span>
+            <span className="menu-sub-chevron" aria-hidden="true">
+              ›
+            </span>
+          </li>
           {/* Only offered where there IS an arrangement to drop — this clears
               the hand-made order for one folder so its contents fall back to
               the sort above, and leaves every other folder's alone. */}
@@ -1669,7 +2137,7 @@ export function FileTree() {
               Reset manual order
             </li>
           )}
-          {menu.node && menuTarget && (
+          {SHOW_SHARE_ITEM && menu.node && menuTarget && (
             <li onClick={() => setShareTarget(menuTarget)}>Share…</li>
           )}
           {menu.node &&
@@ -1677,53 +2145,180 @@ export function FileTree() {
             canManage &&
             (menuLock ? (
               <li onClick={() => void unlockFromMenu(menuLock.id)}>Unlock</li>
+            ) : menuVaultLockedOnly ? (
+              // The row shows a padlock but has no row of its own to unlock,
+              // and locking it would change nothing. Shown disabled rather than
+              // hidden, because the padlock is right there and an entry that
+              // simply vanished would read as a bug — this says who decides.
+              <li
+                className="disabled"
+                aria-disabled="true"
+                title="Everyone can only view this vault. Change it in Members and access"
+                onClick={(e) => e.stopPropagation()}
+              >
+                Locked by the vault
+              </li>
+            ) : null)}
+          {menu.node && (() => {
+            // What the row actually shows: a hand-picked colour, else the
+            // automatic one — so the menu and the sidebar never disagree.
+            const path = menu.node!.data.path;
+            const auto = !itemColors[path] && !!automaticColors[path];
+            const currentColor = ITEM_COLORS.find((c) => c.id === (itemColors[path] ?? automaticColors[path]));
+            return (
+              <li
+                className={`menu-sub-row menu-sep-item${sub?.kind === "color" ? " open" : ""}`}
+                aria-haspopup="menu"
+                aria-expanded={sub?.kind === "color"}
+                onMouseEnter={(e) => openSub("color", e.currentTarget)}
+                onMouseLeave={closeSubSoon}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openSub("color", e.currentTarget);
+                }}
+              >
+                <span className="menu-sub-label">Color</span>
+                <span className="menu-sub-value">
+                  {currentColor ? (
+                    <>
+                      {auto && <span className="menu-sub-auto">Auto</span>}
+                      <span
+                        className="swatch"
+                        style={{ backgroundColor: currentColor.fill, boxShadow: `inset 0 0 0 1.5px ${currentColor.value}` }}
+                      />
+                    </>
+                  ) : (
+                    "None"
+                  )}
+                </span>
+                <span className="menu-sub-chevron" aria-hidden="true">
+                  ›
+                </span>
+              </li>
+            );
+          })()}
+          {menu.node &&
+            (canDeletePath(menu.node.data.path, menu.node.data.isDir) ? (
+              <li className="danger" onClick={() => handleDelete(menu.node!)}>
+                Delete
+              </li>
             ) : (
               <li
-                title="Read-only for everyone — changes won't sync"
-                onClick={() => void lockFromMenu(menuTarget)}
+                className="disabled"
+                aria-disabled="true"
+                title={NOT_CREATOR_MESSAGE}
               >
-                Lock for everyone
+                Delete
               </li>
             ))}
-          {menu.node && (
-            <li className="menu-swatches" onClick={(e) => e.stopPropagation()}>
-              <span
-                className="swatch clear"
-                title="Default color"
-                onClick={() => {
-                  useStore.getState().setItemColor(menu.node!.data.path, null);
-                  setMenu(null);
-                }}
-              />
-              {ITEM_COLORS.map((c) => (
-                <span
-                  key={c.id}
-                  className={`swatch${itemColors[menu.node!.data.path] === c.id ? " on" : ""}`}
-                  style={{ backgroundColor: c.value }}
-                  title={c.label}
+        </ul>
+      )}
+
+      {menu && sub && (
+        <ul
+          className="context-menu context-submenu tree-context-menu"
+          ref={subRef}
+          role="menu"
+          onKeyDown={(event) => menuKeys(event, true)}
+          style={subPos ? { left: subPos.left, top: subPos.top } : { visibility: "hidden", left: 0, top: 0 }}
+          onMouseEnter={keepSub}
+          onMouseLeave={closeSubSoon}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {sub.kind === "dashboard" || sub.kind === "pin" || sub.kind === "home" ? (
+            navigationActions(sub.kind).map((action) => <li key={action.label}
+              role={action.checked === undefined ? "menuitem" : "menuitemcheckbox"}
+              aria-checked={action.checked}
+              className={`menu-navigation-option${action.checked ? " is-on" : ""}`}
+              tabIndex={0}
+              onClick={() => { action.run(); setMenu(null); }}>
+              <span>{action.label}</span>
+              {action.checked && <span className="menu-tick" aria-hidden="true">✓</span>}
+            </li>)
+          ) : sub.kind === "sort" ? (
+            <>
+              {menuDir !== "" && (
+                <li
+                  role="menuitemradio"
+                  aria-checked={!folderSorts[menuDir]}
+                  className={!folderSorts[menuDir] ? "is-on" : undefined}
+                  title="Follow the vault-wide sort (header button)"
                   onClick={() => {
-                    useStore
-                      .getState()
-                      .setItemColor(menu.node!.data.path, c.id);
+                    useStore.getState().setFolderSort(menuDir, null);
+                    setMenu(null);
+                  }}
+                >
+                  <span className="menu-tick" aria-hidden="true">
+                    {!folderSorts[menuDir] ? "✓" : ""}
+                  </span>
+                  Vault default
+                </li>
+              )}
+              {TREE_SORTS.map((t) => {
+                const on = menuDir === "" ? treeSort === t.id : folderSorts[menuDir] === t.id;
+                return (
+                  <li
+                    key={t.id}
+                    role="menuitemradio"
+                    aria-checked={on}
+                    className={on ? "is-on" : undefined}
+                    title={t.hint}
+                    onClick={() => {
+                      if (menuDir === "") useStore.getState().setTreeSort(t.id);
+                      else useStore.getState().setFolderSort(menuDir, t.id);
+                      setMenu(null);
+                    }}
+                  >
+                    <span className="menu-tick" aria-hidden="true">
+                      {on ? "✓" : ""}
+                    </span>
+                    {t.label}
+                  </li>
+                );
+              })}
+            </>
+          ) : (
+            menu.node &&
+            (() => {
+              const path = menu.node!.data.path;
+              const hasAuto = !!automaticColors[path];
+              const effective = itemColors[path] ?? automaticColors[path];
+              return (
+              <li className="menu-swatches">
+                <span
+                  className={`swatch clear${effective == null ? " on" : ""}`}
+                  title={hasAuto ? "Reset to automatic" : "No colour"}
+                  onClick={() => {
+                    useStore.getState().setItemColor(path, null);
                     setMenu(null);
                   }}
                 />
-              ))}
-            </li>
-          )}
-          {menu.node && (
-            <li className="danger" onClick={() => handleDelete(menu.node!)}>
-              Delete
-            </li>
+                {ITEM_COLORS.map((c) => (
+                  <span
+                    key={c.id}
+                    className={`swatch${effective === c.id ? " on" : ""}`}
+                    style={{ backgroundColor: c.fill, boxShadow: `inset 0 0 0 1.5px ${c.value}` }}
+                    title={c.label}
+                    onClick={() => {
+                      useStore.getState().setItemColor(path, c.id);
+                      setMenu(null);
+                    }}
+                  />
+                ))}
+              </li>
+              );
+            })()
           )}
         </ul>
       )}
 
       {shareTarget && (
-        <ShareDialog
-          target={shareTarget}
-          onClose={() => setShareTarget(null)}
-        />
+        <Suspense fallback={null}>
+          <ShareDialog
+            target={shareTarget}
+            onClose={() => setShareTarget(null)}
+          />
+        </Suspense>
       )}
     </div>
   );
@@ -1761,6 +2356,8 @@ interface RowShared {
   presenceByDoc: Map<string, VaultPeer[]>;
   /** Item color ids (vault-local preference) — tint the type glyph. */
   itemColors: Record<string, string | undefined>;
+  /** Personal automatic fallbacks, already assigned in sibling order. */
+  automaticColors: Record<string, string | undefined>;
   onMenu: (
     x: number,
     y: number,
@@ -1790,10 +2387,12 @@ function TreeRow(props: NodeRendererProps<TreeNode>) {
     <Node
       {...props}
       selectedPath={shared.selectedPath}
-      lock={shared.lockByPath.get(path) ?? null}
+      lock={effectiveLockForPath(shared.lockByPath, path)}
       syncIndex={shared.syncIndex}
       presenceByDoc={shared.presenceByDoc}
-      color={shared.itemColors[path]}
+      color={
+        shared.itemColors[path] ?? shared.automaticColors[path]
+      }
       onMenu={shared.onMenu}
       selectMode={shared.selectMode}
       checked={shared.selected.has(path)}
@@ -1873,14 +2472,89 @@ const ICON_HTML = (
     <path d="m10 12-2 2.5 2 2.5M14 12l2 2.5-2 2.5" />
   </TreeSvg>
 );
+/* One glyph per format family (see `lib/treeIcons.ts` for the mapping). A
+   vault that holds videos, spreadsheets and archives alongside notes is
+   unreadable when every row is the same page icon — the glyph is how you find
+   the PDF in a folder of thirty files without reading thirty names. */
+const ICON_IMAGE = (
+  <TreeSvg>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <circle cx="9" cy="9" r="1.6" />
+    <path d="m21 15-4.5-4.5L7 20" />
+  </TreeSvg>
+);
+const ICON_PDF = (
+  <TreeSvg>
+    <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+    <path d="M15 2v5h5" />
+    <path d="M8.5 17v-4h1.3a1.3 1.3 0 0 1 0 2.6H8.5M13.5 17v-4h1.2a1.4 1.4 0 0 1 1.4 1.4v1.2a1.4 1.4 0 0 1-1.4 1.4Z" />
+  </TreeSvg>
+);
+const ICON_SHEET = (
+  <TreeSvg>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M3 9h18M3 14.5h18M9 4v16M15 4v16" />
+  </TreeSvg>
+);
+const ICON_DOC = (
+  <TreeSvg>
+    <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+    <path d="M15 2v5h5" />
+    <path d="M8 12h8M8 15.5h8M8 19h5" />
+  </TreeSvg>
+);
+const ICON_SLIDES = (
+  <TreeSvg>
+    <rect x="3" y="4" width="18" height="12" rx="2" />
+    <path d="M12 16v4M8.5 20h7" />
+  </TreeSvg>
+);
+const ICON_MEDIA = (
+  <TreeSvg>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="m10.5 9 4.5 3-4.5 3Z" />
+  </TreeSvg>
+);
+const ICON_ARCHIVE = (
+  <TreeSvg>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M3 9h18" />
+    <path d="M11 4v5M13 9v3M11 12v2.5h2V12" />
+  </TreeSvg>
+);
+const ICON_CODE = (
+  <TreeSvg>
+    <path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16" />
+  </TreeSvg>
+);
 
-/** Note titles hide the .md/.html extension — it's a notes list, not a file manager. */
-function displayName(name: string, isDir: boolean): string {
-  return isDir ? name : name.replace(/\.(md|html?)$/i, "");
+/** `TreeIconKey` → the glyph. The mapping FROM a path lives in `treeIcons.ts`. */
+const TREE_ICONS: Record<TreeIconKey, React.ReactNode> = {
+  file: ICON_FILE,
+  html: ICON_HTML,
+  image: ICON_IMAGE,
+  pdf: ICON_PDF,
+  sheet: ICON_SHEET,
+  doc: ICON_DOC,
+  slides: ICON_SLIDES,
+  media: ICON_MEDIA,
+  archive: ICON_ARCHIVE,
+  code: ICON_CODE,
+};
+
+/** The glyph for a file row. Exported for the Access panel's file rows, so the
+ *  two lists cannot draw the same `.pdf` differently. */
+export function iconForPath(path: string): React.ReactNode {
+  return TREE_ICONS[iconKeyForPath(path)];
 }
 
-function isHtmlPath(path: string): boolean {
-  return /\.html?$/i.test(path);
+/** Is `path` (file or folder) in the store's tree yet? `nodeAt` only walks
+ *  folders, so look the parent up and then check its listing for the entry. */
+function treeHasPath(root: TreeNode | null, path: string): boolean {
+  if (!root) return false;
+  const slash = path.lastIndexOf("/");
+  const dir = slash === -1 ? root : nodeAt(root, path.slice(0, slash));
+  return dir?.children?.some((c) => c.path === path) ?? false;
 }
 
 const ICON_LOCK = (
@@ -1900,7 +2574,10 @@ function descendantDocIds(node: TreeNode, out: string[]): void {
     if (child.isDir) {
       descendantDocIds(child, out);
     } else {
-      const mapping = syncManager.registry.getMapping(child.path);
+      // Case-insensitive: the registry keys a note by the SERVER's spelling of
+      // its path, which on macOS/Windows can differ from the disk spelling this
+      // tree carries (#125). Exact hits still cost one Map.get.
+      const mapping = syncManager.registry.getMappingCi(child.path);
       if (mapping) out.push(mapping.docId);
     }
   }
@@ -1929,7 +2606,9 @@ function peersForNode(
     }
     return rolled;
   }
-  const mapping = syncManager.registry.getMapping(node.data.path);
+  // Same case-insensitive reason as `descendantDocIds`: an exact-only lookup
+  // left a teammate's dot homeless whenever the two spellings disagreed.
+  const mapping = syncManager.registry.getMappingCi(node.data.path);
   return mapping ? (presenceByDoc.get(mapping.docId) ?? []) : [];
 }
 
@@ -1940,7 +2619,10 @@ function peersForNode(
  * Sized and positioned like `.tree-lock` (its neighbour) and built from the same
  * `.sync-dot` element and semantic tone tokens the vault-level `.sync-badge`
  * uses, so "synced" looks the same everywhere in the app. One span, no layout
- * shift while settled, nothing at all when there is nothing to say.
+ * shift while settled. Notes and files (which sync as blobs, not as CRDTs) both
+ * get one; a row with nothing to say — sync off, or a file the mirror has never
+ * seen — still gets the empty slot, so every label ends at the same edge and its
+ * overflow fade lands before the dot column, not on top of it.
  */
 function TreeSyncMark({
   node,
@@ -1950,7 +2632,7 @@ function TreeSyncMark({
   index: TreeSyncIndex;
 }) {
   const mark = rowSyncMark(node.data, index);
-  if (!mark) return null;
+  if (!mark) return <span className="tree-sync" aria-hidden="true" />;
   return (
     <span
       className={`tree-sync ${mark.state}`}
@@ -1971,14 +2653,13 @@ function TreeSyncMark({
 /** One presence face: the teammate's illustrated character ringed in their
  *  colour — the same treatment as the editor's PresenceAvatar, sized for a row. */
 function SidebarAvatar({ peer }: { peer: VaultPeer }) {
-  const svg = useMemo(
-    () => characterSvg(peer.name || peer.userId || "?"),
-    [peer.name, peer.userId],
-  );
   const tone = statusTone(peer.status);
   const live = ringShowsColor(tone);
   return (
-    <span
+    <span className="sm-host">
+    <Face
+      userId={peer.userId}
+      name={peer.name}
       className={`tree-presence-avatar tone-${tone}${live ? "" : " offline"}`}
       style={
         {
@@ -1986,13 +2667,14 @@ function SidebarAvatar({ peer }: { peer: VaultPeer }) {
         } as CSSProperties
       }
       title={peer.name}
-      dangerouslySetInnerHTML={{ __html: svg }}
     />
+    <StatusMoment status={peer.status} size={20} />
+    </span>
   );
 }
 
-/** The overlapping avatar cluster shown at the right edge of a row. */
-function SidebarPresence({ peers }: { peers: VaultPeer[] }) {
+/** The overlapping avatar cluster shown after a row's label, before its badges. */
+export function SidebarPresence({ peers }: { peers: VaultPeer[] }) {
   if (peers.length === 0) return null;
   const shown =
     peers.length > MAX_ROW_AVATARS
@@ -2017,6 +2699,13 @@ function SidebarPresence({ peers }: { peers: VaultPeer[] }) {
     </span>
   );
 }
+
+/** Second click on the same row within this window = rename. Fixed rather than
+ *  the OS double-click interval; see the row's onClick. Very tight on purpose:
+ *  only a snappy, deliberate double-click gets in, while opening a folder and
+ *  closing it again "fast" is a pair of separate clicks that must NOT rename. */
+const RENAME_DOUBLE_CLICK_MS = 180;
+let lastRowClick: { path: string; at: number } | null = null;
 
 function Node({
   node,
@@ -2047,15 +2736,21 @@ function Node({
   // note opening elsewhere in the tree doesn't re-render every other row — this
   // component is instantiated once per visible row.
   const isOpening = useStore((s) => s.openingNotePath === node.data.path);
+  // Same boolean-subscription reason: a one-shot pulse on the row the app just
+  // revealed must not re-render the other 6,000.
+  const isRevealed = useStore((s) => s.revealedPath === node.data.path);
   const colorValue = itemColorValue(color);
   const peers = peersForNode(node, presenceByDoc);
   // Compose arborist's per-level indent with the row's base inset so every
   // glyph on a level shares one left edge (no chevron column to misalign).
-  // 20 = 12 base + 8 compensating the tree's full-bleed negative margin.
+  // 20 = 12 base + 8 compensating the tree's full-bleed negative margin, the
+  // same inset as the Notes label (`.filetree-head`); minus 3 because the 15px
+  // icon sits centred in its 18px box with its own blank margin inside, so the
+  // DRAWN glyph — not its box — starts under the label's first letter.
   const indent = typeof style.paddingLeft === "number" ? style.paddingLeft : 0;
   return (
     <div
-      style={{ ...style, paddingLeft: indent + 20 }}
+      style={{ ...style, paddingLeft: indent + 17 }}
       data-tree-dir={isDir ? node.data.path : parentDir(node.data.path)}
       // Read back by `planDrop`, which hit-tests rows through the DOM: the
       // list is virtualized and scrolled, so the DOM is the only thing that
@@ -2068,7 +2763,7 @@ function Node({
         // Pre-selects the row the instant it's clicked, so the selection doesn't
         // wait on `getNoteMeta` + `registerNote` to come back from the server.
         isOpening ? " opening" : ""
-      }`}
+      }${isRevealed ? " revealed" : ""}`}
       aria-busy={isOpening || undefined}
       onContextMenu={(e) => {
         e.preventDefault();
@@ -2092,14 +2787,25 @@ function Node({
       }}
       onClick={() => {
         if (isDir) node.toggle();
-      }}
-      onDoubleClick={(e) => {
-        // Double-click a row to rename it in place (Finder-style). Stop the
-        // event so a folder's toggle doesn't fight the rename that follows.
-        // Disabled while selecting — a double-click there is just two picks.
-        if (selectMode) return;
-        e.stopPropagation();
-        node.edit();
+        // Double-click a row to rename it in place (Finder-style) — but timed
+        // by us, not by the browser's `dblclick`. That event honours the OS
+        // "double-click speed" setting, which on a slow setting pairs two
+        // clicks more than a second apart, so re-clicking a note you already
+        // had open kept dropping people into rename. Two clicks on the SAME
+        // row inside a fixed short window, nothing else. Disabled while
+        // selecting — a double-click there is just two picks.
+        const now = performance.now();
+        const prev = lastRowClick;
+        lastRowClick = { path: node.data.path, at: now };
+        if (
+          !selectMode &&
+          prev &&
+          prev.path === node.data.path &&
+          now - prev.at < RENAME_DOUBLE_CLICK_MS
+        ) {
+          lastRowClick = null;
+          node.edit();
+        }
       }}
     >
       {selectMode && (
@@ -2118,25 +2824,23 @@ function Node({
       )}
       <span
         className={`tree-glyph${isEmpty ? " is-empty" : ""}${colorValue ? " colored" : ""}`}
-        style={colorValue ? { color: colorValue } : undefined}
+        style={
+          colorValue
+            ? ({ color: colorValue, "--glyph-fill": itemColorFill(color) } as CSSProperties)
+            : undefined
+        }
         aria-hidden="true"
       >
-        {/* The glyph slot is the row's own status light: while a note is being
-            opened it becomes the spinner. Reusing the slot rather than adding one
-            keeps the label from shifting sideways as the state changes. */}
-        {isOpening ? (
-          <Spinner size="xs" tone="accent" />
-        ) : isDir ? (
-          node.isOpen && !isEmpty ? (
-            ICON_FOLDER_OPEN
-          ) : (
-            ICON_FOLDER
-          )
-        ) : isHtmlPath(node.data.path) ? (
-          ICON_HTML
-        ) : (
-          ICON_FILE
-        )}
+        {/* Opening must not replace this glyph: the unmount/remount was visible
+            as a blink, especially now that every glyph may carry a colour. Slow
+            opens hide the (still mounted) icon and centre a spinner in its box. */}
+        <OpeningGlyph opening={isOpening}>
+          {isDir
+            ? node.isOpen && !isEmpty
+              ? ICON_FOLDER_OPEN
+              : ICON_FOLDER
+            : iconForPath(node.data.path)}
+        </OpeningGlyph>
       </span>
       {node.isEditing ? (
         <input
@@ -2163,7 +2867,16 @@ function Node({
           <span className="tree-label">
             {displayName(node.data.name, isDir)}
           </span>
-          {isEmpty && !lock && <span className="tree-hint">empty</span>}
+          {/* Left of the badges, so faces take room from the label and the
+              lock/sync columns stay put on every row. */}
+          <SidebarPresence peers={peers} />
+          {/* The `lock` guard keeps two badges off one row — but a read-only
+              vault padlocks EVERY row, and suppressing the hint everywhere
+              would cost the whole vault a signal to spare a collision that is
+              no longer rare. An item's own lock still wins the space. */}
+          {isEmpty && (!lock || lock === "vault") && (
+            <span className="tree-hint">empty</span>
+          )}
           {lock && (
             <span
               className={`tree-lock ${lock}`}
@@ -2174,7 +2887,6 @@ function Node({
             </span>
           )}
           {syncIndex && <TreeSyncMark node={node} index={syncIndex} />}
-          <SidebarPresence peers={peers} />
           {!selectMode && (
             <button
               className="tree-more"

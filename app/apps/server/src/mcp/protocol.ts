@@ -1,5 +1,9 @@
+import { inc } from "../metrics/sync-metrics.js";
 import { McpToolError, type McpContext } from "./service.js";
 import { TOOLS, TOOLS_BY_NAME } from "./tools.js";
+
+/** Tool calls slower than this are logged by name (see `tools/call`). */
+const SLOW_TOOL_MS = 5000;
 
 /**
  * A minimal, spec-compliant MCP server over JSON-RPC 2.0, transport-agnostic.
@@ -49,19 +53,29 @@ function fail(
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
 }
 
-/** A tool result: text (always) + structuredContent (when the payload is data). */
-function toolResult(data: unknown): Record<string, unknown> {
+/**
+ * A tool result: text (always) + structuredContent (when the payload is data).
+ *
+ * The spec asks a tool that returns structuredContent to also return the same
+ * JSON serialized in a text block, for clients that only read `content`; both
+ * carry identical data. The text is COMPACT JSON: indentation once made MCP
+ * responses most of the server's egress (scripted clients send no
+ * Accept-Encoding, so nothing compresses them) and adds nothing a JSON parser
+ * reads. `JSON.parse(text)` is unchanged.
+ */
+export function toolResult(data: unknown): Record<string, unknown> {
   const structured = Array.isArray(data) ? { results: data } : data;
   return {
-    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(data) }],
     structuredContent: structured,
   };
 }
 
-function toolError(message: string): Record<string, unknown> {
+function toolError(message: string, code?: string): Record<string, unknown> {
   return {
-    content: [{ type: "text", text: message }],
+    content: [{ type: "text", text: code ? `${code}: ${message}` : message }],
     isError: true,
+    ...(code ? { structuredContent: { code, error: message } } : {}),
   };
 }
 
@@ -98,9 +112,10 @@ export async function handleMcpMessage(
       return ok(msg.id, {
         tools: TOOLS.map((t) => ({
           name: t.name,
+          title: t.annotations.title,
           description: t.description,
           inputSchema: t.inputSchema,
-          ...(t.annotations ? { annotations: t.annotations } : {}),
+          annotations: t.annotations,
         })),
       });
 
@@ -111,21 +126,37 @@ export async function handleMcpMessage(
       }
       const tool = TOOLS_BY_NAME.get(params.name);
       if (!tool) {
-        return ok(msg.id, toolError(`Unknown tool: ${params.name}`));
+        // Counted without the name: it is caller-chosen text, not one of ours.
+        inc("mcp.tool.unknown");
+        return ok(msg.id, toolError(`Unknown tool: ${params.name}`, "unknown_tool"));
       }
       const args =
         params.arguments && typeof params.arguments === "object"
           ? (params.arguments as Record<string, unknown>)
           : {};
+      // Outcome counters per tool — names and codes only, never arguments —
+      // so an error rate seen in a client's dashboard can be split into
+      // refusals (by code) and crashes from the `[sync-metrics]` lines.
+      const started = Date.now();
       try {
         const data = await tool.handler(ctx, args);
+        inc(`mcp.tool.${tool.name}.ok`);
         return ok(msg.id, toolResult(data));
       } catch (err) {
         // Expected, user-facing failures (bad args, no access) → isError result.
-        if (err instanceof McpToolError) return ok(msg.id, toolError(err.message));
+        if (err instanceof McpToolError) {
+          inc(`mcp.tool.${tool.name}.refused`);
+          if (err.code) inc(`mcp.tool.${tool.name}.refused.${err.code}`);
+          return ok(msg.id, toolError(err.message, err.code));
+        }
         // Anything else is a bug on our side — log it, don't leak internals.
+        inc(`mcp.tool.${tool.name}.internal`);
         console.error(`[mcp] tool ${params.name} failed:`, err);
         return ok(msg.id, toolError("Internal error running the tool"));
+      } finally {
+        // A slow call names itself (tool and org only, never arguments).
+        const ms = Date.now() - started;
+        if (ms > SLOW_TOOL_MS) console.warn(`[mcp] slow tool=${tool.name} org=${ctx.auth.organizationId} ms=${ms}`);
       }
     }
 

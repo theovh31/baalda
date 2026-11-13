@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
 import { createApp } from "../src/http/app.js";
 import { pool } from "../src/db/pool.js";
 import { resetDb } from "./helpers/db.js";
@@ -7,13 +8,19 @@ import {
   freezeVaultRoot,
   seedFolder,
   seedLock,
+  seedItemPrivate,
   seedMember,
+  seedNote,
   seedOrg,
   seedShare,
   seedUser,
   seedVault,
+  seedVaultGrant,
 } from "./helpers/seed.js";
 import { createMcpToken, listMcpTokens } from "../src/mcp/tokens.js";
+import { listVisibleFolders } from "../src/permissions/vault-docs.js";
+import { effectivePermission } from "../src/permissions/resolver.js";
+import { resetMcpBadTokens } from "../src/http/routes/mcp.js";
 
 /**
  * End-to-end MCP surface: token auth, JSON-RPC dispatch, CRUD tools, and that
@@ -28,6 +35,7 @@ const disconnected = rec.disconnected;
 /** Every `registry-changed` broadcast the MCP routes fire. An MCP write that
  *  doesn't land here is invisible to every running app until it restarts. */
 const registryBroadcasts = rec.registryBroadcasts;
+const aclBroadcasts = rec.aclBroadcasts;
 
 let rpcId = 0;
 async function rpc(token: string | null, method: string, params?: unknown) {
@@ -81,9 +89,107 @@ describe("MCP server", () => {
     await pool.end();
   });
 
+  it("inherits restricted parent access on MCP creates and lists empty folders for named readers", async () => {
+    const owner = await seedUser("owner@restricted.test");
+    const reader = await seedUser("reader@restricted.test");
+    const excluded = await seedUser("excluded@restricted.test");
+    const org = await seedOrg("Restricted", "restricted-mcp");
+    await seedMember(org, owner, "owner");
+    await seedMember(org, reader, "admin");
+    await seedMember(org, excluded, "member");
+    const vault = await seedVault(org);
+    await seedVaultGrant(org, "edit");
+    const parent = await seedFolder(vault, null, "Finance", "Finance", owner);
+    await seedItemPrivate(org, "folder", parent);
+    await seedShare(org, "folder", parent, owner, "edit");
+    await seedShare(org, "folder", parent, reader, "view");
+    const token = await tokenFor(owner, org);
+    const created = await call(token, "create_folder", {
+      vaultId: vault, name: "Confidential", path: "Finance/Confidential",
+    });
+    expect(created.isError).toBe(false);
+    expect(registryBroadcasts).toContainEqual({ vaultId: vault, originId: null });
+    const child = created.data.folderId;
+    // No copied team grant may widen the parent's restriction.
+    expect((await pool.query("SELECT id FROM shares WHERE resource_id = $1", [child])).rows).toEqual([]);
+    expect((await listVisibleFolders(excluded, vault)).map(f => f.id)).not.toContain(child);
+    expect((await listVisibleFolders(reader, vault)).map(f => f.id)).toEqual(expect.arrayContaining([parent, child]));
+    const hiddenFolders = await call(await tokenFor(excluded, org), "list_folders", { vaultId: vault });
+    expect(hiddenFolders.data.results.map((f: { folderId: string }) => f.folderId)).not.toContain(child);
+    const visibleFolders = await call(await tokenFor(reader, org), "list_folders", { vaultId: vault });
+    expect(visibleFolders.data.results.map((f: { folderId: string }) => f.folderId)).toContain(child);
+    const note = await seedNote(vault, child, "Finance/Confidential/budget.md", owner);
+    expect(await effectivePermission(excluded, note)).toBe("none");
+    expect(await effectivePermission(reader, note)).toBe("view");
+    expect(await effectivePermission(owner, note)).toBe("edit");
+  });
+
+  it("lists an EMPTY item-Private folder to a plain member who holds a personal folder grant", async () => {
+    const owner = await seedUser("owner@empty-grant.test");
+    const named = await seedUser("named@empty-grant.test");
+    const excluded = await seedUser("excluded@empty-grant.test");
+    const org = await seedOrg("EmptyGrant", "empty-grant");
+    await seedMember(org, owner, "owner");
+    await seedMember(org, named, "member");
+    await seedMember(org, excluded, "member");
+    const vault = await seedVault(org);
+    await seedVaultGrant(org, "edit");
+    const parent = await seedFolder(vault, null, "Board", "Board", owner);
+    const child = await seedFolder(vault, parent, "Minutes", "Board/Minutes", owner);
+    await seedItemPrivate(org, "folder", parent);
+    await seedShare(org, "folder", parent, named, "view");
+    // No note anywhere: only the folder-based personal grant can surface them.
+    expect((await listVisibleFolders(named, vault)).map(f => f.id)).toEqual(expect.arrayContaining([parent, child]));
+    const excludedIds = (await listVisibleFolders(excluded, vault)).map(f => f.id);
+    expect(excludedIds).not.toContain(parent);
+    expect(excludedIds).not.toContain(child);
+    const listed = await call(await tokenFor(named, org), "list_folders", { vaultId: vault });
+    expect(listed.data.results.map((f: { folderId: string }) => f.folderId)).toEqual(expect.arrayContaining([parent, child]));
+  });
+
+  it("a personal vault level lifts the Everyone deny on item-Private folders", async () => {
+    const owner = await seedUser("owner@personal-level.test");
+    const viewer = await seedUser("viewer@personal-level.test");
+    const excluded = await seedUser("excluded@personal-level.test");
+    const org = await seedOrg("PersonalLevel", "personal-level");
+    await seedMember(org, owner, "owner");
+    await seedMember(org, viewer, "member");
+    await seedMember(org, excluded, "member");
+    const vault = await seedVault(org);
+    await seedVaultGrant(org, "edit");
+    const hidden = await seedFolder(vault, null, "Payroll", "Payroll", owner);
+    await seedItemPrivate(org, "folder", hidden);
+    await pool.query(
+      `INSERT INTO shares (id, org_id, resource_type, resource_id, principal_type, principal_id, permission)
+       VALUES ($1, $2, 'vault', $2, 'user', $3, 'view')`,
+      [randomUUID(), org, viewer],
+    );
+    expect((await listVisibleFolders(viewer, vault)).map(f => f.id)).toContain(hidden);
+    expect((await listVisibleFolders(excluded, vault)).map(f => f.id)).not.toContain(hidden);
+  });
+
   it("rejects missing/invalid tokens with 401", async () => {
     expect((await rpc(null, "tools/list")).status).toBe(401);
     expect((await rpc("mcp_not-a-real-token", "tools/list")).status).toBe(401);
+  });
+
+  it("backs off a token that keeps failing, without touching token-less discovery or good tokens", async () => {
+    resetMcpBadTokens();
+    const owner = await seedUser("owner@mcp-backoff.com");
+    const org = await seedOrg("Backoff", "acme-mcp-backoff");
+    await seedMember(org, owner, "owner");
+    const good = await tokenFor(owner, org);
+
+    for (let i = 0; i < 20; i++) expect((await rpc("mcp_revoked-token", "tools/list")).status).toBe(401);
+    const limited = await rpc("mcp_revoked-token", "tools/list");
+    expect(limited.status).toBe(429);
+    expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(0);
+
+    // An OAuth client's first request carries no token: always the 401 + metadata.
+    expect((await rpc(null, "tools/list")).status).toBe(401);
+    // Another token is judged on its own.
+    expect((await rpc(good, "tools/list")).status).toBe(200);
+    resetMcpBadTokens();
   });
 
   it("initialize + tools/list advertise the CRUD tools", async () => {
@@ -107,8 +213,119 @@ describe("MCP server", () => {
         "edit_note",
         "delete_note",
         "search_notes",
+        "get_access_default",
+        "set_access_default",
+        "list_resource_access",
+        "manage_access",
       ]),
     );
+  });
+
+  describe("access management tools", () => {
+    it("lets owners/admins manage defaults and inspect resource access", async () => {
+      const org = await seedOrg("Access", `mcp-access-${rpcId}`);
+      const owner = await seedUser(`access-owner-${rpcId}@mcp.test`);
+      const admin = await seedUser(`access-admin-${rpcId}@mcp.test`);
+      const member = await seedUser(`access-member-${rpcId}@mcp.test`);
+      await seedMember(org, owner, "owner");
+      await seedMember(org, admin, "admin");
+      await seedMember(org, member, "member");
+      const vault = await seedVault(org);
+      const folder = await seedFolder(vault, null, "Docs", "Docs", owner);
+      await seedNote(vault, folder, "Docs/note.md", owner);
+      const ownerToken = await tokenFor(owner, org);
+      const adminToken = await tokenFor(admin, org);
+
+      expect((await call(ownerToken, "get_access_default")).data.mode).toBe("private");
+      expect(
+        (await call(adminToken, "set_access_default", { mode: "readonly" })).data.mode,
+      ).toBe("readonly");
+      expect((await call(ownerToken, "get_access_default")).data.mode).toBe("readonly");
+
+      const listed = await call(ownerToken, "list_resource_access", {
+        resourceType: "folder",
+        resourceId: folder,
+      });
+      expect(listed.isError).toBe(false);
+      expect(listed.data.results.map((row: any) => row.userId)).toEqual(
+        expect.arrayContaining([owner, admin, member]),
+      );
+    });
+
+    it("refuses plain members and resources outside the token's vault", async () => {
+      const org = await seedOrg("Access", `mcp-access-denied-${rpcId}`);
+      const owner = await seedUser(`access-owner-denied-${rpcId}@mcp.test`);
+      const member = await seedUser(`access-member-denied-${rpcId}@mcp.test`);
+      await seedMember(org, owner, "owner");
+      await seedMember(org, member, "member");
+      const memberToken = await tokenFor(member, org);
+      expect((await call(memberToken, "get_access_default")).isError).toBe(true);
+
+      const otherOrg = await seedOrg("Other", `mcp-access-other-${rpcId}`);
+      const otherOwner = await seedUser(`access-other-${rpcId}@mcp.test`);
+      await seedMember(otherOrg, otherOwner, "owner");
+      const otherVault = await seedVault(otherOrg);
+      const otherFolder = await seedFolder(otherVault, null, "Secret", "Secret", otherOwner);
+      const ownerToken = await tokenFor(owner, org);
+      const cross = await call(ownerToken, "manage_access", {
+        resources: [{ resourceType: "folder", resourceId: otherFolder }],
+        audience: { type: "org" },
+        mode: "open",
+      });
+      expect(cross.isError).toBe(true);
+      expect(cross.text).toMatch(/Unknown resource/i);
+    });
+
+    it("Everyone replaces subtree overrides, deduplicates resources, and announces the ACL", async () => {
+      const org = await seedOrg("Access", `mcp-access-bulk-${rpcId}`);
+      const owner = await seedUser(`access-owner-bulk-${rpcId}@mcp.test`);
+      const member = await seedUser(`access-member-bulk-${rpcId}@mcp.test`);
+      await seedMember(org, owner, "owner");
+      await seedMember(org, member, "member");
+      const vault = await seedVault(org);
+      const folder = await seedFolder(vault, null, "Docs", "Docs", owner);
+      const child = await seedFolder(vault, folder, "Child", "Docs/Child", owner);
+      const doc = await seedNote(vault, child, "Docs/Child/note.md", owner);
+      await pool.query(
+        `INSERT INTO shares
+           (id, org_id, resource_type, resource_id, principal_type, principal_id, permission)
+         VALUES ($1,$2,'file',$3,'user',$4,'denied'),
+                ($5,$2,'folder',$6,'org',$2,'view')`,
+        [randomUUID(), org, doc, member, randomUUID(), child],
+      );
+      const token = await tokenFor(owner, org);
+      disconnected.length = 0;
+      aclBroadcasts.length = 0;
+
+      const result = await call(token, "manage_access", {
+        resources: [
+          { resourceType: "folder", resourceId: folder },
+          { resourceType: "folder", resourceId: folder },
+        ],
+        audience: { type: "org" },
+        mode: "open",
+      });
+      expect(result.isError).toBe(false);
+      expect(result.data.resourcesChanged).toBe(1);
+      expect(result.data.overridesCleared).toBe(2);
+      expect(disconnected).toContainEqual({ vaultId: vault, docId: doc });
+      expect(aclBroadcasts).toContain(vault);
+
+      const rows = await pool.query<{
+        resource_type: string;
+        resource_id: string;
+        principal_type: string;
+        permission: string;
+      }>("SELECT resource_type, resource_id, principal_type, permission FROM shares WHERE org_id = $1", [org]);
+      expect(rows.rows).toEqual([
+        expect.objectContaining({
+          resource_type: "folder",
+          resource_id: folder,
+          principal_type: "org",
+          permission: "edit",
+        }),
+      ]);
+    });
   });
 
   it("owner: full note CRUD lifecycle", async () => {
@@ -472,6 +689,84 @@ describe("MCP server", () => {
     expect(res.text).toMatch(/outside the scope of this token/i);
   });
 
+  // The refusals that made up most of the error rate clients see were inputs
+  // whose meaning was never in doubt, and retried deletes of things already gone.
+  describe("forgiving inputs and repeat deletes", () => {
+    let token: string;
+    let org: string;
+    let vault: string;
+    beforeEach(async () => {
+      const owner = await seedUser("owner@mcp-forgive.com");
+      org = await seedOrg("Forgive", "forgive-mcp");
+      await seedMember(org, owner, "owner");
+      vault = await seedVault(org, "Team Notes");
+      token = await tokenFor(owner, org);
+    });
+
+    it("resolves a vault named by its name or by the token's org id", async () => {
+      expect((await call(token, "list_folders", { vaultId: "team notes" })).isError).toBe(false);
+      expect((await call(token, "list_folders", { vaultId: org })).isError).toBe(false);
+    });
+
+    it("refuses an unknown vault with a code and the ids it can use", async () => {
+      const wrong = await call(token, "search_notes", { vaultId: "nope", query: "x" });
+      expect(wrong.isError).toBe(true);
+      expect(wrong.data.code).toBe("not_found");
+      expect(wrong.text).toContain(vault);
+    });
+
+    it("accepts numbers and booleans spelled as strings", async () => {
+      expect((await call(token, "search_notes", { vaultId: vault, query: "x", k: "5" })).isError).toBe(false);
+      expect(
+        (await call(token, "search_notes", { vaultId: vault, query: "x", includeFiles: "false" })).isError,
+      ).toBe(false);
+    });
+
+    it("edit_note accepts edits sent as a JSON string", async () => {
+      const created = await call(token, "create_note", { vaultId: vault, relPath: "a.md", content: "hello world" });
+      const docId = created.data.docId as string;
+      const edited = await call(token, "edit_note", {
+        docId,
+        edits: JSON.stringify([{ type: "replace", find: "world", replace: "there" }]),
+      });
+      expect(edited.isError).toBe(false);
+      expect(mem.store.get(docId)).toBe("hello there");
+    });
+
+    it("a repeated delete_note answers alreadyDeleted, an unknown id is still not found", async () => {
+      const created = await call(token, "create_note", { vaultId: vault, relPath: "gone.md", content: "x" });
+      const docId = created.data.docId as string;
+      expect((await call(token, "delete_note", { docId })).isError).toBe(false);
+      const again = await call(token, "delete_note", { docId });
+      expect(again.isError).toBe(false);
+      expect(again.data).toMatchObject({ deleted: docId, alreadyDeleted: true });
+      const unknown = await call(token, "delete_note", { docId: randomUUID() });
+      expect(unknown.isError).toBe(true);
+      expect(unknown.data.code).toBe("not_found");
+    });
+
+    it("a repeated delete_folder answers alreadyDeleted", async () => {
+      const folder = await call(token, "create_folder", { vaultId: vault, name: "Old", path: "Old" });
+      const folderId = folder.data.folderId as string;
+      expect((await call(token, "delete_folder", { folderId })).isError).toBe(false);
+      const again = await call(token, "delete_folder", { folderId });
+      expect(again.isError).toBe(false);
+      expect(again.data).toMatchObject({ deleted: folderId, alreadyDeleted: true });
+    });
+
+    it("a repeated delete is not alreadyDeleted for another vault's token", async () => {
+      const created = await call(token, "create_note", { vaultId: vault, relPath: "mine.md", content: "x" });
+      const docId = created.data.docId as string;
+      await call(token, "delete_note", { docId });
+      const other = await seedUser("other@mcp-forgive.com");
+      const otherOrg = await seedOrg("Other", "other-forgive-mcp");
+      await seedMember(otherOrg, other, "owner");
+      const foreign = await call(await tokenFor(other, otherOrg), "delete_note", { docId });
+      expect(foreign.isError).toBe(true);
+      expect(foreign.data.code).toBe("not_found");
+    });
+  });
+
   it("tracks per-connection usage: tool calls, last-used, and client", async () => {
     const owner = await seedUser("owner@mcp6.com");
     const org = await seedOrg("Acme", "acme-mcp6");
@@ -539,6 +834,9 @@ describe("MCP server", () => {
       org = await seedOrg("Acme", "acme-mcp-live");
       await seedMember(org, owner, "owner");
       vault = await seedVault(org);
+      // Shared, as POST /api/vaults leaves a new vault. Seeded directly it has
+      // no grant and is Private, which no longer exempts the owner.
+      await seedVaultGrant(org, "edit");
       token = await tokenFor(owner, org);
       registryBroadcasts.length = 0;
     });
@@ -649,6 +947,9 @@ describe("MCP server", () => {
       org = await seedOrg("Acme", "acme-mcp-move");
       await seedMember(org, owner, "owner");
       vault = await seedVault(org);
+      // Shared, as POST /api/vaults leaves a new vault. Seeded directly it has
+      // no grant and is Private, which no longer exempts the owner.
+      await seedVaultGrant(org, "edit");
       token = await tokenFor(owner, org);
       registryBroadcasts.length = 0;
     });

@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as Y from "yjs";
 
 vi.mock("../../ipc", () => ({
   getVaultConfig: vi.fn(),
   setVaultConfig: vi.fn(),
   listTree: vi.fn(),
+  listTags: vi.fn(async () => []),
   listNoteTitles: vi.fn(),
   writeNote: vi.fn(),
   writeNoteIfMissing: vi.fn(),
@@ -12,15 +14,26 @@ vi.mock("../../ipc", () => ({
   renamePath: vi.fn(),
   trashNote: vi.fn(),
   deletePath: vi.fn(),
+  deleteFile: vi.fn(),
+  deleteFilesBatch: vi.fn(),
   deleteFolderIfEmpty: vi.fn(),
+  fileStat: vi.fn(),
+  binaryExists: vi.fn(),
+  listBinaries: vi.fn(),
+  getDiskBase: vi.fn(),
+  copyToTrash: vi.fn(),
+  writeTrashCopy: vi.fn(),
+  rebindNoteId: vi.fn(async () => true),
   isVaultMismatch: vi.fn(() => false),
 }));
 vi.mock("../../vault/seed", () => ({ seedWelcomeContent: vi.fn(async () => {}) }));
 
-import type { ApiClient } from "../../api";
+import { ACCESS_CHECK_MAX, type ApiClient } from "../../api";
 import * as ipc from "../../ipc";
 import type { TreeNode } from "../../ipc";
-import { VaultRegistry, type InboundHost } from "../registry";
+import { OWN_DELETE_TTL_MS, VaultRegistry, type InboundHost } from "../registry";
+import { sha256Hex } from "../../bridge/adapter";
+import { reconcileReport } from "../reconcileReport";
 
 /**
  * Inbound reconciliation, wired end to end against a fake disk.
@@ -47,6 +60,20 @@ class FakeDisk {
   /** relPath → body, for the emptiness check on unconfirmed notes. */
   bodies = new Map<string, string>();
   trashed: Array<{ from: string; to: string }> = [];
+  /** Paths removed outright (revocations) — never in the trash. */
+  deleted: string[] = [];
+  /** Tree binaries on disk (a `.pdf`, a `.docx`). NOT notes: they have no index
+   *  row, no CRDT and no `GET /api/notes` entry — their only identity here is
+   *  the registry's `files` map. */
+  binaries = new Set<string>();
+  /** relPath → sha256 of a binary edited since its agreed base; every other
+   *  binary hashes to {@link agreedSha}. */
+  editedBinaries = new Map<string, string>();
+  /** docIds whose file moved on since the last agreed disk base: UNSEEN WORK
+   *  (offline reconciliation). Everything else is in sync with its base. */
+  unseen = new Set<string>();
+  /** Recovery copies made before an inbound removal. */
+  copies: Array<{ from: string; to: string }> = [];
 
   tree(): TreeNode {
     const dirs = [...this.folders].map((f) => ({
@@ -78,13 +105,35 @@ class FakeDisk {
   }
 }
 
+/** The sha a fake binary holds while unedited, and the base `twoPasses` records. */
+const agreedSha = (relPath: string) => `agreed:${relPath}`;
+
 function install(disk: FakeDisk) {
+  vi.mocked(ipc.binaryExists).mockImplementation(async (path) => disk.binaries.has(path));
+  vi.mocked(ipc.listBinaries).mockImplementation(async () =>
+    [...disk.binaries].map((relPath) => ({
+      relPath,
+      size: 1,
+      sha256: disk.editedBinaries.get(relPath) ?? agreedSha(relPath),
+    })),
+  );
+  vi.mocked(ipc.deleteFilesBatch).mockImplementation(async (items) => Promise.all(items.map(async (item) => {
+    try {
+      await ipc.deleteFile(item.path);
+      return { path: item.path, error: null };
+    } catch (e) {
+      return { path: item.path, error: String(e) };
+    }
+  })));
+
   vi.mocked(ipc.listTree).mockImplementation((async () => disk.tree()) as never);
   vi.mocked(ipc.listNoteTitles).mockImplementation((async () => disk.titles()) as never);
   vi.mocked(ipc.readNote).mockImplementation((async (p: string) =>
     disk.bodies.get(p) ?? "") as never);
   vi.mocked(ipc.ensureFolder).mockImplementation((async (p: string) => {
+    if (disk.folders.has(p)) return false; // already there — not a disk change
     disk.folders.add(p);
+    return true;
   }) as never);
   vi.mocked(ipc.writeNoteIfMissing).mockImplementation((async (p: string) => {
     if (disk.notes.has(p)) return false;
@@ -105,7 +154,7 @@ function install(disk: FakeDisk) {
     return to;
   }) as never);
   vi.mocked(ipc.deleteFolderIfEmpty).mockImplementation((async (p: string) => {
-    if (!disk.folders.has(p)) return true; // already gone — the goal state
+    if (!disk.folders.has(p)) return false; // already gone — nothing removed
     const prefix = p + "/";
     const occupied =
       [...disk.notes.keys()].some((n) => n.startsWith(prefix)) ||
@@ -114,10 +163,50 @@ function install(disk: FakeDisk) {
     disk.folders.delete(p);
     return true;
   }) as never);
-  vi.mocked(ipc.trashNote).mockImplementation((async (p: string, stamp: string) => {
+  vi.mocked(ipc.deletePath).mockImplementation((async (p: string) => {
     if (!disk.notes.has(p)) throw new Error("path does not exist");
     disk.notes.delete(p);
     disk.bodies.delete(p);
+    disk.deleted.push(p);
+  }) as never);
+  // The revocation removal's own call: single file, never a directory (Rust
+  // refuses one). Same book-keeping so the assertions below read the same.
+  // Matches `notefile.rs delete_file`, which returns Ok for a path that is
+  // already gone. A mock that threw instead would make the reconciler look
+  // broken on the one case Rust deliberately makes idempotent.
+  vi.mocked(ipc.deleteFile).mockImplementation((async (p: string) => {
+    if (disk.binaries.delete(p)) {
+      disk.deleted.push(p);
+      return;
+    }
+    if (!disk.notes.has(p)) return;
+    disk.notes.delete(p);
+    disk.bodies.delete(p);
+    disk.deleted.push(p);
+  }) as never);
+  vi.mocked(ipc.fileStat).mockImplementation((async (p: string) => {
+    if (!disk.notes.has(p) && !disk.binaries.has(p)) throw new Error("no such file");
+    return { size: 1 };
+  }) as never);
+  vi.mocked(ipc.getDiskBase).mockImplementation((async (docId: string) => {
+    if (disk.unseen.has(docId)) return "base-before-the-offline-edit";
+    const path = [...disk.notes].find(([, id]) => id === docId)?.[0];
+    return path === undefined ? null : sha256Hex(disk.bodies.get(path) ?? "");
+  }) as never);
+  vi.mocked(ipc.copyToTrash).mockImplementation((async (p: string, stamp: string) => {
+    if (!disk.notes.has(p) && !disk.binaries.has(p)) throw new Error("path does not exist");
+    const dest = `.context/trash/${stamp}/${p}`;
+    disk.copies.push({ from: p, to: dest });
+    return dest;
+  }) as never);
+  vi.mocked(ipc.trashNote).mockImplementation((async (p: string, stamp: string) => {
+    // `trash_note` is a rename, so it moves any bytes — a binary needs no twin.
+    const isBinary = disk.binaries.delete(p);
+    if (!isBinary) {
+      if (!disk.notes.has(p)) throw new Error("path does not exist");
+      disk.notes.delete(p);
+      disk.bodies.delete(p);
+    }
     const dest = `.context/trash/${stamp}/${p}`;
     disk.trashed.push({ from: p, to: dest });
     return dest;
@@ -125,13 +214,26 @@ function install(disk: FakeDisk) {
 }
 
 interface ServerState {
-  notes: Array<{ id: string; rel_path: string }>;
+  notes: Array<{ id: string; rel_path: string; created_by?: string }>;
   tombstones?: string[] | null;
   folders?: Array<{ id: string; path: string }>;
   folderTombstones?: string[] | null;
+  /**
+   * What `POST /vaults/:id/access-check` answers — the resolver's independent
+   * second opinion, which every removal past the revocation cap has to clear.
+   *
+   * `"confirm"` (the default): the resolver agrees the caller has lost access to
+   * every id asked about. `"grant"`: it says they can still read them, so the
+   * two server answers disagree and nothing may be removed. `"fail"`: the
+   * request throws, which is "no answer" and also removes nothing.
+   */
+  accessCheck?: "confirm" | "grant" | "fail";
+  /** Answer this many access-check calls, then throw — the partial-answer case. */
+  accessCheckFailAfter?: number;
 }
 
 function fakeApi(state: ServerState) {
+  let accessCheckCalls = 0;
   return {
     listVaults: vi.fn(async () => [{ id: VAULT, name: "v", organization_id: ORG }]),
     createVault: vi.fn(),
@@ -146,27 +248,72 @@ function fakeApi(state: ServerState) {
       notes: state.notes,
       tombstones: state.tombstones === undefined ? [] : state.tombstones,
     })),
+    // The paged twin the reconciler actually calls; identical answer.
+    listNoteRegistryPaged: vi.fn(async () => ({
+      notes: state.notes,
+      tombstones: state.tombstones === undefined ? [] : state.tombstones,
+    })),
     createNote: vi.fn(async (i: { relPath: string; docId?: string }) => ({
       id: i.docId ?? `note-${i.relPath}`,
       rel_path: i.relPath,
     })),
     deleteNote: vi.fn(async () => {}),
     deleteFolder: vi.fn(async () => {}),
+    accessCheck: vi.fn(async (_vaultId: string, docIds: string[]) => {
+      const mode = state.accessCheck ?? "confirm";
+      if (mode === "fail") throw new Error("network down");
+      // The real route answers 400 above `ACCESS_CHECK_MAX`, and the client reads
+      // a 400 as "no answer" — so a fake that silently accepted any size would
+      // hide exactly the bug this models.
+      if (docIds.length > ACCESS_CHECK_MAX) throw new Error("at most 2000 docIds per request");
+      accessCheckCalls++;
+      if (state.accessCheckFailAfter !== undefined && accessCheckCalls > state.accessCheckFailAfter) {
+        throw new Error("network down");
+      }
+      return mode === "grant" ? [] : docIds;
+    }),
   } as unknown as ApiClient;
 }
 
-function recordingHost() {
+/** The signed-in user, for account-scoped legacy authorship metadata. */
+const ME = "user-me";
+
+function recordingHost(authority = false, named: ReadonlySet<string> | null = null) {
+  const refused: string[] = [];
   const released: string[] = [];
   const renamed: Array<{ from: string; to: string }> = [];
-  const removed: Array<{ path: string; trashedTo: string | null }> = [];
+  const removed: Array<{ path: string; trashedTo: string | null; reason: string }> = [];
+  /** Paths the registry asked to fill in from a local CRDT after materializing.
+   *  This host has no doc store, so it answers "nothing to fill in" — which is
+   *  the fresh-device case, i.e. today's empty placeholder. */
+  const hydrated: Array<{ docId: string; path: string }> = [];
+  /** Paths claimed with the binary delete queue before they were removed. An
+   *  unclaimed one would be propagated back as `DELETE /api/files/:id`. */
+  const suppressed: string[] = [];
+  const filesRemoved: Array<{ path: string; trashedTo: string | null }> = [];
   const host: InboundHost = {
     releaseDoc: async (docId) => {
       released.push(docId);
     },
     notePathChanged: (_docId, from, to) => renamed.push({ from, to }),
-    noteRemoved: (_docId, path, trashedTo) => removed.push({ path, trashedTo }),
+    noteRemoved: (_docId, path, trashedTo, reason) => removed.push({ path, trashedTo, reason }),
+    materializeContent: async (docId, path) => {
+      hydrated.push({ docId, path });
+      return false;
+    },
+    // Off by default: an inbound pass only treats a shrunken listing as fact
+    // when the session is live AND the server just announced an access change.
+    revocationAuthority: () => authority,
+    // Which docs the server NAMED. Null is the old wholesale-lift path; a set
+    // narrows the lift to those ids, which is what production always carries
+    // once the vault channel has sent a `ready.revoked` or a `drop`.
+    authoritativeRevoked: () => named,
+    revocationRefused: (ids) => refused.push(...ids),
+    localUserId: () => ME,
+    suppressBinaryDelete: (relPath) => suppressed.push(relPath),
+    fileRemoved: (_docId, path, trashedTo) => filesRemoved.push({ path, trashedTo }),
   };
-  return { host, released, renamed, removed };
+  return { host, released, renamed, removed, hydrated, refused, suppressed, filesRemoved };
 }
 
 /**
@@ -175,14 +322,58 @@ function recordingHost() {
  * server. Inbound compares against a prior agreement, so a single pass can never
  * exercise it.
  */
-async function twoPasses(opts: { disk: FakeDisk; first: ServerState; then: ServerState }) {
+async function twoPasses(opts: {
+  disk: FakeDisk;
+  first: ServerState;
+  then: ServerState;
+  /** Does the SECOND pass carry revocation authority (session live AND an
+   *  `acl-changed` frame just arrived)? Only then may it act on a wholesale
+   *  loss of access. */
+  authority?: boolean;
+  /** Tree binaries this device holds a `files` row for, spliced into the config
+   *  the relaunch reads — the same route `adoptConfigFiles` takes in production.
+   *  relPath → `files` id. */
+  files?: Record<string, string>;
+  /**
+   * Which of those `files` ids this device has confirmed the server's copy of
+   * (`registry.confirmFileBytes` — a completed upload, a download, a dedupe, or
+   * a listing sha match).
+   *
+   * Defaults to ALL of them, which is the ordinary state of a synced binary and
+   * what every revocation test means. Pass `[]` for the state this guard exists
+   * for: a `files` row minted before an upload that was then refused for good.
+   */
+  filesConfirmed?: readonly string[];
+  /** `files` id → last agreed sha. Defaults to each file's unedited sha
+   *  ({@link agreedSha}), the ordinary state of a synced binary. */
+  fileBases?: Record<string, string>;
+  /** Which docs the server NAMED on `ready.revoked` / `drop`. A binary is only
+   *  ever removed when it is on this list; there is no listing absence to read
+   *  for one. */
+  named?: ReadonlySet<string>;
+  /** Re-wire an IPC mock AFTER `install` has laid down the fake disk (a slow or
+   *  refusing `trashNote`, say). `install` overwrites every mock, so a test that
+   *  patched one before calling this would silently get the default back. */
+  patch?: () => void;
+}) {
   install(opts.disk);
+  opts.patch?.();
   const reg1 = new VaultRegistry(fakeApi(opts.first));
   reg1.setInboundHost(recordingHost().host);
   await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
 
   const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
-  const written = writes[writes.length - 1]?.[0] as string;
+  let written = writes[writes.length - 1]?.[0] as string;
+  if (opts.files) {
+    written = JSON.stringify({
+      ...JSON.parse(written),
+      files: opts.files,
+      filesConfirmed: opts.filesConfirmed ?? Object.values(opts.files),
+      fileBases:
+        opts.fileBases ??
+        Object.fromEntries(Object.entries(opts.files).map(([path, id]) => [id, agreedSha(path)])),
+    });
+  }
   vi.mocked(ipc.getVaultConfig).mockResolvedValue(written as never);
   vi.mocked(ipc.renamePath).mockClear();
   vi.mocked(ipc.trashNote).mockClear();
@@ -190,7 +381,7 @@ async function twoPasses(opts: { disk: FakeDisk; first: ServerState; then: Serve
 
   const api = fakeApi(opts.then);
   const reg = new VaultRegistry(api);
-  const host = recordingHost();
+  const host = recordingHost(opts.authority === true, opts.named ?? null);
   reg.setInboundHost(host.host);
   await reg.reconcile({ organizationId: ORG, vaultName: "v" });
   return { reg, api, ...host };
@@ -275,6 +466,50 @@ describe("inbound rename", () => {
     expect(vi.mocked(r.api.createNote)).not.toHaveBeenCalled();
   });
 
+  it("refuses a rename onto a path another note already occupies (#129)", async () => {
+    // The doomed rename. A second file is sitting at the destination — a copy, a
+    // half-finished move, a placeholder materialized before the rename was
+    // planned. Rust refuses a rename onto an existing file, so executing this
+    // move can only throw, leave the SOURCE in place, and record the identical
+    // failure on the next pass, and the next, forever — while `releaseDoc` tears
+    // down the open note's provider every single time.
+    //
+    // So the plan refuses it instead: no IPC, no doc release, one honest failure
+    // naming the conflict. Both files stay exactly where they are; choosing
+    // between two copies of someone's note is not this reconciler's call.
+    const disk = new FakeDisk();
+    disk.notes.set("old.md", "d1");
+    install(disk);
+    const state: ServerState = { notes: [{ id: "d1", rel_path: "old.md" }] };
+    const reg = new VaultRegistry(fakeApi(state));
+    const host = recordingHost();
+    reg.setInboundHost(host.host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    // Hand the baseline back the way a relaunch reads it.
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(
+      writes[writes.length - 1]?.[0] as never,
+    );
+    // …and now the destination is occupied by a note of its own, while the
+    // server says `d1` moved there.
+    disk.notes.set("new.md", "local-new.md");
+    state.notes = [{ id: "d1", rel_path: "new.md" }];
+    vi.mocked(ipc.renamePath).mockClear();
+
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(ipc.renamePath).not.toHaveBeenCalled();
+    // Nothing was released either — the tear-down only exists to free the path.
+    expect(host.released).toEqual([]);
+    // Both files untouched. Least of all the source, which holds the content.
+    expect([...disk.notes.keys()].sort()).toEqual(["new.md", "old.md"]);
+    // And it is REPORTED, not swallowed: the user is the only one who can say
+    // which of the two copies they meant.
+    const refused = reg.failures().find((f) => f.kind === "inbound-blocked" && f.path === "new.md");
+    expect(refused?.reason).toContain("already occupies that path");
+  });
+
   it("does not re-materialize the old path afterwards", async () => {
     // The re-read guard: without it, the outbound half still sees `old.md` as a
     // local note missing from the server and `new.md` as server-only.
@@ -290,7 +525,7 @@ describe("inbound rename", () => {
 });
 
 describe("inbound delete", () => {
-  it("trashes a tombstoned note and reports where it went", async () => {
+  it("permanently removes a tombstoned note", async () => {
     const disk = new FakeDisk();
     disk.notes.set("bye.md", "d1");
     const r = await twoPasses({
@@ -300,16 +535,18 @@ describe("inbound delete", () => {
     });
 
     expect(disk.notes.has("bye.md")).toBe(false);
-    // Recoverable, never a hard delete: this reconciler once destroyed 428 notes.
+    // Final, but only after the reconciler's identity, tombstone and cap guards.
     expect(ipc.deletePath).not.toHaveBeenCalled();
-    expect(disk.trashed[0].to).toContain(".context/trash/");
+    expect(ipc.deleteFile).toHaveBeenCalledWith("bye.md", null);
+    expect(disk.trashed).toEqual([]);
+    expect(disk.deleted).toEqual(["bye.md"]);
     expect(r.released).toEqual(["d1"]);
     expect(r.removed[0]?.path).toBe("bye.md");
     // Crucially it is NOT pushed back up, which is what produced the ghost note.
     expect(vi.mocked(r.api.createNote)).not.toHaveBeenCalled();
   });
 
-  it("trashes a MATERIALIZED note the server deleted, while the path→docId join is live", async () => {
+  it("removes a MATERIALIZED note the server deleted, while the path→docId join is live", async () => {
     // The undeletable-note bug. Nothing is on disk to begin with: the file
     // arrives via `writeNoteIfMissing`, and Rust's indexer mints a local id for
     // it that is NOT the server's docId (the mock mirrors that). `registry.byPath`
@@ -341,12 +578,13 @@ describe("inbound delete", () => {
     state.tombstones = ["srv-1"];
     await reg.reconcile({ organizationId: ORG, vaultName: "v" });
 
-    expect(disk.trashed[0]?.from).toBe("naveed-test.md");
+    expect(disk.trashed).toEqual([]);
+    expect(disk.deleted).toEqual(["naveed-test.md"]);
     expect(disk.notes.has("naveed-test.md")).toBe(false);
     expect(vi.mocked(api.createNote)).not.toHaveBeenCalled();
   });
 
-  it("trashes it across a relaunch too, from the persisted path→docId join", async () => {
+  it("removes it across a relaunch too, from the persisted path→docId join", async () => {
     // The common MCP shape: the note is deleted while the app isn't running, so
     // the in-memory join is gone by the time anyone reconciles. `config.json`'s
     // `docs` map was being written every pass and read by nobody, which left the
@@ -358,7 +596,8 @@ describe("inbound delete", () => {
       then: { notes: [], tombstones: ["srv-1"] },
     });
 
-    expect(disk.trashed[0]?.from).toBe("naveed-test.md");
+    expect(disk.trashed).toEqual([]);
+    expect(disk.deleted).toEqual(["naveed-test.md"]);
     expect(disk.notes.has("naveed-test.md")).toBe(false);
     expect(vi.mocked(r.api.createNote)).not.toHaveBeenCalled();
   });
@@ -394,11 +633,13 @@ describe("inbound delete", () => {
     expect(ipc.trashNote).not.toHaveBeenCalled();
   });
 
-  it("REMOVES a file whose access was revoked, and stops re-registering it", async () => {
+  it("REMOVES a file whose access was revoked outright, and stops re-registering it", async () => {
     // `GET /api/notes` is ACL-filtered, so a revoked share looks like a delete;
-    // the tombstone set is what tells them apart. Both end with the file in the
-    // vault's recoverable trash — a revocation that leaves a readable `.md`
-    // behind is cosmetic, since the ex-reader can open it in any editor forever.
+    // the tombstone set is what tells them apart. A DELETED note goes to the
+    // vault trash (the undo for a deliberate removal); a REVOKED one is removed
+    // outright — a copy in `.context/trash` would hand the ex-reader exactly the
+    // readable `.md` the revocation exists to take away, and the server still
+    // holds the content, so nothing is lost.
     const disk = new FakeDisk();
     disk.notes.set("shared.md", "d1");
     const r = await twoPasses({
@@ -408,7 +649,11 @@ describe("inbound delete", () => {
     });
 
     expect(disk.notes.has("shared.md")).toBe(false);
-    expect(ipc.trashNote).toHaveBeenCalledWith("shared.md", expect.any(String), null);
+    expect(disk.deleted).toEqual(["shared.md"]);
+    expect(disk.trashed).toEqual([]);
+    expect(ipc.trashNote).not.toHaveBeenCalled();
+    // The UI learns WHY, so it can say "access removed" rather than "deleted".
+    expect(r.removed).toEqual([{ path: "shared.md", trashedTo: null, reason: "revoked" }]);
     // And it is NOT re-registered on the way out, which would resurrect it as an
     // unsyncable ghost.
     expect(vi.mocked(r.api.createNote)).not.toHaveBeenCalled();
@@ -466,9 +711,71 @@ describe("inbound delete", () => {
     expect(ipc.trashNote).not.toHaveBeenCalled();
   });
 
-  it("leaves an unconfirmed, non-empty note alone and records it as an orphan", async () => {
-    // This device never confirmed the note's content upstream, so its text may
-    // exist nowhere else — removing it could destroy the only copy.
+  it.each(["Untitled.md", "Dashboards/Home.html"])("accepts an admin delete of a newly registered owner file: %s", async (path) => {
+    const disk = new FakeDisk();
+    install(disk);
+    const state: ServerState = { notes: [] };
+    const api = fakeApi(state);
+    const reg = new VaultRegistry(api);
+    const host = recordingHost();
+    reg.setInboundHost(host.host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    // Eager registration happens after the last full reconcile, so this new
+    // file is mapped but has no per-document baseline yet.
+    disk.notes.set(path, "owner-new");
+    disk.bodies.set(path, "owner content");
+    await reg.registerNote(path, "New", "owner-new");
+    state.notes = [];
+    state.tombstones = ["owner-new"];
+    vi.mocked(api.createNote).mockClear();
+    await reg.pull();
+    expect(disk.notes.has(path)).toBe(false);
+    expect(host.removed).toEqual([expect.objectContaining({ path, reason: "deleted" })]);
+    await reg.pull();
+    expect(api.createNote).not.toHaveBeenCalled();
+  });
+
+  it("copies a note with unseen work to the trash before a teammate's delete removes it (D1)", async () => {
+    // Delete wins for the team; this device's unsent version stays recoverable.
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    disk.notes.set("mine.md", "d1");
+    disk.bodies.set("mine.md", "words nobody else has");
+    disk.unseen.add("d1");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "mine.md" }] },
+      then: { notes: [], tombstones: ["d1"] },
+    });
+
+    expect(disk.notes.has("mine.md")).toBe(false);
+    expect(disk.copies.map((c) => c.from)).toEqual(["mine.md"]);
+    expect(disk.deleted).toEqual(["mine.md"]);
+    expect(r.reg.failures().map((f) => f.kind)).not.toContain("orphan");
+    const items = reconcileReport.items();
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "deletedByTeammate", docId: "d1", path: "mine.md" });
+    expect(items[0].detail).toBe(disk.copies[0].to);
+  });
+
+  it("removes a stale device's copy outright, with no recovery copy", async () => {
+    // Nothing new since the last agreement with the server: accept the delete.
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    disk.notes.set("old.md", "d1");
+    disk.bodies.set("old.md", "the text everyone already has");
+    await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "old.md" }] },
+      then: { notes: [], tombstones: ["d1"] },
+    });
+    expect(disk.deleted).toEqual(["old.md"]);
+    expect(disk.copies).toEqual([]);
+    expect(reconcileReport.items()).toEqual([]);
+  });
+
+  it("preserves a matching deleted document in Trash when its content baseline is missing", async () => {
+    // The index proves identity even though content acknowledgement is absent.
     const disk = new FakeDisk();
     disk.notes.set("mine.md", "d1");
     disk.bodies.set("mine.md", "words nobody else has");
@@ -476,16 +783,146 @@ describe("inbound delete", () => {
       disk,
       first: { notes: [{ id: "d1", rel_path: "mine.md" }] },
       then: { notes: [], tombstones: ["d1"] },
+      patch: () => vi.mocked(ipc.getDiskBase).mockResolvedValue(null as never),
     });
+    expect(disk.notes.has("mine.md")).toBe(false);
+    expect(disk.copies.map((copy) => copy.from)).toEqual(["mine.md"]);
+    expect(r.reg.failures().map((f) => f.kind)).not.toContain("orphan");
+  });
 
+  it("does not remove a different local identity merely reusing a deleted path", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("mine.md", "d1");
+    disk.bodies.set("mine.md", "new independent content");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "mine.md" }] },
+      then: { notes: [], tombstones: ["d1"] },
+      patch: () => {
+        vi.mocked(ipc.getDiskBase).mockResolvedValue(null as never);
+        vi.mocked(ipc.listNoteTitles).mockResolvedValue([
+          { id: "different-local-id", path: "mine.md", title: "mine" },
+        ] as never);
+      },
+    });
     expect(disk.notes.has("mine.md")).toBe(true);
-    expect(ipc.trashNote).not.toHaveBeenCalled();
+    expect(disk.copies).toEqual([]);
     expect(r.reg.failures().map((f) => f.kind)).toContain("orphan");
+  });
+
+  it("keeps unconfirmed deleted content active if its recovery copy cannot be saved", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("mine.md", "d1");
+    disk.bodies.set("mine.md", "only local content");
+    await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "mine.md" }] },
+      then: { notes: [], tombstones: ["d1"] },
+      patch: () => {
+        vi.mocked(ipc.getDiskBase).mockResolvedValue(null as never);
+        vi.mocked(ipc.copyToTrash).mockRejectedValue(new Error("disk full"));
+      },
+    });
+    expect(disk.notes.has("mine.md")).toBe(true);
+    expect(disk.deleted).toEqual([]);
+  });
+
+  it("never re-registers the dead id after its unseen work was copied aside", async () => {
+    // Prod 2026-09-23 shape: a dead doc_id going back up every ~30 s. With the
+    // recovery copy made and the file gone, later passes must stay quiet.
+    const disk = new FakeDisk();
+    disk.notes.set("mine.md", "d1");
+    disk.bodies.set("mine.md", "words nobody else has");
+    disk.unseen.add("d1");
+    const then = { notes: [], tombstones: ["d1"] };
+    await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "mine.md" }] },
+      then,
+    });
+    expect(disk.copies.map((c) => c.from)).toEqual(["mine.md"]);
+    expect(disk.notes.has("mine.md")).toBe(false);
+
+    for (let pass = 0; pass < 2; pass++) {
+      const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+      vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+      const api = fakeApi(then);
+      const reg = new VaultRegistry(api);
+      reg.setInboundHost(recordingHost().host);
+      await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+      expect(vi.mocked(api.createNote)).not.toHaveBeenCalled();
+      expect(reg.getMapping("mine.md")).toBeNull();
+    }
+    expect(disk.copies).toHaveLength(1);
   });
 });
 
 
 describe("inbound folder deletion", () => {
+  it("retries a failed remote folder removal without registering a replacement, including after restart", async () => {
+    const disk = new FakeDisk();
+    disk.folders.add("Team");
+    disk.folders.add("Team/Sub");
+    const { api } = await twoPasses({
+      disk,
+      first: { notes: [], folders: [{ id: "f1", path: "Team" }, { id: "f2", path: "Team/Sub" }] },
+      then: { notes: [], folders: [], folderTombstones: ["f1", "f2"] },
+      patch: () => vi.mocked(ipc.deleteFolderIfEmpty).mockRejectedValueOnce(new Error("directory temporarily busy")),
+    });
+    expect(api.createFolder).not.toHaveBeenCalled();
+    expect(disk.folders.has("Team")).toBe(true);
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1][0]);
+    const restarted = new VaultRegistry(api);
+    restarted.setInboundHost(recordingHost().host);
+    await restarted.reconcile({ organizationId: ORG, vaultName: "v" });
+    expect(api.createFolder).not.toHaveBeenCalled();
+    expect(disk.folders.has("Team")).toBe(false);
+  });
+
+  it("never asks for a local subfolder of a deleted folder it could not remove", async () => {
+    const disk = new FakeDisk();
+    disk.folders.add("Team");
+    // Made here and never on the server: it is what keeps "Team" from emptying.
+    disk.folders.add("Team/Local");
+    disk.folders.add("Team/Local/Deeper");
+    const { api, reg } = await twoPasses({
+      disk,
+      first: { notes: [], folders: [{ id: "f1", path: "Team" }] },
+      then: { notes: [], folders: [], folderTombstones: ["f1"] },
+      patch: () => vi.mocked(ipc.deleteFolderIfEmpty).mockRejectedValue(new Error("directory not empty")),
+    });
+    const asked = () => vi.mocked(api.createFolder).mock.calls.map(([f]) => (f as { path: string }).path);
+    expect(asked()).not.toContain("Team/Local");
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    expect(asked().filter((p) => p.startsWith("Team"))).toEqual([]);
+    // The file uploader asks the same question (`isHeldCreate`).
+    expect(reg.isInsideDeadFolder("Team/Local/report.pdf")).toBe(true);
+    expect(reg.isInsideDeadFolder("Other/report.pdf")).toBe(false);
+  });
+
+  it("re-registers a deleted folder whose removal failed once the user adds a note to it", async () => {
+    const disk = new FakeDisk();
+    disk.folders.add("Team");
+    const { api, reg } = await twoPasses({
+      disk,
+      first: { notes: [], folders: [{ id: "f1", path: "Team" }] },
+      then: { notes: [], folders: [], folderTombstones: ["f1"] },
+      // A lasting I/O failure (Windows lock, EACCES): every removal throws.
+      patch: () => vi.mocked(ipc.deleteFolderIfEmpty).mockRejectedValue(new Error("access denied")),
+    });
+    expect(api.createFolder).not.toHaveBeenCalled();
+    // The user writes a note into the folder the teammate deleted.
+    disk.notes.set("Team/new.md", "local");
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    expect(api.createFolder).toHaveBeenCalledWith(expect.objectContaining({ path: "Team" }));
+    expect(api.createNote).toHaveBeenCalledWith(expect.objectContaining({ relPath: "Team/new.md" }));
+    // Once kept, the folder is no longer a pending removal.
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    const cfg = JSON.parse(writes[writes.length - 1][0] as string);
+    expect(cfg.revokedFolders?.Team).toBeUndefined();
+  });
+
   it("removes an emptied local folder the server deleted and does not re-register it", async () => {
     // THE reappearing-folder bug, end to end: without a tombstone this device
     // saw "missing from the server" and re-registered the folder, resurrecting
@@ -503,18 +940,20 @@ describe("inbound folder deletion", () => {
     });
 
     // The note left via its own tombstone first, then the emptied folder.
-    expect(disk.trashed.map((t) => t.from)).toEqual(["Team/plan.md"]);
+    expect(disk.trashed).toEqual([]);
+    expect(disk.deleted).toEqual(["Team/plan.md"]);
     expect(disk.folders.has("Team")).toBe(false);
     expect(vi.mocked(api.createFolder)).not.toHaveBeenCalled();
   });
 
-  it("keeps a deleted folder that still holds content, re-registering it fresh", async () => {
-    // An unconfirmed note blocks its folder's removal — content must live
-    // somewhere — so the folder stays and goes back up under a NEW id.
+  it("removes a deleted folder once its mapped notes' unseen work is copied aside", async () => {
+    // Delete wins: every note inside was a MAPPED doc, so after the recovery
+    // copies the folder has nothing of this device's left and goes too.
     const disk = new FakeDisk();
     disk.folders.add("Team");
     disk.notes.set("Team/mine.md", "d1");
     disk.bodies.set("Team/mine.md", "words nobody else has");
+    disk.unseen.add("d1");
     const { api } = await twoPasses({
       disk,
       first: {
@@ -524,10 +963,57 @@ describe("inbound folder deletion", () => {
       then: { notes: [], tombstones: ["d1"], folders: [], folderTombstones: ["f1"] },
     });
 
-    expect(disk.folders.has("Team")).toBe(true);
-    expect(vi.mocked(api.createFolder)).toHaveBeenCalledWith(
+    expect(disk.copies.map((c) => c.from)).toEqual(["Team/mine.md"]);
+    expect(disk.folders.has("Team")).toBe(false);
+    expect(vi.mocked(api.createFolder)).not.toHaveBeenCalledWith(
       expect.objectContaining({ path: "Team" }),
     );
+  });
+
+  it("removes a folder made private along with its notes, and does not re-adopt it", async () => {
+    // The reported bug: the Access page set "Getting Started" to Private. On the
+    // teammate's device the notes left as revoked, but the folder — neither
+    // tombstoned nor moved, merely absent from the permission-filtered listing —
+    // stayed in the sidebar as an empty shell, and the outbound half re-adopted
+    // its hidden id on every pull.
+    const disk = new FakeDisk();
+    disk.folders.add("Getting Started");
+    disk.notes.set("Getting Started/welcome.md", "d1");
+    const { api } = await twoPasses({
+      disk,
+      first: {
+        notes: [{ id: "d1", rel_path: "Getting Started/welcome.md" }],
+        folders: [{ id: "f1", path: "Getting Started" }],
+      },
+      // Nothing deleted: both tombstone lists are answered and empty.
+      then: { notes: [], tombstones: [], folders: [], folderTombstones: [] },
+    });
+
+    expect(disk.deleted).toEqual(["Getting Started/welcome.md"]);
+    expect(disk.trashed).toEqual([]);
+    expect(disk.folders.has("Getting Started")).toBe(false);
+    expect(vi.mocked(api.createFolder)).not.toHaveBeenCalled();
+  });
+
+  it("removes a private folder once its mapped notes' unsent edits are kept locally (D7)", async () => {
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    disk.folders.add("Getting Started");
+    disk.notes.set("Getting Started/mine.md", "d1");
+    disk.bodies.set("Getting Started/mine.md", "words nobody else has");
+    disk.unseen.add("d1");
+    await twoPasses({
+      disk,
+      first: {
+        notes: [{ id: "d1", rel_path: "Getting Started/mine.md" }],
+        folders: [{ id: "f1", path: "Getting Started" }],
+      },
+      then: { notes: [], tombstones: [], folders: [], folderTombstones: [] },
+    });
+
+    expect(disk.copies.map((c) => c.from)).toEqual(["Getting Started/mine.md"]);
+    expect(disk.folders.has("Getting Started")).toBe(false);
+    expect(reconcileReport.items().map((i) => i.kind)).toEqual(["keptLocally"]);
   });
 
   it("removes the emptied old directory after a server-side folder move, and does not re-register it", async () => {
@@ -609,7 +1095,7 @@ describe("inbound folder deletion", () => {
     expect(reg.failures()).toEqual([]);
   });
 
-  it("trashes an EMPTY leftover of a deleted note that the plan could only suppress", async () => {
+  it("removes an EMPTY leftover of a deleted note that the plan could only suppress", async () => {
     // The file at the deleted note's path is still on disk, but the local index
     // keys it under a different id (a re-indexed placeholder). The plan can't
     // prove it is the same note, so it only suppresses re-registration; for an
@@ -626,7 +1112,7 @@ describe("inbound folder deletion", () => {
       },
       then: { notes: [], tombstones: ["d1"], folders: [{ id: "f1", path: "Team" }] },
     });
-    // twoPasses already trashed the file under its ORIGINAL id (the plain path,
+    // twoPasses already removed the file under its ORIGINAL id (the plain path,
     // covered elsewhere). Re-run the deleted state with the file re-keyed and
     // present again, as the production stubs were.
     disk.notes.set("Team/stub.md", "local-rekeyed");
@@ -636,7 +1122,8 @@ describe("inbound folder deletion", () => {
     reg.setInboundHost(recordingHost().host);
     await reg.reconcile({ organizationId: ORG, vaultName: "v" });
 
-    expect(disk.trashed.map((t) => t.from)).toEqual(["Team/stub.md"]);
+    expect(disk.trashed).toEqual([]);
+    expect(disk.deleted).toContain("Team/stub.md");
     expect(vi.mocked(api.createNote)).not.toHaveBeenCalled();
   });
 
@@ -742,5 +1229,1474 @@ describe("inbound folder deletion", () => {
     });
     expect(disk.folders.has("Team")).toBe(true);
     expect(ipc.deleteFolderIfEmpty).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Vault Settings → Access → Entire vault → Private, seen from the plain
+ * member's device.
+ *
+ * The per-ITEM Private already worked: one folder's notes are a small enough
+ * slice of the vault to fit under the revocation cap. The whole vault never can
+ * — it is 100% of the mapped set against a 50% ceiling — so the setting that
+ * promises "removed from their devices, including the local copies on disk"
+ * removed nothing, on any vault with more than 20 notes.
+ */
+describe("whole-vault Private reaches the member's disk", () => {
+  const N = 40;
+
+  function memberVault(nested = false): { disk: FakeDisk; state: ServerState } {
+    const disk = new FakeDisk();
+    disk.folders.add("Docs");
+    if (nested) disk.folders.add("Docs/Guides");
+    const notes: Array<{ id: string; rel_path: string }> = [];
+    for (let i = 0; i < N; i++) {
+      const path = nested && i % 2 === 1 ? `Docs/Guides/n${i}.md` : `Docs/n${i}.md`;
+      disk.notes.set(path, `d${i}`);
+      // Real content, and confirmed upstream below: the trash executor refuses
+      // any doc whose bytes this device never sent, so an empty-file vault
+      // would pass for the wrong reason.
+      disk.bodies.set(path, `note ${i}`);
+      notes.push({ id: `d${i}`, rel_path: path });
+    }
+    const folders = [{ id: "f1", path: "Docs" }];
+    if (nested) folders.push({ id: "f2", path: "Docs/Guides" });
+    return { disk, state: { notes, folders } };
+  }
+
+  /** Reconcile once (the shared state), carry the config, then reconcile against
+   *  a server that now shows the member nothing. */
+  async function afterPrivate(
+    authority: boolean,
+    opts: {
+      /** The resolver's second opinion (see `ServerState.accessCheck`). */
+      accessCheck?: "confirm" | "grant" | "fail";
+      /** Docs to mark confirmed-upstream. Default: all of them. */
+      pushed?: number;
+      /** Run a SECOND pull after the first, the way a launch does: the reconcile
+       *  is not authoritative, the channel's pull that follows is. */
+      thenAuthoritative?: boolean;
+      /** Half the notes in a nested `Docs/Guides` subfolder. */
+      nested?: boolean;
+    } = {},
+  ) {
+    const { disk, state } = memberVault(opts.nested);
+    install(disk);
+    const reg1 = new VaultRegistry(fakeApi(state));
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+
+    // The owner set the vault to Private: the member's ACL-filtered listings are
+    // empty, and both tombstone questions are ANSWERED (nothing was deleted).
+    const api = fakeApi({
+      notes: [],
+      tombstones: [],
+      folders: [],
+      folderTombstones: [],
+      accessCheck: opts.accessCheck,
+    });
+    if (opts.nested) {
+      // A member with No access may not create anything, so the server refuses
+      // to re-register a leftover folder rather than handing it a fresh id.
+      const { ApiError } = await import("../../api");
+      vi.mocked(api.createFolder).mockImplementation(async () => {
+        throw new ApiError(403, "no write access", { code: "no_write_access" });
+      });
+    }
+    let live = authority;
+    const reg = new VaultRegistry(api);
+    const host = recordingHost(false);
+    // The authority is read at plan time, so a two-pass run can change it
+    // between passes exactly the way a launch does.
+    (host.host as { revocationAuthority?: () => boolean }).revocationAuthority = () => live;
+    reg.setInboundHost(host.host);
+    const pushed = opts.pushed ?? N;
+    for (let i = 0; i < pushed; i++) reg.markPushed(`d${i}`);
+    // "Never confirmed upstream" is now modelled as what it always stood for:
+    // work on this device the server has not seen.
+    for (let i = pushed; i < N; i++) disk.unseen.add(`d${i}`);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    if (opts.thenAuthoritative !== undefined) {
+      live = opts.thenAuthoritative;
+      await reg.pull();
+    }
+    return { disk, reg, api, ...host };
+  }
+
+  it("removes every note and the folder on the pull the ACL frame asked for", async () => {
+    const r = await afterPrivate(true);
+
+    expect(r.disk.notes.size).toBe(0);
+    expect(r.disk.deleted).toHaveLength(N);
+    // Removed outright, never trashed: a copy under `.context/trash` would leave
+    // the ex-reader exactly the readable `.md` the revocation takes away.
+    expect(r.disk.trashed).toEqual([]);
+    expect(r.removed.every((x) => x.reason === "revoked" && x.trashedTo === null)).toBe(true);
+    // The emptied folder goes too, rather than sitting in the sidebar as a shell.
+    expect(r.disk.folders.size).toBe(0);
+    // And nothing is re-registered on the way out.
+    expect(vi.mocked(r.api.createNote)).not.toHaveBeenCalled();
+    expect(vi.mocked(r.api.createFolder)).not.toHaveBeenCalled();
+    expect(r.reg.hasFailures()).toBe(false);
+  });
+
+  it("still removes on the authoritative pull that FOLLOWS a refused reconcile", async () => {
+    // The real cold-launch sequence, which one pass cannot model: the launch
+    // reconcile runs before the vault channel is `synced`, so it is refused; the
+    // pull the channel then asks for is the authoritative one. This only works
+    // because the baseline accumulates rather than being rebuilt per pass — a
+    // refused pass must not forget which docs it had agreed were server-owned.
+    const r = await afterPrivate(false, { thenAuthoritative: true });
+
+    expect(r.disk.notes.size).toBe(0);
+    expect(r.disk.deleted).toHaveLength(N);
+    expect(vi.mocked(r.api.createNote)).not.toHaveBeenCalled();
+  });
+
+  it("remembers the pending folders across a relaunch", async () => {
+    // The refused pass leaves the notes and so the folders; a relaunch reads the
+    // config back, and the authoritative pull there must still remove them.
+    const r = await afterPrivate(false, { nested: true });
+    expect(r.disk.folders.size).toBe(2);
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    const saved = writes[writes.length - 1]?.[0] as unknown as string;
+    const cfg = JSON.parse(saved) as { revokedFolders?: Record<string, string> };
+    expect(cfg.revokedFolders).toEqual({ Docs: "f1", "Docs/Guides": "f2" });
+
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(saved as never);
+    const reg2 = new VaultRegistry(r.api);
+    const host2 = recordingHost(true);
+    reg2.setInboundHost(host2.host);
+    for (let i = 0; i < N; i++) reg2.markPushed(`d${i}`);
+    await reg2.reconcile({ organizationId: ORG, vaultName: "v" });
+    expect(r.disk.notes.size).toBe(0);
+    expect(r.disk.folders.size).toBe(0);
+  });
+
+  it("removes the emptied folder subtree on the pass that FOLLOWS a refused one", async () => {
+    // The refused pass tries the folders while their notes are still on disk,
+    // so the empty-only removal keeps them. The authoritative pass that removes
+    // the notes must still remove the folders, children before parents, rather
+    // than leave empty shells in the sidebar (re-invited with No access).
+    const r = await afterPrivate(false, { thenAuthoritative: true, nested: true });
+
+    expect(r.disk.notes.size).toBe(0);
+    expect(r.disk.folders.size).toBe(0);
+  });
+
+  it("refuses every removal the resolver will not confirm", async () => {
+    // The listing says the member may read nothing and the channel named every
+    // doc — but both are the same server function. `effectivePermission` is the
+    // one that could disagree, and when it does, the files stay.
+    const r = await afterPrivate(true, { accessCheck: "grant" });
+
+    expect(r.disk.notes.size).toBe(N);
+    expect(r.disk.deleted).toEqual([]);
+    expect(vi.mocked(r.api.accessCheck)).toHaveBeenCalledTimes(1);
+    expect(
+      r.reg.failures().some((f) => f.reason.includes("the resolver still grants access")),
+    ).toBe(true);
+    // Not suppressed either: a doc the server says we can still read is an
+    // ordinary note again, not one frozen out of every later pass.
+    expect(r.reg.hasFailures()).toBe(true);
+  });
+
+  it("removes nothing when the second opinion cannot be reached", async () => {
+    // No answer is not a yes. A permission change is never so urgent that it
+    // justifies deleting files on a round trip that did not happen.
+    const r = await afterPrivate(true, { accessCheck: "fail" });
+
+    expect(r.disk.notes.size).toBe(N);
+    expect(r.disk.deleted).toEqual([]);
+    expect(
+      r.reg.failures().some((f) => f.reason.includes("could not confirm the access change")),
+    ).toBe(true);
+  });
+
+  it("keeps a recovery copy of a revoked file holding unseen work, then removes it (D7)", async () => {
+    // Never destroy unsent edits because of someone else's permission change:
+    // the half with unseen work is copied to `.context/trash` first and
+    // reported as kept locally; the stale half is removed outright.
+    reconcileReport.clear();
+    const half = N / 2;
+    const r = await afterPrivate(true, { pushed: half });
+
+    expect(r.disk.notes.size).toBe(0);
+    expect(r.disk.deleted).toHaveLength(N);
+    expect(r.disk.copies).toHaveLength(N - half);
+    expect(r.reg.failures().filter((f) => f.kind === "orphan")).toHaveLength(0);
+    const kept = reconcileReport.items().filter((i) => i.kind === "keptLocally");
+    expect(kept.map((i) => i.path).sort()).toEqual(r.disk.copies.map((c) => c.from).sort());
+    expect(kept[0].detail).toMatch(/^\.context\/trash\//);
+  });
+
+  it("permanently removes an author's revoked note too", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("mine.md", "d1");
+    disk.bodies.set("mine.md", "my own words");
+    disk.notes.set("theirs.md", "d2");
+    disk.bodies.set("theirs.md", "someone else's");
+    install(disk);
+
+    const reg1 = new VaultRegistry(
+      fakeApi({
+        notes: [
+          { id: "d1", rel_path: "mine.md", created_by: ME },
+          { id: "d2", rel_path: "theirs.md", created_by: "user-them" },
+        ],
+      }),
+    );
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    const carried = writes[writes.length - 1]?.[0] as string;
+    // Authorship is PERSISTED, because a revoked doc is absent from the listing
+    // and there is nowhere left to read its author from when it matters.
+    expect(JSON.parse(carried).authored).toEqual({ userId: ME, docIds: ["d1"] });
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(carried as never);
+
+    const reg = new VaultRegistry(fakeApi({ notes: [], tombstones: [] }));
+    const host = recordingHost(true);
+    reg.setInboundHost(host.host);
+    reg.markPushed("d1");
+    reg.markPushed("d2");
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(disk.notes.size).toBe(0);
+    expect(disk.trashed).toEqual([]);
+    expect(disk.deleted.sort()).toEqual(["mine.md", "theirs.md"]);
+  });
+
+  it("corroborates the named survivors even when the unnamed half is refused", async () => {
+    // The executor half of R2, and the first test anywhere to drive it with a
+    // non-null named set — the shape production always has once the vault
+    // channel has named anything. 10 of 40 named: the other 30 blow
+    // revokeCap(40) = 20 and are struck, and the 10 survivors must STILL be
+    // corroborated rather than sliding under the cap the refusal just vacated.
+    const { disk, state } = memberVault();
+    install(disk);
+    const reg1 = new VaultRegistry(fakeApi(state));
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+
+    const named = new Set(Array.from({ length: 10 }, (_, i) => `d${i}`));
+    const api = fakeApi({ notes: [], tombstones: [], folders: [], folderTombstones: [] });
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost(true, named).host);
+    for (let i = 0; i < N; i++) reg.markPushed(`d${i}`);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(vi.mocked(api.accessCheck)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(api.accessCheck).mock.calls[0][1].sort()).toEqual([...named].sort());
+    expect(disk.deleted.length).toBe(10);
+    expect(disk.notes.size).toBe(N - 10);
+  });
+
+  it.each(["confirm", "grant", "fail"] as const)(
+    "keeps occupied folders safe during a large named cleanup when access check says %s",
+    async (accessCheck) => {
+      const disk = new FakeDisk();
+      const folders = Array.from({ length: 130 }, (_, i) => ({ id: `f${i}`, path: `F${i}` }));
+      for (const folder of folders) disk.folders.add(folder.path);
+      const notes = folders.map((f, i) => ({ id: `d${i}`, rel_path: `${f.path}/note.md` }));
+      for (const note of notes) {
+        disk.notes.set(note.rel_path, note.id);
+        disk.bodies.set(note.rel_path, "confirmed content");
+      }
+      install(disk);
+      const initial = new VaultRegistry(fakeApi({ notes, folders }));
+      initial.setInboundHost(recordingHost().host);
+      await initial.reconcile({ organizationId: ORG, vaultName: "v" });
+      const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+      vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+      const api = fakeApi({ notes: [], folders: [], tombstones: [], folderTombstones: [], accessCheck });
+      const reg = new VaultRegistry(api);
+      reg.setInboundHost(recordingHost(true, new Set(notes.map((n) => n.id))).host);
+      for (const note of notes) reg.markPushed(note.id);
+      const phases: Array<[string, number | undefined]> = [];
+      let done = 0;
+      reg.setProgressSink({ phase: (phase, total) => { phases.push([phase, total]); },
+        item: () => { done++; }, addTotal: () => {}, doc: () => {}, flush: () => {} });
+      await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+      expect(api.accessCheck).toHaveBeenCalled();
+      expect(disk.notes.size).toBe(accessCheck === "confirm" ? 0 : 130);
+      expect(disk.folders.size).toBe(accessCheck === "confirm" ? 0 : 130);
+      expect(reg.failures().some((f) => f.reason.includes("folder access removals"))).toBe(false);
+      if (accessCheck === "confirm") {
+        expect(ipc.deleteFilesBatch).toHaveBeenCalledTimes(3);
+        expect(vi.mocked(ipc.deleteFilesBatch).mock.calls.every(([items]) => items.length <= 64)).toBe(true);
+        expect(phases).toContainEqual(["removing", 260]);
+        expect(done).toBeGreaterThanOrEqual(260);
+      } else {
+        expect(ipc.deleteFilesBatch).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("chunks the access check rather than earning a 400", async () => {
+    // A vault larger than `ACCESS_CHECK_MAX` sent one oversized request, got a
+    // 400, and the catch read that as "no answer" — so the revocation never
+    // landed, on any vault of more than 2000 mapped notes, and repeated the
+    // whole failure on every connect.
+    const disk = new FakeDisk();
+    const big = ACCESS_CHECK_MAX + 1000;
+    const notes: Array<{ id: string; rel_path: string }> = [];
+    for (let i = 0; i < big; i++) {
+      const path = `n${i}.md`;
+      disk.notes.set(path, `d${i}`);
+      disk.bodies.set(path, "x");
+      notes.push({ id: `d${i}`, rel_path: path });
+    }
+    install(disk);
+    const reg1 = new VaultRegistry(fakeApi({ notes }));
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+
+    const api = fakeApi({ notes: [], tombstones: [], folders: [], folderTombstones: [] });
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost(true).host);
+    for (let i = 0; i < big; i++) reg.markPushed(`d${i}`);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    const calls = vi.mocked(api.accessCheck).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls.every((c) => c[1].length <= ACCESS_CHECK_MAX)).toBe(true);
+    expect(calls[0][1].length + calls[1][1].length).toBe(big);
+    // And the removal actually completes, which is the point.
+    expect(disk.notes.size).toBe(0);
+  }, 30_000);
+
+  it("fails the WHOLE group when any slice goes unanswered", async () => {
+    // Acting on the half that came back would delete files on a partial second
+    // opinion. `failAfter` lets the first slice answer and the second throw.
+    const disk = new FakeDisk();
+    const big = ACCESS_CHECK_MAX + 10;
+    const notes: Array<{ id: string; rel_path: string }> = [];
+    for (let i = 0; i < big; i++) {
+      const path = `n${i}.md`;
+      disk.notes.set(path, `d${i}`);
+      disk.bodies.set(path, "x");
+      notes.push({ id: `d${i}`, rel_path: path });
+    }
+    install(disk);
+    const reg1 = new VaultRegistry(fakeApi({ notes }));
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+
+    const api = fakeApi({
+      notes: [],
+      tombstones: [],
+      folders: [],
+      folderTombstones: [],
+      accessCheckFailAfter: 1,
+    });
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost(true).host);
+    for (let i = 0; i < big; i++) reg.markPushed(`d${i}`);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(disk.deleted).toEqual([]);
+    expect(disk.notes.size).toBe(big);
+  }, 30_000);
+
+  it("does not honour one account's authorship list for another account", async () => {
+    // `.context/config.json` travels with the vault and a device can be signed
+    // into a different account tomorrow. Inheriting A's list would mark A's
+    // notes recoverable for B — and the recoverable route writes a full readable
+    // `.md` into `.context/trash`, which is the exact leak the outright removal
+    // exists to prevent.
+    const disk = new FakeDisk();
+    disk.notes.set("mine.md", "d1");
+    disk.bodies.set("mine.md", "A wrote this");
+    install(disk);
+
+    const hostA = recordingHost();
+    const regA = new VaultRegistry(
+      fakeApi({ notes: [{ id: "d1", rel_path: "mine.md", created_by: ME }] }),
+    );
+    regA.setInboundHost(hostA.host);
+    await regA.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    const carried = writes[writes.length - 1]?.[0] as string;
+    expect(JSON.parse(carried).authored).toEqual({ userId: ME, docIds: ["d1"] });
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(carried as never);
+
+    // B signs in on the same device. The server no longer lists the note at all.
+    const regB = new VaultRegistry(fakeApi({ notes: [], tombstones: [] }));
+    const hostB = recordingHost(true);
+    (hostB.host as { localUserId?: () => string }).localUserId = () => "user-someone-else";
+    regB.setInboundHost(hostB.host);
+    regB.markPushed("d1");
+    await regB.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(disk.notes.size).toBe(0);
+    // Removed outright. A trash copy here would have handed B a readable copy of
+    // A's note.
+    expect(disk.deleted).toEqual(["mine.md"]);
+    expect(disk.trashed).toEqual([]);
+  });
+
+  it("removes nothing on a pull that carries no such authority", async () => {
+    // Either the session is not live yet (a launch still catching up, where an
+    // empty listing means "not there yet"), or no `acl-changed` frame announced
+    // this — a routine pull whose listing merely came back empty, which is what
+    // a server-side regression in the readable-set filter looks like.
+    const r = await afterPrivate(false);
+
+    expect(r.disk.notes.size).toBe(N);
+    expect(r.disk.deleted).toEqual([]);
+    expect(r.disk.folders.has("Docs")).toBe(true);
+    // The files stay, but they are NOT pushed back up: re-registering notes the
+    // server just stopped listing would re-create the member's copies under new
+    // ids — a revocation leaking content back in the wrong direction.
+    expect(vi.mocked(r.api.createNote)).not.toHaveBeenCalled();
+    // Refused loudly, not silently: the vault cannot read as fully synced.
+    expect(r.reg.hasFailures()).toBe(true);
+    expect(r.reg.failures().some((f) => f.reason.includes("access removals"))).toBe(true);
+  });
+});
+
+describe("a revoked tree binary leaves the disk like a revoked note", () => {
+  // The gap this closes: a `.pdf` set to Private stopped syncing and vanished
+  // from every teammate's sidebar, but stayed on the ex-reader's disk — fully
+  // readable in any viewer, forever. Notes had left since `ready.revoked`; files
+  // had no route at all, because they are in none of the listings the note plan
+  // reads.
+
+  it("deletes a named, access-checked binary and forgets its files row", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      authority: true,
+      files: { "Team/report.pdf": "file-1" },
+      named: new Set(["file-1"]),
+    });
+
+    expect(disk.binaries.has("Team/report.pdf")).toBe(false);
+    // Deleted, not moved aside: a copy in `.context/trash` left a revoked file
+    // readable on the ex-reader's disk for good.
+    expect(disk.deleted).toEqual(["Team/report.pdf"]);
+    expect(disk.trashed).toEqual([]);
+    // The note beside it is untouched: the binary pass reads `localFiles` only.
+    expect(disk.notes.has("a.md")).toBe(true);
+    expect(r.filesRemoved).toEqual([{ path: "Team/report.pdf", trashedTo: null }]);
+    // The mapping goes with the file, or the next `hello` re-announces an id
+    // whose file is not here and the server names it revoked on every connect.
+    expect(r.reg.getFileId("Team/report.pdf")).toBeNull();
+    expect(r.reg.fileDocIds()).toEqual([]);
+    expect(reconcileReport.items().some((i) => i.kind === "keptLocally")).toBe(false);
+  });
+
+  it("keeps a recovery copy of a binary edited here since the server last agreed on it", async () => {
+    // Confirmation proves an EARLIER upload. A spreadsheet edited offline, or
+    // still inside the upload quiet period, holds work the server never saw;
+    // deleting it on a revocation would lose that work everywhere.
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.xlsx");
+    disk.editedBinaries.set("Team/report.xlsx", "edited-offline");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      authority: true,
+      files: { "Team/report.xlsx": "file-1" },
+      named: new Set(["file-1"]),
+    });
+
+    expect(disk.binaries.has("Team/report.xlsx")).toBe(false);
+    expect(disk.deleted).toEqual([]);
+    expect(disk.trashed).toEqual([{ from: "Team/report.xlsx", to: expect.stringContaining(".context/trash/") }]);
+    expect(r.filesRemoved).toEqual([{ path: "Team/report.xlsx", trashedTo: disk.trashed[0].to }]);
+    expect(r.reg.getFileId("Team/report.xlsx")).toBeNull();
+    expect(reconcileReport.items()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "keptLocally", docId: "file-1", detail: disk.trashed[0].to }),
+    ]));
+  });
+
+  it("keeps a recovery copy when there is no agreed base or the disk cannot be hashed", async () => {
+    for (const patch of [undefined, () => { vi.mocked(ipc.listBinaries).mockRejectedValue(new Error("busy")); }]) {
+      reconcileReport.clear();
+      const disk = new FakeDisk();
+      disk.notes.set("a.md", "d1");
+      disk.binaries.add("Team/report.pdf");
+      await twoPasses({
+        disk,
+        first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+        then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+        authority: true,
+        files: { "Team/report.pdf": "file-1" },
+        named: new Set(["file-1"]),
+        fileBases: patch ? undefined : {},
+        patch,
+      });
+      expect(disk.deleted).toEqual([]);
+      expect(disk.trashed).toEqual([{ from: "Team/report.pdf", to: expect.stringContaining(".context/trash/") }]);
+    }
+  });
+
+  it("forgets the files row even when the vault changes after the binary was deleted", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    let paused = false;
+    const original = VaultRegistry.prototype.setInboundHost;
+    const spy = vi.spyOn(VaultRegistry.prototype, "setInboundHost").mockImplementation(function (
+      this: VaultRegistry,
+      host,
+    ) {
+      return original.call(this, host ? { ...host, structurePaused: () => paused } : host);
+    });
+    try {
+      const r = await twoPasses({
+        disk,
+        first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+        then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+        authority: true,
+        files: { "Team/report.pdf": "file-1" },
+        named: new Set(["file-1"]),
+        patch: () => {
+          const remove = vi.mocked(ipc.deleteFile).getMockImplementation()!;
+          vi.mocked(ipc.deleteFile).mockImplementation((async (...a: Parameters<typeof remove>) => {
+            const out = await remove(...a);
+            paused = true; // the vault changed while the delete was in flight
+            return out;
+          }) as never);
+        },
+      });
+      expect(disk.binaries.has("Team/report.pdf")).toBe(false);
+      expect(r.reg.getFileId("Team/report.pdf")).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("leaves the binary and its identity when it cannot be deleted", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("report.pdf");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      authority: true,
+      files: { "report.pdf": "file-1" },
+      named: new Set(["file-1"]),
+      patch: () => { vi.mocked(ipc.deleteFile).mockRejectedValue(new Error("permission denied")); },
+    });
+    expect(disk.binaries.has("report.pdf")).toBe(true);
+    expect(disk.deleted).toEqual([]);
+    expect(r.reg.getFileId("report.pdf")).toBe("file-1");
+    expect(r.filesRemoved).toEqual([]);
+  });
+
+  it("claims the watcher echo first, so the delete queue never sees it", async () => {
+    // Without the claim the removal reads to `binaryDeletes.ts` as "gone from
+    // disk, still on the server" — a user delete — and it answers with
+    // `DELETE /api/files/:id`, destroying the OWNER's copy of a file they had
+    // only meant to stop sharing.
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      authority: true,
+      files: { "Team/report.pdf": "file-1" },
+      named: new Set(["file-1"]),
+    });
+    expect(r.suppressed).toEqual(["Team/report.pdf"]);
+  });
+
+  it("always asks the resolver — a binary has no listing absence to corroborate it", async () => {
+    // A small revocation of NOTES skips the round trip: the cap is already what
+    // bounds the damage, and the listing is a second reading. A binary has only
+    // the name, so the second opinion is not optional. One file, cap 20.
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      authority: true,
+      files: { "Team/report.pdf": "file-1" },
+      named: new Set(["file-1"]),
+    });
+    expect(vi.mocked(r.api.accessCheck)).toHaveBeenCalledWith(VAULT, ["file-1"]);
+  });
+
+  it("leaves it alone when the resolver still grants access", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [], accessCheck: "grant" },
+      authority: true,
+      files: { "Team/report.pdf": "file-1" },
+      named: new Set(["file-1"]),
+    });
+    expect(disk.binaries.has("Team/report.pdf")).toBe(true);
+    expect(disk.deleted).toEqual([]);
+    // …and the contradicted id leaves the named set, so no later pass retries it.
+    expect(r.refused).toEqual(["file-1"]);
+    expect(r.reg.getFileId("Team/report.pdf")).toBe("file-1");
+  });
+
+  it("leaves it alone when the access check cannot be reached", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [], accessCheck: "fail" },
+      authority: true,
+      files: { "Team/report.pdf": "file-1" },
+      named: new Set(["file-1"]),
+    });
+    expect(disk.binaries.has("Team/report.pdf")).toBe(true);
+    expect(disk.deleted).toEqual([]);
+  });
+
+  it("removes nothing when the server named nothing — the old-server path", async () => {
+    // `authoritative` alone lifts the NOTE cap wholesale, but a binary has no
+    // absence to act on: no name, no removal, on any server that predates
+    // `ready.revoked`.
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      authority: true,
+      files: { "Team/report.pdf": "file-1" },
+    });
+    expect(disk.binaries.has("Team/report.pdf")).toBe(true);
+    expect(disk.deleted).toEqual([]);
+  });
+
+  it("removes nothing without revocation authority", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      files: { "Team/report.pdf": "file-1" },
+      named: new Set(["file-1"]),
+    });
+    expect(disk.binaries.has("Team/report.pdf")).toBe(true);
+  });
+
+  it("keeps the uploader's own revoked binary in recovery instead of deleting it", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("mine.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    install(disk);
+
+    const reg1 = new VaultRegistry(
+      fakeApi({ notes: [{ id: "d1", rel_path: "mine.md", created_by: ME }] }),
+    );
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    const carried = JSON.parse(writes[writes.length - 1]?.[0] as string);
+    // Authorship of the BINARY is carried the same way a note's is: the doc is
+    // absent from every listing by the time the answer is needed.
+    carried.files = { "Team/report.pdf": "file-1" };
+    carried.filesConfirmed = ["file-1"];
+    carried.authored = { userId: ME, docIds: ["d1", "file-1"] };
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(JSON.stringify(carried) as never);
+
+    const reg = new VaultRegistry(fakeApi({ notes: [{ id: "d1", rel_path: "mine.md" }], tombstones: [] }));
+    const host = recordingHost(true, new Set(["file-1"]));
+    reg.setInboundHost(host.host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(disk.binaries.has("Team/report.pdf")).toBe(false);
+    expect(disk.deleted).toEqual([]);
+    expect(disk.trashed).toEqual([{ from: "Team/report.pdf", to: expect.stringContaining(".context/trash/") }]);
+    expect(host.filesRemoved).toEqual([{ path: "Team/report.pdf", trashedTo: disk.trashed[0].to }]);
+  });
+
+  it("keeps a binary whose bytes this device never confirmed upstream", async () => {
+    // The hole this closes. A `files` row is minted BEFORE the upload
+    // (`attachments.ts ensureFileRow`), and on a Free vault — or above the blob
+    // size ceiling, or behind a full quota — the bytes never follow. Reading the
+    // row as "the server has it" and removing the file on a revocation destroys
+    // the ONLY copy, which is exactly what `isPushed` refuses to do for a note.
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      authority: true,
+      files: { "Team/report.pdf": "file-1" },
+      filesConfirmed: [],
+      named: new Set(["file-1"]),
+    });
+
+    expect(disk.binaries.has("Team/report.pdf")).toBe(true);
+    expect(disk.deleted).toEqual([]);
+    expect(r.filesRemoved).toEqual([]);
+    // The mapping SURVIVES: a later pass that does confirm these bytes may
+    // remove the file properly. It just stays out of the `hello` claim
+    // meanwhile, so nothing re-announces it.
+    expect(r.reg.getFileId("Team/report.pdf")).toBe("file-1");
+    expect(r.reg.fileDocIds()).toEqual([]);
+    expect(r.reg.failures().map((f) => [f.kind, f.path, f.reason])).toEqual([
+      [
+        "orphan",
+        "Team/report.pdf",
+        "access was removed, but this device never confirmed its bytes upstream, so it was left on disk",
+      ],
+    ]);
+  });
+
+  it("does not announce an unconfirmed binary, so the server cannot name it", async () => {
+    // Belt and braces are different rails: the guard above refuses the removal,
+    // this keeps the question from being asked at all. It matters because every
+    // `ready.revoked` re-stamps the ACL-authority clock, so a permanently
+    // unconfirmable file would hold the wholesale-removal window open for every
+    // OTHER doc on every reconnect.
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.binaries.add("Team/report.pdf");
+    disk.binaries.add("Team/slides.pptx");
+    const r = await twoPasses({
+      disk,
+      first: { notes: [{ id: "d1", rel_path: "a.md" }] },
+      then: { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] },
+      files: { "Team/report.pdf": "file-1", "Team/slides.pptx": "file-2" },
+      filesConfirmed: ["file-2"],
+    });
+    expect(r.reg.fileDocIds()).toEqual(["file-2"]);
+  });
+});
+
+describe("a revoked binary that is already off disk", () => {
+  it("forgets the mapping instead of failing this pass and every pass after it", async () => {
+    // The user deleted the file in the same window the revocation landed in.
+    // `delete_file` is idempotent for a missing source, so the mapping can be
+    // forgotten instead of re-planning the removal forever.
+    const disk = new FakeDisk();
+    disk.notes.set("mine.md", "d1");
+    install(disk);
+
+    const reg1 = new VaultRegistry(
+      fakeApi({ notes: [{ id: "d1", rel_path: "mine.md", created_by: ME }] }),
+    );
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    const carried = JSON.parse(writes[writes.length - 1]?.[0] as string);
+    // Mapped, authored — but never on this fake disk.
+    carried.files = { "Team/gone.pdf": "file-1" };
+    carried.filesConfirmed = ["file-1"];
+    carried.authored = { userId: ME, docIds: ["file-1"] };
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(JSON.stringify(carried) as never);
+
+    const reg = new VaultRegistry(fakeApi({ notes: [{ id: "d1", rel_path: "mine.md" }], tombstones: [] }));
+    reg.setInboundHost(recordingHost(true, new Set(["file-1"])).host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(reg.getFileId("Team/gone.pdf")).toBeNull();
+    expect(reg.hasFailures()).toBe(false);
+  });
+});
+
+// ── Bulk removals run pooled ───────────────────────────────────────────────
+// A folder a teammate deleted arrives here as one path per note. The loop that
+// executes them used to be serial — one IPC round trip per file with the disk
+// idle in between — while every decision about WHICH files go was already made
+// (and capped) by `planInbound`. These pin the two halves of that change: the
+// removals overlap, and one refusal is still just one file's.
+describe("inbound removals are pooled", () => {
+  /** 100 notes on the server so 20 deletions fit under `trashCap` (20%). */
+  function hundredNotes() {
+    return Array.from({ length: 100 }, (_, i) => ({ id: `d${i}`, rel_path: `n${i}.md` }));
+  }
+
+  it("runs removals concurrently, bounded", async () => {
+    const disk = new FakeDisk();
+    const notes = hundredNotes();
+    for (const n of notes) disk.notes.set(n.rel_path, n.id);
+
+    let inflight = 0;
+    let maxInflight = 0;
+    const gone = notes.slice(0, 20);
+    const { removed } = await twoPasses({
+      disk,
+      first: { notes },
+      then: { notes: notes.slice(20), tombstones: gone.map((n) => n.id) },
+      patch: () => {
+        const remove = vi.mocked(ipc.deleteFile).getMockImplementation()!;
+        vi.mocked(ipc.deleteFile).mockImplementation((async (...args: unknown[]) => {
+          inflight++;
+          maxInflight = Math.max(maxInflight, inflight);
+          await new Promise((r) => setTimeout(r, 1));
+          inflight--;
+          return (remove as (...a: unknown[]) => unknown)(...args);
+        }) as never);
+      },
+    });
+
+    expect(removed).toHaveLength(20);
+    // Serially this was pinned at 1; the pool is bounded at 8.
+    expect(maxInflight).toBeGreaterThan(1);
+    expect(maxInflight).toBeLessThanOrEqual(8);
+  });
+
+  it("a refusal on one removal leaves the other nineteen done", async () => {
+    const disk = new FakeDisk();
+    const notes = hundredNotes();
+    for (const n of notes) disk.notes.set(n.rel_path, n.id);
+    const gone = notes.slice(0, 20);
+    const { reg, removed } = await twoPasses({
+      disk,
+      first: { notes },
+      then: { notes: notes.slice(20), tombstones: gone.map((n) => n.id) },
+      patch: () => {
+        const remove = vi.mocked(ipc.deleteFile).getMockImplementation()!;
+        vi.mocked(ipc.deleteFile).mockImplementation((async (...args: unknown[]) => {
+          // The one file the OS refuses (locked by another process, say).
+          if (args[0] === "n7.md") throw new Error("permission denied");
+          return (remove as (...a: unknown[]) => unknown)(...args);
+        }) as never);
+      },
+    });
+
+    expect(removed).toHaveLength(19);
+    expect(removed.map((r) => r.path)).not.toContain("n7.md");
+    expect(disk.notes.has("n7.md")).toBe(true); // still there, to try again
+    // Recorded, not swallowed — and it is the only failure.
+    expect(reg.hasFailures()).toBe(true);
+    expect(reg.failures().map((f) => f.path)).toEqual(["n7.md"]);
+  });
+});
+
+describe("offline reconciliation — the acknowledged state vector gate", () => {
+  /** Pass 1 syncs d1; pass 2 sees it tombstoned with this device's CRDT at `localSv`
+   *  and the server's acknowledgement at `acked`. */
+  async function deleteWith(
+    localSv: Uint8Array,
+    acked: Uint8Array | null,
+    opts: { body?: string; crdtText?: string } = {},
+  ) {
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    disk.notes.set("n.md", "d1");
+    disk.bodies.set("n.md", opts.body ?? "text on disk");
+    install(disk);
+    const textCopies: Array<{ path: string; content: string }> = [];
+    vi.mocked(ipc.writeTrashCopy).mockImplementation((async (p: string, stamp: string, content: string) => {
+      textCopies.push({ path: p, content });
+      return `.context/trash/${stamp}/${p}`;
+    }) as never);
+    const reg1 = new VaultRegistry(fakeApi({ notes: [{ id: "d1", rel_path: "n.md" }] }));
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const carry = () => {
+      const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+      vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+    };
+    carry();
+    const then = { notes: [], tombstones: ["d1"] };
+    const api = fakeApi(then);
+    const reg = new VaultRegistry(api);
+    const host = recordingHost();
+    (host.host as InboundHost).localStateVector = async () => localSv;
+    reg.setInboundHost(host.host);
+    (host.host as InboundHost).localText = async () => opts.crdtText ?? null;
+    if (acked) reg.recordAck("d1", acked);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    return { disk, reg, api, carry, then, textCopies };
+  }
+
+  it("closed-app offline edit, then a teammate's delete: recovery copy first", async () => {
+    const doc = new Y.Doc();
+    doc.getText("content").insert(0, "synced text");
+    const acked = Y.encodeStateVector(doc);
+    doc.getText("content").insert(11, " + offline edit"); // made while the app was closed
+    const { disk } = await deleteWith(Y.encodeStateVector(doc), acked);
+    expect(disk.copies.map((c) => c.from)).toEqual(["n.md"]);
+    expect(disk.notes.has("n.md")).toBe(false);
+    expect(reconcileReport.items().map((i) => i.kind)).toEqual(["deletedByTeammate"]);
+  });
+
+  it("open-but-disconnected edit (never acknowledged at all): recovery copy first", async () => {
+    const doc = new Y.Doc();
+    doc.getText("content").insert(0, "typed with no network");
+    const { disk } = await deleteWith(Y.encodeStateVector(doc), null);
+    expect(disk.copies.map((c) => c.from)).toEqual(["n.md"]);
+    expect(disk.notes.has("n.md")).toBe(false);
+  });
+
+  it("a stale device accepts the delete outright and does not resurrect it", async () => {
+    const doc = new Y.Doc();
+    doc.getText("content").insert(0, "synced text");
+    const sv = Y.encodeStateVector(doc);
+    const { disk, carry, then } = await deleteWith(sv, sv);
+    expect(disk.copies).toEqual([]);
+    expect(disk.deleted).toEqual(["n.md"]);
+    expect(reconcileReport.items()).toEqual([]);
+    // A later pass neither re-creates the file nor re-registers the note.
+    carry();
+    const api = fakeApi(then);
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost().host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    expect(disk.notes.has("n.md")).toBe(false);
+    expect(vi.mocked(api.createNote)).not.toHaveBeenCalled();
+    expect(vi.mocked(ipc.writeNoteIfMissing)).not.toHaveBeenCalledWith("n.md", expect.anything(), expect.anything());
+  });
+
+  it("an empty file over unacked CRDT ops: the CRDT's text is what goes to the trash", async () => {
+    const doc = new Y.Doc();
+    doc.getText("content").insert(0, "only in the CRDT");
+    const { textCopies, disk } = await deleteWith(Y.encodeStateVector(doc), null, {
+      body: "",
+      crdtText: "only in the CRDT",
+    });
+    expect(textCopies).toEqual([{ path: "n.md", content: "only in the CRDT" }]);
+    expect(disk.copies).toEqual([]);
+    expect(disk.notes.has("n.md")).toBe(false);
+  });
+
+  it("persists the acknowledgement across a relaunch", async () => {
+    const doc = new Y.Doc();
+    doc.getText("content").insert(0, "x");
+    const { reg } = await deleteWith(Y.encodeStateVector(doc), Y.encodeStateVector(doc));
+    void reg;
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    const cfg = JSON.parse(writes[writes.length - 1]?.[0] as string);
+    // d1 left the vault (tombstoned + removed), so its ack was pruned with it.
+    expect(cfg.ackedSv?.d1).toBeUndefined();
+  });
+});
+
+describe("offline reconciliation — folder kept by this device's new notes (D8)", () => {
+  it("keeps a teammate-deleted folder holding a note created here, and says so", async () => {
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    disk.folders.add("Team");
+    disk.notes.set("Team/old.md", "d1");
+    install(disk);
+    const reg1 = new VaultRegistry(
+      fakeApi({ notes: [{ id: "d1", rel_path: "Team/old.md" }], folders: [{ id: "f1", path: "Team" }] }),
+    );
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+
+    // Offline, this device made a new note inside the folder the teammate deletes.
+    disk.notes.set("Team/new.md", "local-new");
+    disk.bodies.set("Team/new.md", "written offline");
+    const reg = new VaultRegistry(
+      fakeApi({ notes: [], tombstones: ["d1"], folders: [], folderTombstones: ["f1"] }),
+    );
+    reg.setInboundHost(recordingHost().host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+
+    expect(disk.folders.has("Team")).toBe(true);
+    expect(disk.notes.has("Team/new.md")).toBe(true);
+    expect(disk.notes.has("Team/old.md")).toBe(false);
+    expect(reconcileReport.items()).toEqual([
+      expect.objectContaining({ kind: "folderKept", path: "Team" }),
+    ]);
+  });
+});
+
+describe("own in-app delete of a nested tree", () => {
+  /** Context/beliefs/captures/a.md (d1), Context/beliefs/b.md (d2), agreed on a
+   *  first pass; then an unpushed local note lands in captures and d1 holds ops
+   *  the server never acknowledged. */
+  async function tree() {
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    for (const f of ["Context", "Context/beliefs", "Context/beliefs/captures"]) disk.folders.add(f);
+    disk.notes.set("Context/beliefs/captures/a.md", "d1");
+    disk.bodies.set("Context/beliefs/captures/a.md", "a");
+    disk.notes.set("Context/beliefs/b.md", "d2");
+    disk.bodies.set("Context/beliefs/b.md", "b");
+    install(disk);
+    // Recursive, like Rust's `delete_path`.
+    vi.mocked(ipc.deletePath).mockImplementation((async (p: string) => {
+      const under = (x: string) => x === p || x.startsWith(p + "/");
+      for (const n of [...disk.notes.keys()]) if (under(n)) { disk.notes.delete(n); disk.bodies.delete(n); }
+      for (const f of [...disk.folders]) if (under(f)) disk.folders.delete(f);
+    }) as never);
+    const state: ServerState = {
+      notes: [
+        { id: "d1", rel_path: "Context/beliefs/captures/a.md" },
+        { id: "d2", rel_path: "Context/beliefs/b.md" },
+      ],
+      folders: [
+        { id: "f1", path: "Context" },
+        { id: "f2", path: "Context/beliefs" },
+        { id: "f3", path: "Context/beliefs/captures" },
+      ],
+    };
+    const api = fakeApi(state);
+    const reg = new VaultRegistry(api);
+    reg.setInboundHost(recordingHost().host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    disk.notes.set("Context/beliefs/captures/new.md", "local-new");
+    disk.bodies.set("Context/beliefs/captures/new.md", "written, not pushed yet");
+    disk.unseen.add("d1");
+    const tombstoneAll = () => {
+      state.notes = [];
+      state.folders = [];
+      state.tombstones = ["d1", "d2"];
+      state.folderTombstones = ["f1", "f2", "f3"];
+    };
+    return { disk, api, reg, tombstoneAll };
+  }
+
+  it("removes everything, even with pulls racing between server and disk, and reports nothing", async () => {
+    const { disk, api, reg, tombstoneAll } = await tree();
+    vi.mocked(api.createFolder).mockClear();
+    vi.mocked(api.createNote).mockClear();
+    vi.mocked(ipc.copyToTrash).mockClear();
+    const selection = ["Context/beliefs/captures", "Context/beliefs", "Context"];
+    // Server first, deepest first, as the sidebar's bulk delete orders them.
+    for (const p of selection) await reg.deletePath(p);
+    // A pull whose listing predates the commit still names the folders…
+    await reg.pull();
+    // …then one that sees the tombstones, both before the disk half ran.
+    tombstoneAll();
+    await reg.pull();
+    // The sidebar's own disk half, then a settling pull.
+    for (const p of selection) await ipc.deletePath(p);
+    await reg.pull();
+
+    expect([...disk.folders]).toEqual([]);
+    expect([...disk.notes.keys()]).toEqual([]);
+    expect(reconcileReport.items()).toEqual([]);
+    expect(ipc.copyToTrash).not.toHaveBeenCalled();
+    expect(api.createFolder).not.toHaveBeenCalled();
+    expect(api.createNote).not.toHaveBeenCalled();
+  });
+
+  it("a stale listing applied AFTER the disk half never re-creates the folders, even past the own-delete window", async () => {
+    const { disk, api, reg, tombstoneAll } = await tree();
+    vi.mocked(api.createFolder).mockClear();
+    vi.mocked(api.createNote).mockClear();
+    const selection = ["Context/beliefs/captures/new.md", "Context/beliefs/captures", "Context/beliefs", "Context"];
+    for (const p of selection) await reg.deletePath(p);
+    // The sidebar's disk half lands first this time…
+    for (const p of selection) await ipc.deletePath(p);
+    // …then a pull whose listing predates the server commits still names the
+    // notes and the folders.
+    await reg.pull();
+    expect([...disk.folders]).toEqual([]);
+    expect([...disk.notes.keys()]).toEqual([]);
+
+    // Past the own-delete window nothing is left on disk to register.
+    const realNow = Date.now;
+    const later = realNow() + OWN_DELETE_TTL_MS + 1_000;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => later);
+    try {
+      tombstoneAll();
+      await reg.pull();
+    } finally {
+      spy.mockRestore();
+    }
+    expect([...disk.folders]).toEqual([]);
+    expect(api.createFolder).not.toHaveBeenCalled();
+    expect(api.createNote).not.toHaveBeenCalled();
+  });
+
+  it("a teammate's delete of the same tree still keeps the folder holding this device's new note", async () => {
+    const { disk, reg, tombstoneAll } = await tree();
+    tombstoneAll();
+    await reg.pull();
+
+    expect(disk.folders.has("Context/beliefs/captures")).toBe(true);
+    expect(disk.notes.has("Context/beliefs/captures/new.md")).toBe(true);
+    expect(disk.notes.has("Context/beliefs/b.md")).toBe(false);
+    expect(reconcileReport.items()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "folderKept", path: "Context/beliefs/captures" }),
+      ]),
+    );
+  });
+});
+
+describe("offline reconciliation — same-path create (D4)", () => {
+  /** Pass 1 agrees on `a.md` (a baseline exists); then this device creates
+   *  `P.md` offline while a teammate's `P.md` lands on the server. */
+  async function sameCreate(opts: {
+    serverCreatedAt: string;
+    localCreated: number | null;
+    updateNote?: (id: string, input: { relPath?: string }) => Promise<unknown>;
+    baseline?: boolean;
+    /** This device's local CRDT text per doc id (absent ⇒ never seen). */
+    localText?: Record<string, string>;
+    /** Extra same-path pairs: local file + a teammate's server note at it. */
+    extra?: number;
+  }) {
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    if (opts.baseline !== false) disk.notes.set("a.md", "d0");
+    install(disk);
+    vi.mocked(ipc.fileStat).mockImplementation((async () => ({
+      size: 10, modified: opts.localCreated, created: opts.localCreated,
+    })) as never);
+    if (opts.baseline !== false) {
+      const reg1 = new VaultRegistry(fakeApi({ notes: [{ id: "d0", rel_path: "a.md" }] }));
+      reg1.setInboundHost(recordingHost().host);
+      await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+      const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+      vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+    }
+    disk.notes.set("P.md", "local-b");
+    disk.bodies.set("P.md", "B's words");
+    const theirs = { id: "d9", rel_path: "P.md", createdAt: opts.serverCreatedAt };
+    const extra = Array.from({ length: opts.extra ?? 0 }, (_, i) => {
+      disk.notes.set(`E${i}.md`, `local-e${i}`);
+      disk.bodies.set(`E${i}.md`, `words ${i}`);
+      return { id: `de${i}`, rel_path: `E${i}.md`, createdAt: opts.serverCreatedAt };
+    });
+    const api = fakeApi({
+      notes: [...(opts.baseline !== false ? [{ id: "d0", rel_path: "a.md" }] : []), theirs, ...extra],
+      tombstones: [],
+    });
+    const updateNote = vi.fn(opts.updateNote ?? (async (_id: string, input: { relPath?: string }) => ({
+      id: "d9", rel_path: input.relPath, title: null,
+    })));
+    (api as unknown as { updateNote: typeof updateNote }).updateNote = updateNote;
+    const reg = new VaultRegistry(api);
+    const { host } = recordingHost();
+    const texts = opts.localText;
+    reg.setInboundHost(texts ? { ...host, localText: async (id) => texts[id] ?? null } : host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    return { disk, reg, api, updateNote };
+  }
+
+  it("never treats a note this device already holds as a same-path create", async () => {
+    // A reset re-downloads the vault: the file at P.md IS the teammate's note,
+    // written here from the server, and the local CRDT for d9 proves it.
+    const { disk, reg, updateNote } = await sameCreate({
+      serverCreatedAt: "2020-01-01T00:00:00Z",
+      localCreated: Date.parse("2026-09-26T00:00:00Z"),
+      localText: { d9: "B's words" },
+    });
+    expect(updateNote).not.toHaveBeenCalled();
+    expect([...disk.notes.keys()].some((p) => p.includes("(conflict "))).toBe(false);
+    expect(disk.notes.has("P.md")).toBe(true);
+    expect(reg.getMapping("P.md")?.docId).toBe("d9");
+    expect(reconcileReport.items()).toEqual([]);
+  });
+
+  it("renames nothing when one pass finds more clashes than the cap", async () => {
+    const { disk, reg, updateNote } = await sameCreate({
+      serverCreatedAt: "2026-09-26T12:00:00Z",
+      localCreated: Date.parse("2026-09-25T00:00:00Z"),
+      extra: 12,
+    });
+    expect(updateNote).not.toHaveBeenCalled();
+    expect([...disk.notes.keys()].some((p) => p.includes("(conflict "))).toBe(false);
+    expect(disk.notes.get("P.md")).toBe("local-b");
+    expect(reg.getMapping("P.md")?.docId ?? null).not.toBe("d9");
+    expect(reconcileReport.items()).toEqual([]);
+    expect(reg.failures().some((f) => f.path === "P.md")).toBe(true);
+  });
+
+  it("marks its own conflict move so the drain cannot pair it into a server rename", async () => {
+    const { disk, reg } = await sameCreate({
+      serverCreatedAt: "2020-01-01T00:00:00Z",
+      localCreated: Date.parse("2026-09-26T00:00:00Z"),
+    });
+    const moved = [...disk.notes.keys()].find((p) => p.startsWith("P (conflict "))!;
+    expect(reg.isOwnMove("P.md")).toBe(true);
+    expect(reg.isOwnMove(moved)).toBe(true);
+    expect(reg.isOwnMove("a.md")).toBe(false);
+  });
+
+  it("the local note is later: it is renamed and never bound to the teammate's id", async () => {
+    const { disk, reg, updateNote } = await sameCreate({
+      serverCreatedAt: "2020-01-01T00:00:00Z",
+      localCreated: Date.parse("2026-09-26T00:00:00Z"),
+    });
+    expect(updateNote).not.toHaveBeenCalled();
+    const moved = [...disk.notes].find(([p]) => p.startsWith("P (conflict "));
+    expect(moved?.[1]).toBe("local-b");
+    expect(disk.bodies.get(moved![0])).toBe("B's words");
+    expect(reg.getMapping(moved![0])?.docId ?? null).not.toBe("d9");
+    const item = reconcileReport.items().find((i) => i.kind === "renamedConflict");
+    expect(item).toMatchObject({ path: "P.md", newPath: moved![0] });
+  });
+
+  it("the server note is later: the teammate's note is renamed, ours keeps the path", async () => {
+    const { disk, reg, updateNote } = await sameCreate({
+      serverCreatedAt: "2026-09-26T12:00:00Z",
+      localCreated: Date.parse("2026-09-25T00:00:00Z"),
+    });
+    expect(updateNote).toHaveBeenCalledWith("d9", { relPath: expect.stringMatching(/^P \(conflict \d{4}-\d{2}-\d{2}\)\.md$/) });
+    expect(disk.notes.get("P.md")).toBe("local-b");
+    expect(disk.bodies.get("P.md")).toBe("B's words");
+    expect(reg.getMapping("P.md")?.docId ?? null).not.toBe("d9");
+    expect(reconcileReport.items().map((i) => i.kind)).toContain("renamedConflict");
+  });
+
+  it("a refused server rename falls back to moving the local file", async () => {
+    const { disk, reg } = await sameCreate({
+      serverCreatedAt: "2026-09-26T12:00:00Z",
+      localCreated: Date.parse("2026-09-25T00:00:00Z"),
+      updateNote: async () => { throw new Error("403 no_write_access"); },
+    });
+    expect(disk.notes.has("P.md")).toBe(false);
+    const moved = [...disk.notes].find(([p]) => p.startsWith("P (conflict "));
+    expect(moved?.[1]).toBe("local-b");
+    expect(reg.getMapping(moved![0])?.docId ?? null).not.toBe("d9");
+  });
+
+  it("a first sync with no baseline still adopts by path (no conflict)", async () => {
+    const { disk, updateNote } = await sameCreate({
+      serverCreatedAt: "2020-01-01T00:00:00Z",
+      localCreated: Date.parse("2026-09-26T00:00:00Z"),
+      baseline: false,
+    });
+    expect(updateNote).not.toHaveBeenCalled();
+    expect(disk.notes.has("P.md")).toBe(true);
+    expect(reconcileReport.items()).toEqual([]);
+  });
+});
+
+describe("offline reconciliation — closed-app rename and delete (row 4b, D5)", () => {
+  async function afterClosedApp(change: (disk: FakeDisk) => void, localText: string | null) {
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    disk.bodies.set("a.md", "hello there");
+    install(disk);
+    const listing = { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] as string[] };
+    const reg1 = new VaultRegistry(fakeApi(listing));
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+    change(disk);
+    vi.mocked(ipc.writeNoteIfMissing).mockClear();
+    vi.mocked(ipc.rebindNoteId).mockClear();
+    const api = fakeApi({ notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] });
+    const updateNote = vi.fn(async (_id: string, input: { relPath?: string }) => ({
+      id: "d1", rel_path: input.relPath, title: null,
+    }));
+    (api as unknown as { updateNote: typeof updateNote }).updateNote = updateNote;
+    const reg = new VaultRegistry(api);
+    const host = recordingHost();
+    (host.host as InboundHost).localText = async () => localText;
+    reg.setInboundHost(host.host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    return { disk, reg, api, updateNote };
+  }
+
+  it("a rename made while the app was closed stays ONE note", async () => {
+    const { reg, api, updateNote } = await afterClosedApp((disk) => {
+      disk.notes.delete("a.md");
+      disk.bodies.delete("a.md");
+      disk.notes.set("b.md", "local-x");
+      disk.bodies.set("b.md", "hello there");
+    }, "hello there");
+    expect(updateNote).toHaveBeenCalledWith("d1", expect.objectContaining({ relPath: "b.md" }));
+    expect(vi.mocked(ipc.rebindNoteId)).toHaveBeenCalledWith("b.md", "d1", null);
+    expect(vi.mocked(api.createNote)).not.toHaveBeenCalled();
+    expect(vi.mocked(ipc.writeNoteIfMissing)).not.toHaveBeenCalledWith("a.md", expect.anything(), expect.anything());
+    expect(reg.getMapping("b.md")?.docId).toBe("d1");
+    expect(reconcileReport.items()).toEqual([]);
+  });
+
+  it("different text is not a rename: the old note is restored and the new file registers", async () => {
+    const { api } = await afterClosedApp((disk) => {
+      disk.notes.delete("a.md");
+      disk.bodies.delete("a.md");
+      disk.notes.set("b.md", "local-x");
+      disk.bodies.set("b.md", "something else entirely");
+    }, "hello there");
+    expect(vi.mocked(ipc.writeNoteIfMissing)).toHaveBeenCalledWith("a.md", "", null);
+    expect(vi.mocked(api.createNote)).toHaveBeenCalledWith(expect.objectContaining({ relPath: "b.md" }));
+    expect(reconcileReport.items().map((i) => [i.kind, i.path])).toEqual([["restoredFromServer", "a.md"]]);
+  });
+
+  it("a delete made while the app was closed is undone, and reported (D5)", async () => {
+    await afterClosedApp((disk) => {
+      disk.notes.delete("a.md");
+      disk.bodies.delete("a.md");
+    }, "hello there");
+    expect(vi.mocked(ipc.writeNoteIfMissing)).toHaveBeenCalledWith("a.md", "", null);
+    expect(reconcileReport.items()).toEqual([
+      expect.objectContaining({ kind: "restoredFromServer", path: "a.md", docId: "d1" }),
+    ]);
+  });
+});
+
+describe("offline reconciliation — ready.tombstones", () => {
+  async function pull(opts: { readyTombstones?: string[]; listingTombstones: string[] | null }) {
+    reconcileReport.clear();
+    const disk = new FakeDisk();
+    disk.notes.set("n.md", "d1");
+    disk.bodies.set("n.md", "edited offline");
+    disk.unseen.add("d1");
+    install(disk);
+    const reg1 = new VaultRegistry(fakeApi({ notes: [{ id: "d1", rel_path: "n.md" }] }));
+    reg1.setInboundHost(recordingHost().host);
+    await reg1.reconcile({ organizationId: ORG, vaultName: "v" });
+    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
+    vi.mocked(ipc.getVaultConfig).mockResolvedValue(writes[writes.length - 1]?.[0] as never);
+    const reg = new VaultRegistry(fakeApi({ notes: [], tombstones: opts.listingTombstones }));
+    reg.setInboundHost(recordingHost().host);
+    if (opts.readyTombstones) reg.noteServerTombstones(opts.readyTombstones);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    return { disk, reg };
+  }
+
+  it("a doc named only by ready.tombstones goes down the DELETION path (recovery copy, teammate delete)", async () => {
+    const { disk, reg } = await pull({ readyTombstones: ["d1"], listingTombstones: [] });
+    expect(reg.isServerTombstoned("d1")).toBe(true);
+    expect(disk.copies.map((c) => c.from)).toEqual(["n.md"]);
+    expect(disk.notes.has("n.md")).toBe(false);
+    expect(reconcileReport.items().map((i) => i.kind)).toEqual(["deletedByTeammate"]);
+  });
+
+  it("without the field the pass is unchanged: the same absence reads as a revocation", async () => {
+    // Today's behaviour for an older server: a small, answered absence is a
+    // revocation (kept locally), which is exactly what the field corrects.
+    const { disk } = await pull({ listingTombstones: [] });
+    expect(disk.copies.map((c) => c.from)).toEqual(["n.md"]);
+    expect(reconcileReport.items().map((i) => i.kind)).toEqual(["keptLocally"]);
+  });
+
+  it("a listing that cannot answer tombstones stays 'cannot answer'", async () => {
+    const { disk } = await pull({ readyTombstones: ["d1"], listingTombstones: null });
+    expect(disk.notes.has("n.md")).toBe(true);
+  });
+});
+
+describe("access grants", () => {
+  it("does not call a note created during a slow listing an access grant", async () => {
+    const clock = vi.spyOn(Date, "now");
+    const started = Date.parse("2026-10-01T10:00:00Z");
+    clock.mockReturnValue(started);
+    try {
+      const disk = new FakeDisk();
+      install(disk);
+      const state: ServerState = { notes: [], tombstones: [] };
+      const api = fakeApi(state);
+      const list = api.listNoteRegistryPaged.bind(api);
+      vi.mocked(api.listNoteRegistryPaged).mockImplementationOnce(async (...args) => {
+        const result = await list(...args);
+        clock.mockReturnValue(started + 30_000);
+        return result;
+      });
+      const reg = new VaultRegistry(api);
+      const grants: unknown[] = [];
+      const host = recordingHost();
+      host.host.accessGranted = (event) => grants.push(event);
+      reg.setInboundHost(host.host);
+      await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+      state.notes = [{ id: "new", rel_path: "new.md", created_at: new Date(started + 10_000).toISOString() } as ServerState["notes"][number]];
+      await reg.pull();
+      expect(grants).toEqual([]);
+    } finally { clock.mockRestore(); }
+  });
+
+  it("the first pull fires nothing; a later pull adding two readable notes fires once with count 2", async () => {
+    const disk = new FakeDisk();
+    disk.notes.set("a.md", "d1");
+    install(disk);
+    const old = "2020-01-01T00:00:00Z";
+    const state: ServerState = { notes: [{ id: "d1", rel_path: "a.md" }], tombstones: [] };
+    const reg = new VaultRegistry(fakeApi(state));
+    const grants: Array<{ count: number; paths: string[] }> = [];
+    const host = recordingHost();
+    (host.host as InboundHost).accessGranted = (info) => grants.push(info);
+    reg.setInboundHost(host.host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    expect(grants).toEqual([]);
+
+    // Shared with us since: two OLD notes are readable now, and a teammate's
+    // brand-new note arrived too (new content, not a grant).
+    state.notes = [
+      ...state.notes,
+      { id: "g1", rel_path: "shared/one.md", created_at: old } as ServerState["notes"][number],
+      { id: "g2", rel_path: "shared/two.md", created_at: old } as ServerState["notes"][number],
+      { id: "n1", rel_path: "fresh.md", created_at: new Date(Date.now() + 60_000).toISOString() } as ServerState["notes"][number],
+    ];
+    await reg.pull();
+    expect(grants).toEqual([{ count: 2, paths: ["shared/one.md", "shared/two.md"] }]);
+
+    // Nothing new: nothing fires.
+    await reg.pull();
+    expect(grants).toHaveLength(1);
+  });
+});
+
+describe("empty folders the server refuses to register", () => {
+  async function refusedPass(opts: { status: number; code?: string; withFile?: boolean; live?: boolean }) {
+    const disk = new FakeDisk();
+    disk.folders.add("A");
+    disk.folders.add("A/B");
+    if (opts.withFile) {
+      disk.notes.set("A/B/x.md", "dx");
+      disk.bodies.set("A/B/x.md", "kept");
+    }
+    install(disk);
+    const api = fakeApi({ notes: [], tombstones: [], folders: [], folderTombstones: [] });
+    const { ApiError } = await import("../../api");
+    vi.mocked(api.createFolder).mockImplementation(async () => {
+      throw new ApiError(opts.status, "refused", opts.code ? { code: opts.code } : {});
+    });
+    const reg = new VaultRegistry(api);
+    const host = recordingHost();
+    (host.host as { mayRemoveRefusedEmptyFolders?: () => boolean }).mayRemoveRefusedEmptyFolders = () =>
+      opts.live ?? true;
+    reg.setInboundHost(host.host);
+    await reg.reconcile({ organizationId: ORG, vaultName: "v" });
+    return { disk, reg, api };
+  }
+
+  it("removes nested empty unmapped folders refused with no_write_access, bottom-up", async () => {
+    const r = await refusedPass({ status: 403, code: "no_write_access" });
+    expect(r.disk.folders.size).toBe(0);
+    expect(r.reg.hasFailures()).toBe(false);
+  });
+
+  it("keeps them when anything is inside", async () => {
+    const r = await refusedPass({ status: 403, code: "no_write_access", withFile: true });
+    expect([...r.disk.folders].sort()).toEqual(["A", "A/B"]);
+    expect(r.disk.notes.has("A/B/x.md")).toBe(true);
+  });
+
+  it("keeps them when the refusal is anything else (a 500)", async () => {
+    const r = await refusedPass({ status: 500 });
+    expect([...r.disk.folders].sort()).toEqual(["A", "A/B"]);
+  });
+
+  it("keeps them when the session is not live or the root is missing", async () => {
+    const r = await refusedPass({ status: 403, code: "no_write_access", live: false });
+    expect([...r.disk.folders].sort()).toEqual(["A", "A/B"]);
   });
 });

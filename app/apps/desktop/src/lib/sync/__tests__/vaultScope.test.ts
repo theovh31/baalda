@@ -17,6 +17,7 @@ vi.mock("../../ipc", () => ({
   getVaultConfig: vi.fn(async () => null),
   setVaultConfig: vi.fn(async () => {}),
   listTree: vi.fn(async () => ({ id: "root", name: "", path: "", isDir: true, children: [], childrenLoaded: true })),
+  listTags: vi.fn(async () => []),
   listNoteTitles: vi.fn(async () => []),
   writeNote: vi.fn(async () => {}),
   writeNoteIfMissing: vi.fn(async () => true),
@@ -172,6 +173,11 @@ describe("VaultRegistry.reconcile across a vault switch", () => {
         await held.waited;
         return { notes: [{ id: "server-only", rel_path: "FromA.md" }], tombstones: [] };
       }),
+      // The paged twin the reconciler actually calls; identical answer.
+      listNoteRegistryPaged: vi.fn(async () => {
+        await held.waited;
+        return { notes: [{ id: "server-only", rel_path: "FromA.md" }], tombstones: [] };
+      }),
       listFolders: vi.fn(async () => []),
       listFolderRegistry: vi.fn(async () => ({ folders: [], tombstones: [] })),
       createFolder,
@@ -212,6 +218,11 @@ describe("VaultRegistry.reconcile across a vault switch", () => {
         notes: [{ id: "server-only", rel_path: "FromServer.md" }],
         tombstones: [],
       })),
+      // The paged twin the reconciler actually calls; identical answer.
+      listNoteRegistryPaged: vi.fn(async () => ({
+        notes: [{ id: "server-only", rel_path: "FromServer.md" }],
+        tombstones: [],
+      })),
       listFolders: vi.fn(async () => []),
       listFolderRegistry: vi.fn(async () => ({ folders: [], tombstones: [] })),
       createFolder: vi.fn(async (i: { path: string }) => ({ id: `f-${i.path}` })),
@@ -241,6 +252,8 @@ describe("VaultRegistry.reconcile across a vault switch", () => {
       createVault: vi.fn(),
       listNotes: vi.fn(async () => []),
       listNoteRegistry: vi.fn(async () => ({ notes: [], tombstones: [] })),
+      // The paged twin the reconciler actually calls; identical answer.
+      listNoteRegistryPaged: vi.fn(async () => ({ notes: [], tombstones: [] })),
       listFolders: vi.fn(async () => []),
       listFolderRegistry: vi.fn(async () => ({ folders: [], tombstones: [] })),
       createFolder: vi.fn(),
@@ -270,6 +283,11 @@ describe("VaultRegistry.reconcile across a vault switch", () => {
       createVault: vi.fn(),
       listNotes: vi.fn(async () => [{ id: "n1", rel_path: "Kept.md" }]),
       listNoteRegistry: vi.fn(async () => ({
+        notes: [{ id: "n1", rel_path: "Kept.md" }],
+        tombstones: [],
+      })),
+      // The paged twin the reconciler actually calls; identical answer.
+      listNoteRegistryPaged: vi.fn(async () => ({
         notes: [{ id: "n1", rel_path: "Kept.md" }],
         tombstones: [],
       })),

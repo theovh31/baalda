@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Replace the whole ipc module so importing authManager doesn't drag in
 // `@tauri-apps/api` (unavailable in the Node test env). These fakes stand in for
@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("../../ipc", () => ({
   googleOauthListen: vi.fn(async () => ({ port: 5123, state: "test-nonce" })),
   googleOauthAwait: vi.fn(async () => "code-xyz"),
+  googleOauthReturnToApp: vi.fn(async () => {}),
   openExternal: vi.fn(async () => {}),
   keychainSet: vi.fn(async () => {}),
   keychainGet: vi.fn(async () => null),
@@ -31,6 +32,10 @@ function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
 }
 
 describe("AuthManager.signInWithGoogle", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("drives loopback → authorize → browser → exchange → keychain", async () => {
     const api = fakeApi();
     const mgr = new AuthManager(api);
@@ -66,6 +71,11 @@ describe("AuthManager.signInWithGoogle", () => {
     expect(value).toBe("sess-1");
     expect(key).toBe("session-v2:http://localhost:3010");
     expect(key.startsWith("session:")).toBe(false);
+    expect(ipc.googleOauthReturnToApp).toHaveBeenCalledOnce();
+    const keychainOrder = vi.mocked(ipc.keychainSet).mock.invocationCallOrder;
+    expect(vi.mocked(ipc.googleOauthReturnToApp).mock.invocationCallOrder[0]).toBeGreaterThan(
+      keychainOrder[keychainOrder.length - 1],
+    );
   });
 
   it("propagates a failure from the loopback wait (no token stored)", async () => {
@@ -75,5 +85,115 @@ describe("AuthManager.signInWithGoogle", () => {
 
     await expect(mgr.signInWithGoogle()).rejects.toThrow("timed out");
     expect(ipc.keychainSet).not.toHaveBeenCalled();
+    expect(ipc.googleOauthReturnToApp).not.toHaveBeenCalled();
+  });
+
+  it("does not focus the app when session persistence fails", async () => {
+    vi.mocked(ipc.keychainSet).mockRejectedValueOnce(new Error("keychain locked"));
+    const mgr = new AuthManager(fakeApi());
+
+    await expect(mgr.signInWithGoogle()).rejects.toThrow("keychain locked");
+    expect(ipc.googleOauthReturnToApp).not.toHaveBeenCalled();
+  });
+
+  it("keeps a completed sign-in successful when the window manager refuses focus", async () => {
+    vi.mocked(ipc.googleOauthReturnToApp).mockRejectedValueOnce(new Error("focus denied"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mgr = new AuthManager(fakeApi());
+
+    await expect(mgr.signInWithGoogle()).resolves.toMatchObject({ id: "u1" });
+    expect(ipc.keychainSet).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "[oauth] sign-in completed but the app could not be focused",
+      expect.any(Error),
+    );
+    warn.mockRestore();
+  });
+});
+
+// The mid-run session check behind the #145 banner. `getSession` already draws
+// the only line that matters — `null` is the server ANSWERING "no session"
+// (401/403, or Better Auth's literal null body), anything it cannot make sense
+// of throws and keeps the token — so this is about what the AuthManager does
+// with each answer, because the sync layer signs the app out on `gone`.
+describe("AuthManager.revalidateSession", () => {
+  it("answers 'valid' and keeps the token when the session is real", async () => {
+    vi.mocked(ipc.keychainDelete).mockClear();
+    const mgr = new AuthManager(
+      fakeApi({
+        getSession: vi.fn(async () => ({
+          user: { id: "u1", email: "a@b.co", name: "" },
+          activeOrganizationId: "o1",
+        })),
+      } as Partial<ApiClient>),
+    );
+
+    await expect(mgr.revalidateSession()).resolves.toBe("valid");
+    expect(ipc.keychainDelete).not.toHaveBeenCalled();
+  });
+
+  it("answers 'gone' and drops the stored token", async () => {
+    vi.mocked(ipc.keychainDelete).mockClear();
+    const setToken = vi.fn();
+    const mgr = new AuthManager(
+      fakeApi({ getSession: vi.fn(async () => null), setToken } as Partial<ApiClient>),
+    );
+
+    await expect(mgr.revalidateSession()).resolves.toBe("gone");
+    // Same clean-up as `init()`'s invalid-token branch: a token the server has
+    // already rejected must not survive to the next launch.
+    expect(setToken).toHaveBeenCalledWith(null);
+    expect(ipc.keychainDelete).toHaveBeenCalledWith("session-v2:http://localhost:3010");
+  });
+
+  it("answers 'unreachable' and keeps the token when the server does not answer", async () => {
+    // The load-bearing one: a thrown request is offline/server-down, and signing
+    // a local-first app out over it would be the worst possible reading of it.
+    vi.mocked(ipc.keychainDelete).mockClear();
+    const mgr = new AuthManager(
+      fakeApi({
+        getSession: vi.fn(async () => {
+          throw new Error("fetch failed");
+        }),
+      } as Partial<ApiClient>),
+    );
+
+    await expect(mgr.revalidateSession()).resolves.toBe("unreachable");
+    expect(ipc.keychainDelete).not.toHaveBeenCalled();
+  });
+});
+
+describe("AuthManager server switching", () => {
+  it("clears the previous bearer before exposing a new server and restores each server's own session", async () => {
+    const events: string[] = [];
+    let persisted = "https://one.example";
+    let base = persisted;
+    let token: string | null = "one-token";
+    vi.mocked(ipc.setServerUrl).mockImplementation(async (url) => {
+      expect(base).toBe(persisted);
+      persisted = url!;
+    });
+    vi.mocked(ipc.getServerUrl).mockImplementation(async () => persisted);
+    vi.mocked(ipc.keychainGet).mockImplementation(async (key) => key.includes("two.example") ? "two-token" : "one-token");
+    const mgr = new AuthManager(fakeApi({
+      getBaseUrl: () => base,
+      setBaseUrl: (url) => { events.push(`${url}:${token}`); base = url; },
+      setToken: (value) => { token = value; },
+      getSession: vi.fn(async () => ({ user: { id: token!, email: "demo@example.com", name: "Demo" }, activeOrganizationId: null })),
+    }));
+    expect((await mgr.setServerUrl("https://two.example"))?.user.id).toBe("two-token");
+    expect(events[0]).toBe("https://two.example:null");
+    expect((await mgr.setServerUrl("https://one.example"))?.user.id).toBe("one-token");
+    expect(events[2]).toBe("https://one.example:null");
+  });
+
+  it("keeps the old client intact if persisting the destination fails", async () => {
+    vi.mocked(ipc.setServerUrl).mockRejectedValueOnce(new Error("disk full"));
+    const api = fakeApi({ setBaseUrl: vi.fn(), setToken: vi.fn() });
+    const mgr = new AuthManager(api);
+    await expect(mgr.setServerUrl("https://two.example")).rejects.toThrow("disk full");
+    expect(api.setBaseUrl).not.toHaveBeenCalled();
+    expect(api.setToken).not.toHaveBeenCalled();
+    expect(mgr.getServerUrl()).toBe("http://localhost:3010");
   });
 });

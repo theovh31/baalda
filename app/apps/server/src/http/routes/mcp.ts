@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { pool } from "../../db/pool.js";
 import { config } from "../../config.js";
@@ -14,7 +15,12 @@ import {
   revokeMcpToken,
   verifyMcpToken,
 } from "../../mcp/tokens.js";
-import { TOOLS } from "../../mcp/tools.js";
+import { TOOLS, TOOLS_BY_NAME } from "../../mcp/tools.js";
+import { mcpBuckets, rateLimitKey, toolCallCost } from "../../mcp/rate-limit.js";
+import { inc } from "../../metrics/sync-metrics.js";
+import { vaultKeysEnabled } from "../../crypto/config.js";
+import { keyRequiredResponse, VK_HEADER } from "../../crypto/transport.js";
+import { keysForMint } from "../../mcp/token-keys.js";
 
 /**
  * The tool catalog every connection can reach (identical for all tokens; the
@@ -57,6 +63,62 @@ const WWW_AUTHENTICATE = `Bearer resource_metadata="${config.betterAuthUrl}/.wel
  * the /api/mcp endpoint is token-authenticated (the AI client).
  */
 
+/**
+ * Backoff for a token that keeps failing.
+ *
+ * Prod 2026-09-23: scripts kept POSTing a revoked/unknown token every ~20 s,
+ * forever, each one a token lookup plus an OAuth lookup. After
+ * {@link BAD_TOKEN_LIMIT} rejections of the SAME token inside
+ * {@link BAD_TOKEN_WINDOW_MS}, it is answered 429 with `Retry-After` until the
+ * window ends — no lookups. Keyed by a hash of the token, never by IP: Claude's
+ * connector traffic arrives from shared egress addresses, and an OAuth client's
+ * first discovery request carries NO token and is never limited.
+ */
+/** Most JSON-RPC messages one POST /api/mcp may carry. */
+export const MCP_MAX_BATCH = 50;
+
+/** JSON-RPC error code for a rate-limited request (server-defined range). */
+export const MCP_RATE_LIMITED = -32029;
+
+const BAD_TOKEN_LIMIT = 20;
+const BAD_TOKEN_WINDOW_MS = 10 * 60_000;
+const BAD_TOKEN_MAX_KEYS = 10_000;
+const badTokens = new Map<string, { count: number; since: number }>();
+
+function tokenKey(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 32);
+}
+
+/** Seconds until this token may be tried again, or 0 when it may be now. */
+function badTokenRetryAfter(token: string, now = Date.now()): number {
+  const hit = badTokens.get(tokenKey(token));
+  if (!hit) return 0;
+  if (now - hit.since >= BAD_TOKEN_WINDOW_MS) {
+    badTokens.delete(tokenKey(token));
+    return 0;
+  }
+  return hit.count >= BAD_TOKEN_LIMIT ? Math.ceil((hit.since + BAD_TOKEN_WINDOW_MS - now) / 1000) : 0;
+}
+
+function noteBadToken(token: string, now = Date.now()): void {
+  const key = tokenKey(token);
+  const hit = badTokens.get(key);
+  if (hit && now - hit.since < BAD_TOKEN_WINDOW_MS) {
+    hit.count++;
+    return;
+  }
+  if (badTokens.size >= BAD_TOKEN_MAX_KEYS) {
+    for (const [k, v] of badTokens) if (now - v.since >= BAD_TOKEN_WINDOW_MS) badTokens.delete(k);
+    if (badTokens.size >= BAD_TOKEN_MAX_KEYS) badTokens.clear();
+  }
+  badTokens.set(key, { count: 1, since: now });
+}
+
+/** Test seam: forget every remembered failure. */
+export function resetMcpBadTokens(): void {
+  badTokens.clear();
+}
+
 export interface McpDeps {
   docWriter: DocWriter;
   disconnectDoc: (vaultId: string, docId: string) => void;
@@ -64,6 +126,7 @@ export interface McpDeps {
    *  registry routes use, so an AI's structural edit lands live exactly like a
    *  teammate's. */
   onRegistryChanged?: (vaultId: string, originId: string | null) => void;
+  onAclChanged?: (vaultId: string) => void;
 }
 
 /** Pull the MCP token from an Authorization: Bearer header or a ?key=/?token= query. */
@@ -99,21 +162,47 @@ export function createMcpRoutes(deps: McpDeps): Hono {
   app.post("/mcp", async (c) => {
     const token = extractToken(c);
     const client = c.req.header("user-agent") ?? c.req.header("User-Agent") ?? null;
+    const wait = token ? badTokenRetryAfter(token) : 0;
+    if (wait > 0) {
+      c.header("Retry-After", String(wait));
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32001, message: "Too many failed attempts with this token. Mint a new one in Baalda." },
+        },
+        429,
+      );
+    }
     let auth = token ? await verifyMcpToken(token, undefined, { client }) : null;
-    if (!auth) auth = await resolveOAuthMcpAuth(c.req.raw.headers);
+    let noVault = false;
     if (!auth) {
+      auth = await resolveOAuthMcpAuth(c.req.raw.headers, undefined, (reason) => {
+        noVault = reason === "no_vault_selected";
+      });
+    }
+    if (!auth) {
+      if (token) noteBadToken(token);
       c.header("WWW-Authenticate", WWW_AUTHENTICATE);
       c.header("Access-Control-Expose-Headers", "WWW-Authenticate");
       return c.json(
         {
           jsonrpc: "2.0",
           id: null,
-          error: { code: -32001, message: "Unauthorized: authentication required" },
+          error: {
+            code: -32001,
+            message: noVault
+              ? "Unauthorized: signed in, but no vault is selected for this connection. Log in to the connector again and pick a vault."
+              : "Unauthorized: authentication required",
+          },
         },
         401,
       );
     }
 
+    // The per-call vault keys this token unwrapped (auth.vaultKeys) live only
+    // for this request: zero them however it ends.
+    try {
     let body: unknown;
     try {
       body = await c.req.json();
@@ -131,10 +220,65 @@ export function createMcpRoutes(deps: McpDeps): Hono {
       // No origin to skip: an MCP client isn't a vault-channel subscriber, so
       // every connected app should hear about this write.
       onRegistryChanged: (vaultId) => deps.onRegistryChanged?.(vaultId, null),
+      onAclChanged: deps.onAclChanged,
     };
 
     // A batch (array) or a single message. Notifications yield no response.
     const messages = Array.isArray(body) ? body : [body];
+    // Bound the work one request can ask for: every message is a tool call run
+    // in sequence, and an unbounded batch is unbounded cost per request. The
+    // current MCP revision dropped JSON-RPC batching altogether, so no client
+    // that follows it comes near this.
+    if (messages.length > MCP_MAX_BATCH) {
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32600, message: `Batch too large: at most ${MCP_MAX_BATCH} messages per request` },
+        },
+        400,
+      );
+    }
+    // Rate limit, per connection and per tool call: the whole request is paid
+    // for up front, all or nothing, so a batch counts every call in it and a
+    // refused request ran nothing (a client can retry it whole).
+    const calls = messages.filter((m) => (m as JsonRpcRequest)?.method === "tools/call");
+    if (calls.length > 0) {
+      let cost = 0;
+      for (const m of calls) {
+        const p = ((m as JsonRpcRequest).params ?? {}) as { name?: unknown; arguments?: unknown };
+        cost += toolCallCost(p.name, p.arguments);
+      }
+      // One call heavier than the whole bucket waits for a full one; a batch
+      // that heavy could never be paid and must be split.
+      const tooBig = cost > mcpBuckets.burst;
+      if (tooBig && calls.length === 1) cost = mcpBuckets.burst;
+      const taken = tooBig && calls.length > 1
+        ? { ok: false as const, retryAfterSeconds: Math.ceil((mcpBuckets.burst * 60) / mcpBuckets.perMinute) }
+        : mcpBuckets.take(rateLimitKey(auth), cost);
+      if (!taken.ok) {
+        inc("mcp.ratelimited");
+        // Per tool too, so a client dashboard's error rate can be matched to it.
+        for (const m of calls) {
+          const name = ((m as JsonRpcRequest).params as { name?: unknown } | undefined)?.name;
+          if (typeof name === "string" && TOOLS_BY_NAME.has(name)) inc(`mcp.tool.${name}.ratelimited`);
+        }
+        c.header("Retry-After", String(taken.retryAfterSeconds));
+        const isBatch = Array.isArray(body);
+        const message =
+          tooBig && calls.length > 1
+            ? "Rate limit: this batch costs more than one request may spend. Send fewer tool calls per request."
+            : `Rate limit: too many tool calls on this connection. Slow down and retry in ${taken.retryAfterSeconds}s. For large vaults, page list_notes with limit and cursor (cheap) instead of listing the whole vault.`;
+        const ids = isBatch ? messages.map((m) => (m as JsonRpcRequest)?.id ?? null) : [(body as JsonRpcRequest)?.id ?? null];
+        const errors = ids.map((id) => ({
+          jsonrpc: "2.0" as const,
+          id,
+          error: { code: MCP_RATE_LIMITED, message, data: { retryAfterSeconds: taken.retryAfterSeconds } },
+        }));
+        return c.json(isBatch ? errors : errors[0], 429);
+      }
+    }
+
     const responses = [];
     let toolCalls = 0;
     for (const m of messages) {
@@ -148,6 +292,9 @@ export function createMcpRoutes(deps: McpDeps): Hono {
 
     if (responses.length === 0) return c.body(null, 202); // notifications only
     return c.json(Array.isArray(body) ? responses : responses[0]);
+    } finally {
+      zeroAuthKeys(auth);
+    }
   });
 
   // No server-initiated stream; be explicit so clients fall back to POST-only.
@@ -182,12 +329,29 @@ export function createMcpRoutes(deps: McpDeps): Hono {
     const body = (await c.req.json().catch(() => ({}))) as { name?: unknown };
     const name =
       typeof body.name === "string" && body.name.trim() ? body.name.trim() : "MCP token";
+    // W3: a keyed vault of the org needs its VK (X-Baalda-VK), wrapped under
+    // the new token's secret so it works with no desktop online. Refused
+    // before anything is minted when a keyed vault's key is missing.
+    let vaultKeys: Array<{ vaultId: string; key: Buffer; generation: number }> = [];
+    try {
+    if (vaultKeysEnabled()) {
+      const mint = await keysForMint(org, c.req.header(VK_HEADER), pool);
+      if (mint.missing.length > 0) {
+        return keyRequiredResponse(c, mint.missing[0] ?? null);
+      }
+      vaultKeys = mint.keys;
+    }
     const { token, row } = await createMcpToken(
       { userId: session.userId, organizationId: org },
       name,
+      pool,
+      vaultKeys,
     );
     // The plaintext token is returned exactly once.
     return c.json({ token, ...row }, 201);
+    } finally {
+      for (const k of vaultKeys) k.key.fill(0);
+    }
   });
 
   app.delete("/mcp/tokens/:id", async (c) => {
@@ -199,4 +363,11 @@ export function createMcpRoutes(deps: McpDeps): Hono {
   });
 
   return app;
+}
+
+/** Zero the vault keys an MCP request unwrapped for itself (never the cache's). */
+export function zeroAuthKeys(auth: { vaultKeys?: Map<string, { key: Buffer }> } | null): void {
+  if (!auth?.vaultKeys) return;
+  for (const held of auth.vaultKeys.values()) held.key.fill(0);
+  auth.vaultKeys.clear();
 }

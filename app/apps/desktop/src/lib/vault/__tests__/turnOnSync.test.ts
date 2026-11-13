@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { planTurnOnSync } from "../turnOnSync";
+import { foreignFolderMessage, planTurnOnSync } from "../turnOnSync";
 
 describe("planTurnOnSync", () => {
   it("creates a vault for a folder nothing is bound to", () => {
@@ -123,9 +123,23 @@ describe("planTurnOnSync", () => {
     ).toEqual({ kind: "blocked-foreign", orgId: "org-x" });
   });
 
-  it("prefers a live binding over the folder's stamp", () => {
-    // Both signals present and disagreeing: the binding reflects an explicit,
-    // newer decision on this device.
+  it("prefers a live binding over a stamp for another vault we're in", () => {
+    // Both signals name vaults this account can reach: the binding reflects an
+    // explicit, newer decision on this device.
+    expect(
+      planTurnOnSync({
+        openPath: "/vaults/a",
+        activeOrganizationId: "org-b",
+        orgIds: ["org-a", "org-b", "org-x"],
+        orgVaults: { "org-a": "/vaults/a" },
+        stampedOrgId: "org-x",
+      }),
+    ).toEqual({ kind: "switch", orgId: "org-a" });
+  });
+
+  it("blocks a bound folder whose stamp names a vault we can't see", () => {
+    // The binding points at a non-active vault, but the folder itself says it
+    // belongs elsewhere. The stamp wins: switching would hit the same refusal.
     expect(
       planTurnOnSync({
         openPath: "/vaults/a",
@@ -134,7 +148,74 @@ describe("planTurnOnSync", () => {
         orgVaults: { "org-a": "/vaults/a" },
         stampedOrgId: "org-x",
       }),
-    ).toEqual({ kind: "switch", orgId: "org-a" });
+    ).toEqual({ kind: "blocked-foreign", orgId: "org-x" });
+  });
+
+  it("blocks instead of retrying when the active vault's folder is stamped for another server's vault", () => {
+    // The reported case: a folder synced against production is bound by path
+    // to the ACTIVE vault on a local server. Retrying hit enableSyncForVault's
+    // stamp guard and surfaced a misleading "check your connection" error.
+    expect(
+      planTurnOnSync({
+        openPath: "/vaults/team",
+        activeOrganizationId: "org-local",
+        orgIds: ["org-local"],
+        orgVaults: { "org-local": "/vaults/team" },
+        stampedOrgId: "org-prod",
+      }),
+    ).toEqual({ kind: "blocked-foreign", orgId: "org-prod" });
+  });
+
+  it("still retries the bound active vault when its stamp is confirmed gone", () => {
+    expect(
+      planTurnOnSync({
+        openPath: "/vaults/team",
+        activeOrganizationId: "org-local",
+        orgIds: ["org-local"],
+        orgVaults: { "org-local": "/vaults/team" },
+        stampedOrgId: "org-dead",
+        stampedOrgGone: true,
+      }),
+    ).toEqual({ kind: "retry-active", orgId: "org-local" });
+  });
+
+  it("names the stamped vault and the server URL fix in the refusal message", () => {
+    const msg = foreignFolderMessage("org-prod");
+    expect(msg).toContain("org-prod");
+    expect(msg).toContain("server URL");
+    expect(msg).not.toMatch(/connection and try again/);
+  });
+
+  it("creates a vault when the stamped one is confirmed GONE from the server", () => {
+    // The unsync recovery path: the stamp names a vault the owner made local
+    // only, so there is no other account's folder left to protect. Refusing
+    // here is what left the folder permanently unsyncable.
+    expect(
+      planTurnOnSync({
+        openPath: "/vaults/a",
+        activeOrganizationId: null,
+        orgIds: [],
+        orgVaults: {},
+        stampedOrgId: "org-dead",
+        stampedOrgGone: true,
+      }),
+    ).toEqual({ kind: "create-vault" });
+  });
+
+  it("keeps refusing a foreign folder when the vault still exists", () => {
+    // `stampedOrgGone` is only ever set from a definite 404. Anything else —
+    // including a network error — must leave today's refusal exactly as it was,
+    // or a flaky connection hands a teammate's folder to the wrong account.
+    expect(
+      planTurnOnSync({
+        openPath: "/vaults/a",
+        activeOrganizationId: null,
+        orgIds: [],
+        orgVaults: {},
+        stampedOrgId: "org-theirs",
+        stampedOrgGone: false,
+      }),
+    ).toEqual({ kind: "blocked-foreign", orgId: "org-theirs" });
   });
 
   it("still retries after a failed sync on the vault just created", () => {

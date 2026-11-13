@@ -11,6 +11,16 @@ import {
 } from "../src/yjs/persistence.js";
 import { pool } from "../src/db/pool.js";
 import { resetDb } from "./helpers/db.js";
+import {
+  seedFile,
+  seedMember,
+  seedNote,
+  seedOrg,
+  seedUser,
+  seedVault,
+  seedVaultGrant,
+} from "./helpers/seed.js";
+import { listReadableDocsInVault } from "../src/permissions/vault-docs.js";
 
 const DOC = "doc-persist-1";
 
@@ -77,6 +87,63 @@ describe("binary Yjs persistence + compaction (spec 02 §5A / 03 §3)", () => {
     const rebuilt = new Y.Doc();
     Y.applyUpdate(rebuilt, state!);
     expect(rebuilt.getText("content").toString()).toBe("y".repeat(15));
+  });
+
+  it("compacts on exactly the append that crosses the threshold, without counting every write", async () => {
+    const threshold = 10;
+    const docId = `doc-threshold-${Math.random().toString(36).slice(2)}`;
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    const seq: Uint8Array[] = [];
+    doc.on("update", (u) => seq.push(u));
+    for (let i = 0; i < 12; i++) text.insert(text.length, "z");
+    doc.destroy();
+
+    let counts = 0;
+    const counting: Queryable = {
+      query: ((sql: string, params?: unknown[]) => {
+        if (typeof sql === "string" && sql.includes("count(*)")) counts++;
+        return pool.query(sql, params as unknown[]);
+      }) as Queryable["query"],
+    };
+    const compactedAt: number[] = [];
+    for (let i = 0; i < seq.length; i++) {
+      const r = await appendUpdate(docId, seq[i], counting, threshold);
+      if (r.compacted) compactedAt.push(i + 1);
+    }
+    // Same trigger as a count on every write: the 11th row (> 10) compacts.
+    expect(compactedAt).toEqual([11]);
+    // ...but far fewer counts than the 12 writes.
+    expect(counts).toBeLessThan(seq.length);
+    const rebuilt = new Y.Doc();
+    Y.applyUpdate(rebuilt, (await loadDocState(docId))!);
+    expect(rebuilt.getText("content").toString()).toBe("z".repeat(12));
+  });
+
+  it("still compacts when rows arrive from outside this process (another instance)", async () => {
+    const threshold = 10;
+    const docId = `doc-foreign-${Math.random().toString(36).slice(2)}`;
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    const seq: Uint8Array[] = [];
+    doc.on("update", (u) => seq.push(u));
+    for (let i = 0; i < 40; i++) text.insert(text.length, "w");
+    doc.destroy();
+
+    // Seed this process's estimate with one append, then let "another
+    // instance" write 15 rows straight to the table.
+    await appendUpdate(docId, seq[0], pool, threshold);
+    for (let i = 1; i <= 15; i++) {
+      await pool.query("INSERT INTO doc_updates (doc_id, update) VALUES ($1, $2)", [
+        docId,
+        Buffer.from(seq[i]),
+      ]);
+    }
+    let compacted = false;
+    for (let i = 16; i < 24 && !compacted; i++) {
+      compacted = (await appendUpdate(docId, seq[i], pool, threshold)).compacted;
+    }
+    expect(compacted).toBe(true);
   });
 
   it("explicit compact() is idempotent and preserves state", async () => {
@@ -211,7 +278,7 @@ function countingDb(): { db: Queryable; sql: string[] } {
   return { db: db as unknown as Queryable, sql };
 }
 
-const SNAPSHOT_READ = "SELECT snapshot FROM doc_snapshots";
+const SNAPSHOT_READ = "SELECT snapshot, snapshot_enc FROM doc_snapshots";
 
 /** Seed DOC from a fresh single-client history; returns the authoritative doc. */
 async function seedDoc(text: string, docId = DOC): Promise<Y.Doc> {
@@ -290,6 +357,100 @@ describe("loadDocDiff (vault-channel backfill)", () => {
     expect(diff!.serverStateVector).toEqual(Y.encodeStateVector(doc));
   });
 
+  it("a client that is AHEAD of the server is up to date, not behind — and is named as ahead", async () => {
+    // One vault re-downloaded "40 notes" on every reload: each held an edit the
+    // server had never received, so the vectors were unequal, so the diff was
+    // computed — and it was EMPTY (2 bytes), applied to nothing, and computed
+    // again on the next connect. Unequal is not behind; covered is up to date.
+    const doc = await seedDoc("shared");
+    await compact(DOC, pool); // probe path: state_vector present, log empty
+
+    const client = new Y.Doc();
+    Y.applyUpdate(client, Y.encodeStateAsUpdate(doc));
+    client.getText("content").insert(6, " + local only"); // never reached the server
+    const aheadSv = Y.encodeStateVector(client);
+
+    const { db, sql } = countingDb();
+    const diff = await loadDocDiff(DOC, aheadSv, db);
+    expect(diff!.upToDate).toBe(true);
+    expect(diff!.update.length).toBe(0);
+    expect(diff!.clientAhead).toBe(true);
+    // Answered by the probe: the snapshot BYTEA was never read for it.
+    expect(sql.some((q) => q.includes(SNAPSHOT_READ))).toBe(false);
+
+    // The slow path (a pending logged update) reaches the same verdict, and a
+    // client that is BOTH ahead and behind gets the ops it lacks plus the flag.
+    const later: Uint8Array[] = [];
+    doc.on("update", (u: Uint8Array) => later.push(u));
+    doc.getText("content").insert(0, "# ");
+    for (const u of later) await appendUpdate(DOC, u, pool, 1000);
+    const both = await loadDocDiff(DOC, aheadSv);
+    expect(both!.upToDate).toBe(false);
+    expect(both!.clientAhead).toBe(true);
+    Y.applyUpdate(client, both!.update);
+    expect(client.getText("content").toString()).toBe("# shared + local only");
+  });
+
+  it("caches a doc's state vector so an unchanged doc costs one query and no merge", async () => {
+    // The point of migration 025. A note edited fewer than COMPACTION_THRESHOLD
+    // times has no `doc_snapshots` row, so before the cache EVERY connect read its
+    // whole update log and ran `Y.mergeUpdates` over it, only to conclude the
+    // client was already current — thousands of queries and hundreds of
+    // single-threaded merges standing in front of one `ready` frame.
+    const doc = await seedDoc("cached");
+    const sv = Y.encodeStateVector(doc);
+
+    // First read pays the slow path and populates the cache.
+    const cold = await loadDocDiff(DOC, sv);
+    expect(cold!.upToDate).toBe(true);
+
+    const { db, sql } = countingDb();
+    const warm = await loadDocDiff(DOC, sv, db);
+    expect(warm!.upToDate).toBe(true);
+    expect(warm!.update.length).toBe(0);
+    // Neither the log nor the snapshot was touched.
+    expect(sql.some((q) => q.includes(SNAPSHOT_READ))).toBe(false);
+    expect(sql.some((q) => q.includes("SELECT id, update, update_enc FROM doc_updates"))).toBe(false);
+    expect(sql).toHaveLength(1);
+  });
+
+  it("a new update invalidates the cached vector instead of being missed by it", async () => {
+    // The hazard the watermark exists for: a cached vector that is TRUSTED and
+    // stale would report a client up to date while ops it has never seen sit in
+    // the log — withholding content silently, the one failure this must not have.
+    const doc = await seedDoc("before");
+    const sv = Y.encodeStateVector(doc);
+    // A snapshot of the client as it stands now, before the server moves on.
+    const before = new Y.Doc();
+    Y.applyUpdate(before, Y.encodeStateAsUpdate(doc));
+    await loadDocDiff(DOC, sv); // populate the cache
+
+    const later: Uint8Array[] = [];
+    doc.on("update", (u: Uint8Array) => later.push(u));
+    doc.getText("content").insert(6, " and after");
+    for (const u of later) await appendUpdate(DOC, u, pool, 1000);
+
+    const diff = await loadDocDiff(DOC, sv);
+    expect(diff!.upToDate).toBe(false);
+    // `update` is a DIFF against `sv`, so it only means anything applied to a doc
+    // already at that state — which is exactly the client the server is answering.
+    const behind = new Y.Doc();
+    Y.applyUpdate(behind, Y.encodeStateAsUpdate(before));
+    Y.applyUpdate(behind, diff!.update);
+    expect(behind.getText("content").toString()).toBe("before and after");
+  });
+
+  it("an equal or merely behind client is not `clientAhead`", async () => {
+    const doc = await seedDoc("base");
+    const equal = await loadDocDiff(DOC, Y.encodeStateVector(doc));
+    expect(equal!.upToDate).toBe(true);
+    expect(equal!.clientAhead).toBe(false);
+    const behind = await loadDocDiff(DOC, Y.encodeStateVector(new Y.Doc()));
+    expect(behind!.upToDate).toBe(false);
+    expect(behind!.clientAhead).toBe(false);
+    expect((await loadDocDiff(DOC, null))!.clientAhead).toBe(false);
+  });
+
   it("a client with no state vector gets the full state", async () => {
     const doc = await seedDoc("# Full\nbody");
     const diff = await loadDocDiff(DOC, null);
@@ -341,11 +502,20 @@ describe("loadDocDiff (vault-channel backfill)", () => {
 // ── listEmptyDocs: the `ready.empty` hint ───────────────────────────────────
 
 describe("listEmptyDocs", () => {
+  let vault: string;
+  /** Live `notes` rows for `ids` — only notes can be named on `ready.empty`. */
+  const notes = async (ids: string[]) => {
+    for (const id of ids) await seedNote(vault, null, `${id}.md`, null, id);
+    return ids;
+  };
+
   beforeEach(async () => {
     await resetDb();
+    vault = await seedVault(await seedOrg("Empty Probe", "empty-probe"));
   });
 
   it("names docs with no updates and no snapshot, and only those", async () => {
+    await notes(["doc-with-updates", "doc-compacted", "doc-empty-1", "doc-empty-2"]);
     await seedDoc("has content", "doc-with-updates");
 
     const compacted = await seedDoc("compacted", "doc-compacted");
@@ -363,13 +533,51 @@ describe("listEmptyDocs", () => {
 
   it("never names a doc that wasn't asked about", async () => {
     // "doc-unasked" is empty too, but it is outside the caller's readable set.
+    await notes(["doc-empty-1", "doc-unasked"]);
     const res = await listEmptyDocs(["doc-empty-1"]);
     expect(res.empty).toEqual(["doc-empty-1"]);
     expect(res.empty).not.toContain("doc-unasked");
   });
 
+  it("never names a tree file, a deleted note or an unknown id — only live notes", async () => {
+    // Production: ~5.2k `files` ids in the readable set filled the 2,000 cap on
+    // every connect while only ~146 notes really lacked content.
+    await notes(["note-empty", "note-deleted"]);
+    await pool.query("UPDATE notes SET deleted_at = now() WHERE id = 'note-deleted'");
+    const fileIds = [];
+    for (let i = 0; i < 5; i++) fileIds.push(await seedFile(vault, null, `img-${i}.png`));
+
+    const res = await listEmptyDocs(["note-empty", "note-deleted", "no-such-row", ...fileIds]);
+    expect(res).toEqual({ empty: ["note-empty"], truncated: false });
+  });
+
+  it("over the channel's real readable set (notes + files) names only the empty notes", async () => {
+    const orgId = await seedOrg("Mixed Vault", "mixed-vault");
+    const owner = await seedUser("owner@empty-probe.test");
+    await seedMember(orgId, owner, "owner");
+    await seedVaultGrant(orgId, "edit");
+    const v = await seedVault(orgId);
+    const full = await seedNote(v, null, "Full.md", owner);
+    const emptyA = await seedNote(v, null, "A.md", owner);
+    const emptyB = await seedNote(v, null, "B.md", owner);
+    await seedDoc("body", full);
+    const files = [
+      await seedFile(v, null, "photo.png"),
+      await seedFile(v, null, "deck.pdf"),
+      await seedFile(v, null, "sheet.xlsx"),
+    ];
+
+    const readable = await listReadableDocsInVault(owner, v);
+    // The premise: the set the vault channel probes really does carry file ids.
+    for (const f of files) expect(readable.has(f)).toBe(true);
+
+    const res = await listEmptyDocs([...readable]);
+    expect(res).toEqual({ empty: [emptyA, emptyB].sort(), truncated: false });
+    for (const f of files) expect(res.empty).not.toContain(f);
+  });
+
   it("caps the list and reports truncation", async () => {
-    const ids = Array.from({ length: 10 }, (_, i) => `empty-${i}`);
+    const ids = await notes(Array.from({ length: 10 }, (_, i) => `empty-${i}`));
     const res = await listEmptyDocs(ids, pool, 4);
     expect(res.truncated).toBe(true);
     expect(res.empty.length).toBe(4);
@@ -377,7 +585,204 @@ describe("listEmptyDocs", () => {
     expect(res.empty).toEqual([...res.empty].sort());
   });
 
+  it("past the cap names the SAME set on every connect, whatever the input order", async () => {
+    // A random sample named a different 2,000 on each connect, so clients
+    // re-seeded notes the server had already settled (88–98% `covered`).
+    const ids = await notes(Array.from({ length: 30 }, (_, i) => `empty-${String(i).padStart(2, "0")}`));
+    const first = await listEmptyDocs(ids, pool, 7, "2026-10-14");
+    expect(first.truncated).toBe(true);
+    expect(first.empty.length).toBe(7);
+    for (let i = 0; i < 5; i++) {
+      const shuffled = [...ids].sort(() => Math.random() - 0.5);
+      expect(await listEmptyDocs(shuffled, pool, 7, "2026-10-14")).toEqual(first);
+    }
+  });
+
+  it("rotates the window over days, so no empty note is starved forever", async () => {
+    // The old `ORDER BY id LIMIT cap` answered the same lowest ids on every
+    // connect forever; a doc above that window was never named.
+    const ids = await notes(Array.from({ length: 12 }, (_, i) => `empty-${String(i).padStart(2, "0")}`));
+    const seen = new Set<string>();
+    for (let d = 1; d <= 60 && seen.size < ids.length; d++) {
+      for (const id of (await listEmptyDocs(ids, pool, 3, `day-${d}`)).empty) seen.add(id);
+    }
+    expect(seen.size).toBe(ids.length);
+  });
+
   it("is a no-op on an empty input", async () => {
     expect(await listEmptyDocs([])).toEqual({ empty: [], truncated: false });
+  });
+});
+
+// ── concurrency: compact vs compact, and compact vs a backfill read ─────────
+//
+// Both of these reproduced real data loss before the per-doc advisory lock:
+//   · two `compact()` calls racing (Hocuspocus does not await `onChange`, so two
+//     typists past COMPACTION_THRESHOLD is enough) — the older merge upserted
+//     over the newer one and a committed update existed nowhere afterwards;
+//   · `loadDocDiff` reading the snapshot and the log as two statements with a
+//     compact committing in between — a truncated doc served AND cached with a
+//     NULL watermark, which reads as fresh forever after.
+
+/**
+ * A `Queryable` whose checked-out clients block on `gate` just before running
+ * the first statement containing `match`. Everything else behaves like the pool,
+ * so the code under test takes its real transaction and its real lock.
+ */
+function gatedPool(match: string, gate: Promise<void>): Queryable {
+  return {
+    query: (t: unknown, p?: unknown) =>
+      (pool.query as (t: unknown, p?: unknown) => Promise<unknown>)(t, p),
+    connect: async () => {
+      const client = await pool.connect();
+      const patched = client as unknown as {
+        query: (...args: unknown[]) => unknown;
+        release: (...args: unknown[]) => unknown;
+      };
+      const orig = client.query.bind(client) as (...args: unknown[]) => unknown;
+      const origRelease = client.release.bind(client) as (...args: unknown[]) => unknown;
+      let held = false;
+      // Rest args, not (text, values): `pool.query` calls the client
+      // CALLBACK-style, and a wrapper that drops the third argument leaves it
+      // waiting forever on a callback nobody will run.
+      patched.query = async (...args: unknown[]) => {
+        if (!held && typeof args[0] === "string" && (args[0] as string).includes(match)) {
+          held = true;
+          await gate;
+        }
+        return orig(...args);
+      };
+      // The pool hands the same physical client out again, so the patch has to
+      // come off with the release or it outlives the test that installed it.
+      patched.release = (...args: unknown[]) => {
+        patched.query = orig;
+        patched.release = origRelease;
+        return origRelease(...args);
+      };
+      return client;
+    },
+  } as unknown as Queryable;
+}
+
+/** Append one update carrying `line` to DOC, built on top of `doc`. */
+async function appendLine(doc: Y.Doc, line: string): Promise<void> {
+  const out: Uint8Array[] = [];
+  const on = (u: Uint8Array) => out.push(u);
+  doc.on("update", on);
+  doc.getText("content").insert(doc.getText("content").length, line);
+  doc.off("update", on);
+  for (const u of out) await appendUpdate(DOC, u, pool, 1_000_000);
+}
+
+async function serverText(): Promise<string> {
+  const state = await loadDocState(DOC);
+  const d = new Y.Doc();
+  if (state) Y.applyUpdate(d, state);
+  const out = d.getText("content").toString();
+  d.destroy();
+  return out;
+}
+
+describe("per-doc serialisation of compact + reads", () => {
+  beforeEach(async () => {
+    await resetDb();
+  });
+
+  it("a second compact waits for the first, so no committed update is lost", async () => {
+    const doc = await seedDoc("AAA");
+    await compact(DOC, pool); // snapshot at seq N, log empty
+    await appendLine(doc, "\nBBB");
+
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    // A reads snapshot + log, then parks with the doc's EXCLUSIVE lock held.
+    const first = compact(DOC, gatedPool("INSERT INTO doc_snapshots", gate));
+    await new Promise((r) => setTimeout(r, 150));
+
+    // An update lands while A is parked, and a second compact starts. Before the
+    // lock, B read the same pre-A world and stamped its older merge over A's.
+    await appendLine(doc, "\nCCC");
+    let secondDone = false;
+    const second = compact(DOC, pool).then(() => {
+      secondDone = true;
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(secondDone).toBe(false); // B is queued behind A's lock, not racing it
+
+    open();
+    await first;
+    await second;
+
+    expect(await serverText()).toBe("AAA\nBBB\nCCC");
+    doc.destroy();
+  });
+
+  it("refuses to move a snapshot backwards even without the lock (seq belt)", async () => {
+    const doc = await seedDoc("AAA");
+    await compact(DOC, pool);
+    const stale = await pool.query<{ snapshot: Buffer; state_vector: Buffer; seq: string }>(
+      "SELECT snapshot, state_vector, seq FROM doc_snapshots WHERE doc_id = $1",
+      [DOC],
+    );
+    await appendLine(doc, "\nBBB");
+    await compact(DOC, pool); // snapshot now covers BBB at a higher seq
+
+    // Replay the older compact's upsert verbatim — the shape that used to win.
+    const replay = await pool.query(
+      `INSERT INTO doc_snapshots (doc_id, snapshot, state_vector, seq, updated_at)
+       VALUES ($1, $2, $3, $4, now())
+       ON CONFLICT (doc_id) DO UPDATE
+         SET snapshot = EXCLUDED.snapshot,
+             state_vector = EXCLUDED.state_vector,
+             seq = EXCLUDED.seq,
+             updated_at = now()
+       WHERE doc_snapshots.seq IS NULL OR doc_snapshots.seq < EXCLUDED.seq
+       RETURNING doc_id`,
+      [DOC, stale.rows[0]!.snapshot, stale.rows[0]!.state_vector, stale.rows[0]!.seq],
+    );
+    expect(replay.rowCount).toBe(0);
+    expect(await serverText()).toBe("AAA\nBBB");
+    doc.destroy();
+  });
+
+  it("loadDocDiff never serves — or caches — a doc a concurrent compact truncated", async () => {
+    const doc = await seedDoc("BASE");
+    await compact(DOC, pool);
+    await appendLine(doc, "\nLATER");
+
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    // Park the reader between its snapshot SELECT and its log SELECT — the exact
+    // window a compact used to slip through.
+    const clientSv = Y.encodeStateVector(new Y.Doc());
+    const reading = loadDocDiff(DOC, clientSv, gatedPool("SELECT id, update, update_enc FROM doc_updates", gate));
+    await new Promise((r) => setTimeout(r, 150));
+
+    let compacted = false;
+    const compacting = compact(DOC, pool).then(() => {
+      compacted = true;
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(compacted).toBe(false); // the compact queues behind the reader's shared lock
+
+    open();
+    const diff = await reading;
+    await compacting;
+
+    // The served diff carries the whole doc, not the pre-compact prefix.
+    const rebuilt = new Y.Doc();
+    Y.applyUpdate(rebuilt, diff!.update);
+    expect(rebuilt.getText("content").toString()).toBe("BASE\nLATER");
+    rebuilt.destroy();
+
+    // And the cache it wrote describes the log it actually read: a NULL
+    // watermark here would read as fresh (the log is empty post-compact) and
+    // withhold LATER from every later connect.
+    const cached = await pool.query<{ upto: string | null }>(
+      "SELECT upto_update_id::text AS upto FROM doc_state_vectors WHERE doc_id = $1",
+      [DOC],
+    );
+    expect(cached.rows[0]?.upto).not.toBeNull();
+    doc.destroy();
   });
 });

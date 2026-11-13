@@ -61,13 +61,22 @@ export interface TurnOnSyncInput {
   orgVaults: Readonly<Record<string, string>>;
   /**
    * The vault the folder's own `.context/config.json` is stamped for (see
-   * `configOrgId`), or null. This is the on-disk dual of `orgVaults`: the
+   * `ipc.peekVaultStamp`), or null. This is the on-disk dual of `orgVaults`: the
    * binding is per-device localStorage and easy to lose, while the stamp
    * travels with the folder — so it both heals a lost binding (stamped for a
    * vault we're in → switch) and unmasks a foreign folder (stamped for one
    * we're not → block) that the binding alone would happily re-adopt.
    */
   stampedOrgId?: string | null;
+  /**
+   * The stamped vault is GONE from the server — `GET /api/orgs/:id/status`
+   * answered 404 (see `lib/vault/unsyncPlan.ts`). The refusal below exists to
+   * stop us adopting someone else's folder; a vault that no longer exists is
+   * nobody's, so there is nothing left to protect and refusing would strand the
+   * folder forever. Only ever set from a 404 — never from a network error, or a
+   * flaky connection would hand a live teammate's folder to the wrong account.
+   */
+  stampedOrgGone?: boolean;
 }
 
 export function planTurnOnSync(input: TurnOnSyncInput): TurnOnSyncAction {
@@ -75,6 +84,24 @@ export function planTurnOnSync(input: TurnOnSyncInput): TurnOnSyncAction {
   const boundOrg =
     Object.entries(input.orgVaults).find(([, p]) => p === input.openPath)?.[0] ??
     null;
+
+  const stamped = input.stampedOrgId ?? null;
+
+  // The folder's own stamp outranks the binding when it names a vault this
+  // account can't see. The binding is a per-profile convenience (localStorage,
+  // keyed by path); the stamp is what the folder itself says it is. A folder
+  // synced against another server (say production) can still be bound to a
+  // vault on THIS server by path — honouring the binding then routed into
+  // `enableSyncForVault`, whose stamp guard refused, and the user was told to
+  // check their connection. Refuse up front instead, with the real reason.
+  if (
+    stamped &&
+    !input.stampedOrgGone &&
+    !input.orgIds.includes(stamped) &&
+    stamped !== boundOrg
+  ) {
+    return { kind: "blocked-foreign", orgId: stamped };
+  }
 
   // A binding to a vault we've since been REMOVED from is stale and must not
   // pin the folder to a vault that can never sync again — fall through and let
@@ -88,17 +115,32 @@ export function planTurnOnSync(input: TurnOnSyncInput): TurnOnSyncAction {
   // No usable binding — ask the folder itself. Stamped for a vault we're in:
   // the binding was lost (cleared storage, eviction), not the membership, so
   // switch to that vault rather than minting a duplicate.
-  const stamped = input.stampedOrgId ?? null;
   if (stamped && input.orgIds.includes(stamped)) {
     return stamped === input.activeOrganizationId
       ? { kind: "retry-active", orgId: stamped }
       : { kind: "switch", orgId: stamped };
   }
 
-  // Stamped for a vault this account can't see: refuse to adopt. (This also
-  // catches a vault the account deleted server-side — inconvenient, but the
-  // safe default; the folder can be re-adopted by copying the notes out.)
-  if (stamped) return { kind: "blocked-foreign", orgId: stamped };
+  // Stamped for a vault this account can't see: refuse to adopt — UNLESS the
+  // server has confirmed that vault no longer exists, in which case the stamp is
+  // a tombstone and this folder is free to become a new vault (reusing the doc
+  // ids already in the local index, so its history survives the round trip).
+  if (stamped && !input.stampedOrgGone) return { kind: "blocked-foreign", orgId: stamped };
 
   return { kind: "create-vault" };
+}
+
+/**
+ * What the user is told when a folder is stamped for a vault this account
+ * can't see. The stamp records only the vault id, not the server it lives on,
+ * so "another server" (the usual case: a folder synced against production
+ * while the app points elsewhere) and "another account on this server" can't
+ * be told apart here — the sentence names both remedies.
+ */
+export function foreignFolderMessage(orgId: string): string {
+  return (
+    `This folder is already synced to a vault on another server or account (vault id ${orgId}). ` +
+    "Switch the server URL in Settings → Connection to the one it was synced with, " +
+    "sign in with the account it was synced with, or open a different folder."
+  );
 }

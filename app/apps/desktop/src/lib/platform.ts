@@ -1,12 +1,11 @@
 /**
  * Stamp the host platform onto `<html>` so CSS can react to it.
  *
- * The only thing this currently drives is the macOS traffic-light inset. The
- * window runs with `titleBarStyle: "Overlay"` (see `tauri.conf.json`), which
+ * Drives the macOS traffic-light inset and Windows custom window chrome. The
+ * macOS window runs with `titleBarStyle: "Overlay"` (see `tauri.conf.json`), which
  * hands the webview the full window height and floats the close/minimise/zoom
- * buttons *over* our own top-left corner. Windows and Linux keep a real system
- * title bar above the webview, so reserving that space there would just
- * reintroduce the dead strip we removed.
+ * buttons *over* our own top-left corner. Windows disables decorations before
+ * reveal and renders caption buttons in React; Linux keeps its system titlebar.
  *
  * Read from the user agent rather than `@tauri-apps/plugin-os` on purpose: this
  * has to run synchronously before the first paint (an async platform lookup
@@ -14,6 +13,10 @@
  * bundle free of a plugin we'd otherwise pull in for one boolean.
  */
 export function platformClass(): "macos" | "windows" | "linux" | "other" {
+  // Local redesign testing: `VITE_FAKE_PLATFORM=windows` runs the real app with
+  // the Windows chrome and layout on a Mac (dev builds only).
+  const fake = import.meta.env.DEV ? import.meta.env.VITE_FAKE_PLATFORM : undefined;
+  if (fake === "windows" || fake === "linux" || fake === "macos") return fake;
   const ua = navigator.userAgent;
   // Apple Silicon still reports "Intel Mac OS X" in WKWebView, so match loosely.
   if (/Mac OS X|Macintosh/.test(ua)) return "macos";

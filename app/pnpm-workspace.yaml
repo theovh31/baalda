@@ -10,7 +10,7 @@ packages:
 catalog:
   "@hocuspocus/provider": ^4.4.0
   typescript: ~5.8.3
-  vitest: ^4.1.10
+  vitest: ^4.1.12
   y-protocols: ^1.0.7
   yjs: ^13.6.31
 
@@ -25,3 +25,13 @@ onlyBuiltDependencies:
 # Fail loudly if a new dep ever needs a build script instead of silently
 # skipping it (a silently-skipped esbuild postinstall breaks Vite in CI).
 strictDepBuilds: true
+
+# Security floors for transitive deps (Dependabot). dompurify and katex arrive
+# through mermaid; drop each entry once mermaid's own range requires the fixed
+# version.
+overrides:
+  dompurify: ">=3.4.17"
+  katex: ">=0.18.2"
+  # Mammoth's CLI uses the v1 compatibility API retained in argparse 2.
+  # argparse 1 pulls in unpatched sprintf-js (GHSA-hp3w-g68c-fv3c).
+  "mammoth>argparse": "2.0.1"

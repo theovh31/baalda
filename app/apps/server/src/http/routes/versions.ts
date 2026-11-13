@@ -1,18 +1,40 @@
 import { Hono } from "hono";
 import { pool } from "../../db/pool.js";
-import { canEditDoc } from "../../permissions/http-gates.js";
+import { ACCOUNT_READ_ONLY_BODY, canEditDoc, refusedForBilling } from "../../permissions/http-gates.js";
 import { orgRole, vaultOrg } from "../../permissions/lookup.js";
 import { effectivePermission } from "../../permissions/resolver.js";
+import { vaultAccess } from "../../permissions/vault-docs.js";
+import { deletedReadableDocsForActivity, readableDocsForActivity } from "../../permissions/readable-cache.js";
+import { extractDocText } from "../../index/indexer.js";
 import type { DocWriter } from "../../mcp/doc-writer.js";
-import { recordVersion, sha256Hex, stampLastEdited } from "../../versions/capture.js";
+import { recordVersion, sha256Hex, stampLastEdited, type VersionCause } from "../../versions/capture.js";
+import { resolveText, VERSION_CONTENT, VERSION_CONTENT_ENC, VERSION_SIZE, VERSION_TEXT_JOIN } from "../../versions/texts.js";
+import { docCryptoOf, requireVaultKey } from "../../crypto/transport.js";
 import {
   captureCheckpoint,
   getCheckpointSummary,
   listCheckpoints,
   withVaultCheckpointLock,
 } from "../../versions/checkpoints.js";
-import { revertVaultToCheckpoint, RevertError } from "../../versions/revert.js";
+import {
+  checkpointSchedule,
+  nextManualCheckpointAt,
+  plainCheckpointDate,
+} from "../../versions/checkpoint-plan.js";
+import {
+  revertVaultToCheckpoint,
+  RevertError,
+  RevertTooDestructiveError,
+} from "../../versions/revert.js";
+import {
+  applyRecovery,
+  listRecoveryCandidates,
+  RECOVERY_APPLY_MAX,
+  type RecoveryCandidate,
+  type RecoveryItem,
+} from "../../versions/recovery.js";
 import { getSession } from "../session.js";
+import { trashedNotePermission } from "../../trash/access.js";
 
 /**
  * Version history API (session-authenticated).
@@ -24,6 +46,8 @@ import { getSession } from "../session.js";
  *   POST   /api/vaults/:vaultId/checkpoints           create (owner/admin)
  *   DELETE /api/vaults/:vaultId/checkpoints/:id       delete (owner/admin)
  *   POST   /api/vaults/:vaultId/checkpoints/:id/revert  revert the vault (owner/admin)
+ *   GET    /api/vaults/:vaultId/recovery          damaged notes + proposals (owner/admin; ?format=csv)
+ *   POST   /api/vaults/:vaultId/recovery/apply    restore reviewed {docId, versionId} pairs (owner/admin)
  *
  * Gates mirror the rest of the app: per-doc `effectivePermission` for note
  * versions (so a `locked` share caps at view and a revert 403s), org role for
@@ -41,7 +65,7 @@ interface VersionRow {
   id: string;
   doc_id: string;
   created_at: Date;
-  cause: "idle" | "pre-revert";
+  cause: VersionCause;
   author_id: string | null;
   author_name: string | null;
   sha256: string;
@@ -60,6 +84,37 @@ function versionSummary(r: VersionRow) {
   };
 }
 
+function csvCell(value: string | number): string {
+  const s = String(value);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/** One row per candidate; `apply` is prefilled yes only for a lossless restore. */
+function recoveryCsv(candidates: RecoveryCandidate[]): string {
+  const head = "apply,docId,versionId,path,kind,status,currentChars,proposedChars,proposedAt,novelLines";
+  const rows = candidates.map((r) =>
+    [
+      r.status === "restore" ? "yes" : "no",
+      r.docId,
+      r.proposedVersionId,
+      r.path,
+      r.kind,
+      r.status,
+      r.currentChars,
+      r.proposedChars,
+      r.proposedAt,
+      r.novelLines.join(" | "),
+    ]
+      .map(csvCell)
+      .join(","),
+  );
+  return [head, ...rows].join("\n") + "\n";
+}
+
+/** Default look-back and page cap for `GET /vaults/:id/shrink-events`. */
+const SHRINK_EVENTS_DEFAULT_DAYS = 30;
+const SHRINK_EVENTS_MAX = 200;
+
 /** Live note → its collection id, or null when the note is gone. */
 async function noteVaultId(docId: string): Promise<string | null> {
   const { rows } = await pool.query<{ vault_id: string }>(
@@ -67,6 +122,20 @@ async function noteVaultId(docId: string): Promise<string | null> {
     [docId],
   );
   return rows[0]?.vault_id ?? null;
+}
+
+/** Any note row, live or in Trash. Version READS work on a deleted note so the
+ *  Trash can show its history; a revert stays refused (409 `note_deleted`). */
+async function anyNote(docId: string): Promise<{ vaultId: string; deleted: boolean } | null> {
+  const { rows } = await pool.query<{ vault_id: string; deleted: boolean }>(
+    "SELECT vault_id, deleted_at IS NOT NULL AS deleted FROM notes WHERE id = $1",
+    [docId],
+  );
+  return rows[0] ? { vaultId: rows[0].vault_id, deleted: rows[0].deleted } : null;
+}
+
+async function readPermission(userId: string, docId: string, deleted: boolean) {
+  return deleted ? trashedNotePermission(userId, docId) : effectivePermission(userId, docId);
 }
 
 export function createVersionRoutes(deps: VersionRouteDeps): Hono {
@@ -78,15 +147,17 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     const session = await getSession(c);
     if (!session) return c.json({ error: "Authentication required" }, 401);
     const docId = c.req.param("id");
-    if (!(await noteVaultId(docId))) return c.json({ error: "Unknown note" }, 404);
-    if ((await effectivePermission(session.userId, docId)) === "none") {
+    const note = await anyNote(docId);
+    if (!note) return c.json({ error: "Unknown note" }, 404);
+    if ((await readPermission(session.userId, docId, note.deleted)) === "none") {
       return c.json({ error: "No access to this note" }, 403);
     }
 
     const { rows } = await pool.query<VersionRow>(
       `SELECT v.id, v.doc_id, v.created_at, v.cause, v.author_id,
-              u.name AS author_name, v.sha256, octet_length(v.content) AS size
+              u.name AS author_name, v.sha256, ${VERSION_SIZE} AS size
          FROM note_versions v
+         ${VERSION_TEXT_JOIN}
          LEFT JOIN "user" u ON u.id = v.author_id
         WHERE v.doc_id = $1
         ORDER BY v.id DESC`,
@@ -99,17 +170,20 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     const session = await getSession(c);
     if (!session) return c.json({ error: "Authentication required" }, 401);
     const docId = c.req.param("id");
-    if (!(await noteVaultId(docId))) return c.json({ error: "Unknown note" }, 404);
-    if ((await effectivePermission(session.userId, docId)) === "none") {
+    const note = await anyNote(docId);
+    if (!note) return c.json({ error: "Unknown note" }, 404);
+    if ((await readPermission(session.userId, docId, note.deleted)) === "none") {
       return c.json({ error: "No access to this note" }, 403);
     }
 
     const versionId = Number.parseInt(c.req.param("versionId"), 10);
     if (!Number.isFinite(versionId)) return c.json({ error: "Unknown version" }, 404);
-    const { rows } = await pool.query<VersionRow & { content: string }>(
-      `SELECT v.id, v.doc_id, v.created_at, v.cause, v.author_id,
-              u.name AS author_name, v.sha256, octet_length(v.content) AS size, v.content
+    const { rows } = await pool.query<VersionRow & { content: string; content_enc: Buffer | null; vault_id: string }>(
+      `SELECT v.id, v.doc_id, v.vault_id, v.created_at, v.cause, v.author_id,
+              u.name AS author_name, v.sha256, ${VERSION_SIZE} AS size,
+              ${VERSION_CONTENT} AS content, ${VERSION_CONTENT_ENC} AS content_enc
          FROM note_versions v
+         ${VERSION_TEXT_JOIN}
          LEFT JOIN "user" u ON u.id = v.author_id
         WHERE v.id = $1`,
       [versionId],
@@ -118,7 +192,11 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     // A version id belongs to exactly one doc; asking for it under another note
     // is a 404, not a peek at someone else's content.
     if (!row || row.doc_id !== docId) return c.json({ error: "Unknown version" }, 404);
-    return c.json({ ...versionSummary(row), content: row.content });
+    // W3: a sealed text needs this request's key (409 key_required).
+    const vkr = await requireVaultKey(c, row.vault_id);
+    if (!vkr.ok) return vkr.response;
+    const content = resolveText(row, { vaultId: row.vault_id, docId, sha: row.sha256 }, docCryptoOf(row.vault_id, vkr));
+    return c.json({ ...versionSummary(row), content });
   });
 
   routes.post("/notes/:id/versions/:versionId/revert", async (c) => {
@@ -126,30 +204,48 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     if (!session) return c.json({ error: "Authentication required" }, 401);
     const docId = c.req.param("id");
     const vaultId = await noteVaultId(docId);
-    if (!vaultId) return c.json({ error: "Unknown note" }, 404);
+    if (!vaultId) {
+      const gone = await anyNote(docId);
+      if (gone?.deleted) {
+        return c.json({ error: "Restore the note from Trash before reverting it", code: "note_deleted" }, 409);
+      }
+      return c.json({ error: "Unknown note" }, 404);
+    }
     if (!(await canEditDoc(session.userId, docId))) {
+      if (await refusedForBilling(await vaultOrg(vaultId))) return c.json(ACCOUNT_READ_ONLY_BODY, 402);
       return c.json({ error: "You cannot edit this note" }, 403);
     }
 
     const versionId = Number.parseInt(c.req.param("versionId"), 10);
     if (!Number.isFinite(versionId)) return c.json({ error: "Unknown version" }, 404);
-    const { rows } = await pool.query<{ doc_id: string; content: string }>(
-      "SELECT doc_id, content FROM note_versions WHERE id = $1",
+    // W3: reverting a keyed vault's note reads sealed text and the sealed log
+    // with THIS request's key; refused (nothing written) without it.
+    const vkr = await requireVaultKey(c, vaultId);
+    if (!vkr.ok) return vkr.response;
+    const crypto = docCryptoOf(vaultId, vkr);
+    const { rows: rawRows } = await pool.query<{ doc_id: string; content: string; content_enc: Buffer | null; sha256: string }>(
+      `SELECT v.doc_id, v.sha256, ${VERSION_CONTENT} AS content, ${VERSION_CONTENT_ENC} AS content_enc
+         FROM note_versions v ${VERSION_TEXT_JOIN} WHERE v.id = $1`,
       [versionId],
     );
-    const version = rows[0];
-    if (!version || version.doc_id !== docId) return c.json({ error: "Unknown version" }, 404);
+    const raw = rawRows[0];
+    if (!raw || raw.doc_id !== docId) return c.json({ error: "Unknown version" }, 404);
+    const version = { doc_id: raw.doc_id, content: resolveText(raw, { vaultId, docId, sha: raw.sha256 }, crypto) };
+    // Fail safe: a version whose text cannot be resolved is never "restored"
+    // as an empty note.
+    if (version.content == null) return c.json({ error: "Version content unavailable" }, 409);
 
     // Capture where we are BEFORE overwriting it, so a revert is itself
     // undoable. `recordVersion` dedupes against the newest stored version, so
     // this is a no-op (null) when nothing has changed since the last capture.
-    const current = await deps.docWriter.readContent(vaultId, docId);
+    const current = await deps.docWriter.readContent(vaultId, docId, crypto);
     const preRevertVersionId = await recordVersion({
       vaultId,
       docId,
       content: current,
       cause: "pre-revert",
       authorId: session.userId,
+      crypto,
     });
 
     // Forward-only: set the target text as a normal transaction so live editors
@@ -157,6 +253,7 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     if (sha256Hex(current) !== sha256Hex(version.content)) {
       await deps.docWriter.setContent(vaultId, docId, version.content, {
         userId: session.userId,
+        crypto,
       });
     }
     await stampLastEdited(docId, session.userId);
@@ -173,6 +270,168 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     return orgRole(org, userId);
   }
 
+  // ── recovery of damaged notes (#200) ────────────────────────────────────────
+  // Propose, never apply: the listing is for a person to review, and apply takes
+  // back only the pairs they kept. Each restore is a forward write with a
+  // pre-revert version, so it is undoable from the note's Version History.
+
+  routes.get("/vaults/:vaultId/recovery", async (c) => {
+    const session = await getSession(c);
+    if (!session) return c.json({ error: "Authentication required" }, 401);
+    const vaultId = c.req.param("vaultId");
+    const role = await vaultRole(vaultId, session.userId);
+    if (role === undefined) return c.json({ error: "Unknown vault" }, 404);
+    if (role !== "owner" && role !== "admin") {
+      return c.json({ error: "Only a vault owner/admin can review recovery" }, 403);
+    }
+    const vkr = await requireVaultKey(c, vaultId);
+    if (!vkr.ok) return vkr.response;
+    const candidates = await listRecoveryCandidates(vaultId, {
+      docWriter: deps.docWriter,
+      canEdit: (docId) => canEditDoc(session.userId, docId),
+      crypto: docCryptoOf(vaultId, vkr),
+    });
+    if (c.req.query("format") === "csv") {
+      c.header("Content-Type", "text/csv; charset=utf-8");
+      c.header("Content-Disposition", `attachment; filename="recovery-${vaultId}.csv"`);
+      return c.body(recoveryCsv(candidates));
+    }
+    return c.json({ candidates });
+  });
+
+  routes.post("/vaults/:vaultId/recovery/apply", async (c) => {
+    const session = await getSession(c);
+    if (!session) return c.json({ error: "Authentication required" }, 401);
+    const vaultId = c.req.param("vaultId");
+    const role = await vaultRole(vaultId, session.userId);
+    if (role === undefined) return c.json({ error: "Unknown vault" }, 404);
+    if (role !== "owner" && role !== "admin") {
+      return c.json({ error: "Only a vault owner/admin can apply recovery" }, 403);
+    }
+    // A forward write to every listed note: refused while the account is lapsed.
+    if (await refusedForBilling(await vaultOrg(vaultId))) return c.json(ACCOUNT_READ_ONLY_BODY, 402);
+    const body = (await c.req.json().catch(() => null)) as { items?: unknown } | null;
+    const raw = Array.isArray(body?.items) ? body.items : null;
+    const items: RecoveryItem[] = [];
+    for (const it of raw ?? []) {
+      const docId = (it as { docId?: unknown })?.docId;
+      const versionId = Number((it as { versionId?: unknown })?.versionId);
+      if (typeof docId !== "string" || !Number.isInteger(versionId)) {
+        return c.json({ error: "Each item needs a docId and an integer versionId" }, 400);
+      }
+      items.push({ docId, versionId });
+    }
+    if (!raw || items.length === 0) return c.json({ error: "items required" }, 400);
+    if (items.length > RECOVERY_APPLY_MAX) {
+      return c.json({ error: `At most ${RECOVERY_APPLY_MAX} items per call` }, 400);
+    }
+    const vkr = await requireVaultKey(c, vaultId);
+    if (!vkr.ok) return vkr.response;
+    const results = await applyRecovery(vaultId, items, session.userId, {
+      docWriter: deps.docWriter,
+      canEdit: (docId) => canEditDoc(session.userId, docId),
+      crypto: docCryptoOf(vaultId, vkr),
+    });
+    if (results.some((r) => r.ok)) deps.onRegistryChanged(vaultId, null);
+    return c.json({ results });
+  });
+
+  // ── shrink events (#200) ──────────────────────────────────────────────────
+  // GET /api/vaults/:vaultId/shrink-events?since=<ISO>&limit=<n≤200>
+  // Every `pre-shrink` version (an update that left ≤20% of a note; see
+  // `versions/shrink-guard.ts`) on a note the caller can read, deleted notes
+  // included, newest first. `beforeChars` is the captured text's length. The
+  // capture does not store the post-shrink text, so `afterChars` is the note's
+  // CURRENT length and the response says so with `afterIsCurrent: true`.
+  routes.get("/vaults/:vaultId/shrink-events", async (c) => {
+    const session = await getSession(c);
+    if (!session) return c.json({ error: "Authentication required" }, 401);
+    const vaultId = c.req.param("vaultId");
+    const role = await vaultRole(vaultId, session.userId);
+    if (role === undefined) return c.json({ error: "Unknown vault" }, 404);
+    if (!role) return c.json({ error: "Not a member of this vault" }, 403);
+
+    const sinceRaw = c.req.query("since");
+    const since = sinceRaw ? new Date(sinceRaw) : new Date(Date.now() - SHRINK_EVENTS_DEFAULT_DAYS * 86_400_000);
+    if (Number.isNaN(since.getTime())) return c.json({ error: "since must be an ISO date", code: "invalid_since" }, 400);
+    const limitRaw = Number.parseInt(c.req.query("limit") ?? "", 10);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, SHRINK_EVENTS_MAX) : SHRINK_EVENTS_MAX;
+
+    // Candidates FIRST (#261): the docs with any `pre-shrink` version in the
+    // window, through `note_versions_pre_shrink_idx` (migration 041). Shrinks
+    // are rare, so this is usually empty and no readable set is built at all;
+    // otherwise readability is checked for these few ids only, against the
+    // display-only cached sets (`permissions/readable-cache.ts` — this listing
+    // drives nothing on a client's disk). It used to build both full sets on
+    // every call and send every readable id back as `= ANY($3)`.
+    const { rows: candidateRows } = await pool.query<{ doc_id: string }>(
+      `SELECT DISTINCT doc_id FROM note_versions
+        WHERE vault_id = $1 AND cause = 'pre-shrink' AND created_at >= $2`,
+      [vaultId, since],
+    );
+    if (candidateRows.length === 0) return c.json({ items: [], truncated: false, afterIsCurrent: true });
+    const [live, deleted] = await Promise.all([
+      readableDocsForActivity(session.userId, vaultId),
+      deletedReadableDocsForActivity(session.userId, vaultId),
+    ]);
+    const readable = candidateRows.map((r) => r.doc_id).filter((d) => live.has(d) || deleted.has(d));
+    if (readable.length === 0) return c.json({ items: [], truncated: false, afterIsCurrent: true });
+    // Lengths of a keyed vault's texts are read with THIS request's key.
+    const vkr = await requireVaultKey(c, vaultId);
+    if (!vkr.ok) return vkr.response;
+    const crypto = docCryptoOf(vaultId, vkr);
+
+    const { rows } = await pool.query<{
+      id: string;
+      doc_id: string;
+      rel_path: string;
+      created_at: Date;
+      before_chars: number | null;
+      content_enc: Buffer | null;
+      sha256: string;
+      deleted: boolean;
+    }>(
+      `SELECT v.id, v.doc_id, n.rel_path, v.created_at,
+              (CASE WHEN ${VERSION_CONTENT_ENC} IS NULL THEN char_length(${VERSION_CONTENT}) END)::int AS before_chars,
+              ${VERSION_CONTENT_ENC} AS content_enc, v.sha256,
+              n.deleted_at IS NOT NULL AS deleted
+         FROM note_versions v
+         ${VERSION_TEXT_JOIN}
+         JOIN notes n ON n.id = v.doc_id AND n.vault_id = $1
+        WHERE v.vault_id = $1 AND v.cause = 'pre-shrink' AND v.created_at >= $2
+          AND v.doc_id = ANY($3::text[])
+        ORDER BY v.created_at DESC, v.id DESC
+        LIMIT $4`,
+      [vaultId, since, readable, limit + 1],
+    );
+    const page = rows.slice(0, limit);
+    // Current length per distinct doc, derived the way the indexer derives text.
+    const docIds = [...new Set(page.map((r) => r.doc_id))];
+    const current = new Map<string, number>();
+    for (let i = 0; i < docIds.length; i += 8) {
+      await Promise.all(
+        docIds.slice(i, i + 8).map(async (d) => current.set(d, (await extractDocText(d, pool, crypto)).length)),
+      );
+    }
+    return c.json({
+      items: page.map((r) => ({
+        versionId: Number(r.id),
+        docId: r.doc_id,
+        relPath: r.rel_path,
+        capturedAt: r.created_at.toISOString(),
+        beforeChars:
+          r.before_chars ??
+          resolveText({ content: null, content_enc: r.content_enc }, { vaultId, docId: r.doc_id, sha: r.sha256 }, crypto)
+            ?.length ??
+          0,
+        afterChars: current.get(r.doc_id) ?? 0,
+        deleted: r.deleted,
+      })),
+      truncated: rows.length > limit,
+      afterIsCurrent: true,
+    });
+  });
+
   routes.get("/vaults/:vaultId/checkpoints", async (c) => {
     const session = await getSession(c);
     if (!session) return c.json({ error: "Authentication required" }, 401);
@@ -180,7 +439,17 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     const role = await vaultRole(vaultId, session.userId);
     if (role === undefined) return c.json({ error: "Unknown vault" }, 404);
     if (!role) return c.json({ error: "Not a member of this vault" }, 403);
-    return c.json({ checkpoints: await listCheckpoints(pool, vaultId) });
+    const schedule = await checkpointSchedule(pool, vaultId, { fresh: true });
+    const nextAt = await nextManualCheckpointAt(pool, vaultId, schedule);
+    return c.json({
+      checkpoints: await listCheckpoints(pool, vaultId),
+      schedule: {
+        auto: schedule.auto,
+        manualEveryDays:
+          schedule.manualEveryMs === null ? null : Math.round(schedule.manualEveryMs / 86_400_000),
+        nextManualAt: nextAt?.toISOString() ?? null,
+      },
+    });
   });
 
   routes.post("/vaults/:vaultId/checkpoints", async (c) => {
@@ -195,18 +464,36 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     const body = await c.req.json().catch(() => ({}));
     const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : null;
 
-    const outcome = await withVaultCheckpointLock(vaultId, (db) =>
-      captureCheckpoint({
+    const vkr = await requireVaultKey(c, vaultId);
+    if (!vkr.ok) return vkr.response;
+    const schedule = await checkpointSchedule(pool, vaultId, { fresh: true });
+    const outcome = await withVaultCheckpointLock(vaultId, async (db) => {
+      // Judged under the lock, so two clicks cannot both pass the window.
+      const nextAt = await nextManualCheckpointAt(db, vaultId, schedule);
+      if (nextAt) return { limited: nextAt } as const;
+      return captureCheckpoint({
         db,
         docWriter: deps.docWriter,
+        crypto: docCryptoOf(vaultId, vkr),
         vaultId,
         kind: "manual",
         label,
         createdBy: session.userId,
-      }),
-    );
+      });
+    });
     // Busy: another checkpoint or a revert is running on this vault right now.
     if (!outcome.acquired) return c.json({ error: "Vault is busy, try again" }, 409);
+    if ("limited" in outcome.value) {
+      const nextAt = outcome.value.limited;
+      return c.json(
+        {
+          error: "checkpoint_limit",
+          message: `This vault can make one checkpoint a week. The next one can be made on ${plainCheckpointDate(nextAt)}.`,
+          nextAt: nextAt.toISOString(),
+        },
+        429,
+      );
+    }
 
     const summary = await getCheckpointSummary(pool, vaultId, outcome.value.id);
     return c.json(summary ?? { id: outcome.value.id }, 201);
@@ -243,6 +530,26 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     if (role !== "owner" && role !== "admin") {
       return c.json({ error: "Only a vault owner or admin can revert a vault" }, 403);
     }
+    // Rewrites every note in the vault: refused while the account is lapsed.
+    if (await refusedForBilling(await vaultOrg(vaultId))) return c.json(ACCOUNT_READ_ONLY_BODY, 402);
+    // …and only someone the whole vault is actually readable to. This rewrites
+    // every note at once, so it cannot be done from a seat that can only see
+    // some of them: the role stopped implying vault-wide read when the Private
+    // posture stopped exempting owners, and a partial revert is worse than
+    // none — the structure would come back whole while the contents did not.
+    // A Private vault's owner reverts per note instead (the routes above,
+    // gated on `effectivePermission`), or opens the vault first.
+    const access = await vaultAccess(pool, session.userId, vaultId);
+    if (!access?.vaultWide) {
+      return c.json(
+        {
+          error:
+            "This vault is private, so a whole-vault revert would rewrite notes you cannot read. Revert individual notes, or set the vault to Shared first.",
+          code: "no_vault_wide_access",
+        },
+        403,
+      );
+    }
     const checkpointId = c.req.param("id");
     const { rows } = await pool.query<{ id: string }>(
       "SELECT id FROM vault_checkpoints WHERE id = $1 AND vault_id = $2",
@@ -250,17 +557,34 @@ export function createVersionRoutes(deps: VersionRouteDeps): Hono {
     );
     if (!rows[0]) return c.json({ error: "Unknown checkpoint" }, 404);
 
+    const vkr = await requireVaultKey(c, vaultId);
+    if (!vkr.ok) return vkr.response;
     try {
       const outcome = await revertVaultToCheckpoint({
         vaultId,
         checkpointId,
         userId: session.userId,
         docWriter: deps.docWriter,
+        crypto: docCryptoOf(vaultId, vkr),
         onRegistryChanged: deps.onRegistryChanged,
       });
       if (!outcome.acquired) return c.json({ error: "Vault is busy, try again" }, 409);
       return c.json({ ok: true, ...outcome.result });
     } catch (err) {
+      // A refusal is not a missing checkpoint: the checkpoint is fine, the
+      // revert it describes is too destructive to run (see the class docblock).
+      // 409 + a code, so a client can say so rather than reporting "not found".
+      if (err instanceof RevertTooDestructiveError) {
+        return c.json(
+          {
+            error: err.message,
+            code: "revert_too_destructive",
+            wouldDelete: err.wouldDelete,
+            cap: err.cap,
+          },
+          409,
+        );
+      }
       if (err instanceof RevertError) return c.json({ error: err.message }, 404);
       throw err;
     }

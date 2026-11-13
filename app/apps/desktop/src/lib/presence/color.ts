@@ -2,7 +2,8 @@
 // derived from their stable id so it's identical across every client and every
 // session — no server round-trip, no per-connection randomness.
 
-import type { ActivityStatus } from "../prefs";
+import { selfAvatarImage } from "../avatarIdentity";
+import { STATUS_MOMENTS, statusToWire, type ActivityStatus } from "../prefs";
 
 /**
  * A curated palette of bright, cheerful hues harmonized with the violet accent.
@@ -53,6 +54,12 @@ export interface PresenceUser {
   color: string;
   /** The user's chosen activity status, so peers can show it beside cursors. */
   status?: ActivityStatus;
+  /** Their status moment, when `status` carries only its tone (statusToWire). */
+  moment?: string;
+  /** Their picked character (`character:<seed>`) or photo URL, when small
+   *  enough to broadcast (`wireAvatarImage`). Older builds omit it; readers
+   *  then fall back to the user-id seed. */
+  image?: string;
 }
 
 export function presenceUser(
@@ -60,7 +67,14 @@ export function presenceUser(
   name: string,
   status?: ActivityStatus,
 ): PresenceUser {
-  return { id: userId, name, color: colorForUser(userId), ...(status ? { status } : {}) };
+  const image = selfAvatarImage();
+  return {
+    id: userId,
+    name,
+    color: colorForUser(userId),
+    ...(status ? statusToWire(status) : {}),
+    ...(image ? { image } : {}),
+  };
 }
 
 /**
@@ -75,6 +89,8 @@ export type PresenceTone = "online" | "away" | "busy" | "offline";
 
 /** Fold a chosen availability status into a presence tone. */
 export function statusTone(status: ActivityStatus | undefined): PresenceTone {
+  const moment = STATUS_MOMENTS.find((m) => m.id === status);
+  if (moment) return moment.tone;
   switch (status) {
     case "away":
       return "away";

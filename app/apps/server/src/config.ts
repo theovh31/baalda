@@ -54,6 +54,15 @@ function int(name: string, fallback: number): number {
   return n;
 }
 
+/** `DEEP_LINK_SCHEME`, validated to the shape a URL scheme may take. */
+function deepLinkScheme(): string {
+  const v = optional("DEEP_LINK_SCHEME") ?? "baalda";
+  if (!/^[a-z][a-z0-9+.-]{0,63}$/.test(v)) {
+    throw new Error(`DEEP_LINK_SCHEME must be a URL scheme like "baalda" (got "${v}")`);
+  }
+  return v;
+}
+
 /** An env var that may be absent; empty string is treated as unset. */
 function optional(name: string): string | undefined {
   const v = process.env[name];
@@ -73,10 +82,19 @@ export const config = {
   hocuspocusPort: int("HOCUSPOCUS_PORT", 3011),
   syncTokenTtlSeconds: int("SYNC_TOKEN_TTL_SECONDS", 600),
   compactionThreshold: int("COMPACTION_THRESHOLD", 50),
+  /** Days a soft-deleted note stays in Trash before purge (`src/trash/retention.ts`). */
+  trashRetentionDays: int("TRASH_RETENTION_DAYS", 30),
   /** Quiet time after a note's last edit before a version is captured.
    *  Lower it locally to test the history panel without the 10-minute wait. */
   versionIdleMs: int("VERSION_IDLE_MS", 10 * 60_000),
-  invitationExpiresInSeconds: 48 * 60 * 60, // 48h per spec 04 §2
+  /**
+   * How long a vault invitation stays acceptable. Was a fixed 48 h (spec 04
+   * §2), and most invitations expired unaccepted: people open the email days
+   * later (#268). `INVITATION_EXPIRES_HOURS`, default 7 days. Applies to
+   * invitations created from now on; an existing row keeps the expiry it was
+   * created with, and an owner/admin can Resend an expired one.
+   */
+  invitationExpiresInSeconds: int("INVITATION_EXPIRES_HOURS", 7 * 24) * 60 * 60,
   // ---- Vault sync engine (spec 05) ----
   /** Redis connection string. Unset ⇒ in-memory pub/sub, single instance.
    *  Set ⇒ Redis fanout so N server instances share the vault feed (HA). */
@@ -134,6 +152,33 @@ export const config = {
    *  on email+password alone. Set only via env (never committed). */
   googleClientId: optional("GOOGLE_CLIENT_ID"),
   googleClientSecret: optional("GOOGLE_CLIENT_SECRET"),
+  /**
+   * URL scheme of the desktop app this server's pages bounce into (`/open/*`,
+   * `/invite/:id`, `/email-verified`, `/reset-password`). The released app
+   * registers `baalda`; the Staging app registers `baalda-staging`, so a staging
+   * server must say so or its links open whichever app grabbed `baalda://` last
+   * on a machine that has both installed.
+   */
+  deepLinkScheme: deepLinkScheme(),
+  // ---- Outbound email (issue #99) ----
+  /** Sender address, e.g. `Baalda <no-reply@example.com>`. Required to send
+   *  anything; with it and ONE transport below, password reset + sign-up
+   *  verification + invitation emails switch on. Unset ⇒ email off, and every
+   *  feature that needs it is simply not offered. Resolution + validation live
+   *  in `email/mailer.ts` (`resolveEmailConfig`), which throws at startup on a
+   *  half-configured setup rather than offering reset links that never arrive. */
+  emailFrom: optional("EMAIL_FROM"),
+  /** SMTP connection URL: `smtp://user:pass@host:587` or `smtps://…:465`. */
+  smtpUrl: optional("SMTP_URL"),
+  /** Resend API key (https://resend.com) — the HTTP alternative to SMTP. */
+  resendApiKey: optional("RESEND_API_KEY"),
+  /** Force a transport (`smtp` | `resend` | `log` | `memory`). Normally inferred
+   *  from which credential is set; `log`/`memory` are dev/test only. */
+  emailTransport: optional("EMAIL_TRANSPORT"),
+  /** Where the desktop's "Report a bug" dialog delivers (needs email on, above).
+   *  Unset ⇒ bug reports are off and the app hides the button — the default
+   *  for a self-host, whose users' reports belong to its own operator. */
+  bugReportEmail: optional("BUG_REPORT_EMAIL"),
   // ---- Subscription billing (Polar) ----
   /** Polar organization access token. Its presence is the ON switch for the
    *  whole billing feature (see `billingEnabled` below): unset ⇒ billing is
@@ -149,21 +194,88 @@ export const config = {
    *  dashboard). Checkout picks one based on the requested interval. */
   polarProductMonthlyId: optional("POLAR_PRODUCT_MONTHLY_ID"),
   polarProductYearlyId: optional("POLAR_PRODUCT_YEARLY_ID"),
+  /** Polar seat-based Team products (one per interval). Checkout in `team`
+   *  mode uses these; the legacy ids above only CLASSIFY old subscriptions. */
+  polarProductTeamMonthlyId: optional("POLAR_PRODUCT_TEAM_MONTHLY_ID"),
+  polarProductTeamYearlyId: optional("POLAR_PRODUCT_TEAM_YEARLY_ID"),
+  /** Team list price per seat, minor units (display + preview math only:
+   *  Polar's product price is what is actually charged). */
+  teamPriceMonthlyCents: int("TEAM_PRICE_MONTHLY_CENTS", 1000),
+  teamPriceYearlyCents: int("TEAM_PRICE_YEARLY_CENTS", 11000),
+  /** Fewest seats a Team subscription may hold. */
+  teamMinSeats: int("TEAM_MIN_SEATS", 3),
+  /** Abuse ceilings that apply even to paid Team accounts. */
+  abuseMaxNotes: int("ABUSE_MAX_NOTES", 100000),
+  abuseMaxStorageMb: int("ABUSE_MAX_STORAGE_MB", 10240),
+  /** 'vault' (default: per-vault Pro, FREE_MAX_* caps) or 'team' (per-seat). */
+  billingModel: (optional("BILLING_MODEL") === "team" ? "team" : "vault") as "vault" | "team",
   /** Free-tier caps (only enforced when billing is enabled). A user may OWN up
    *  to this many UNSUBSCRIBED vaults; each unsubscribed vault may hold
    *  up to this many members (incl. pending invitations).
    *
-   *  Members sit well above vaults on purpose: a free vault should be able to
-   *  hold a real team, so the upgrade prompt arrives when a group outgrows the
-   *  product rather than the moment it stops being a pair. */
-  freeMaxVaults: int("FREE_MAX_VAULTS", 3),
-  freeMaxMembers: int("FREE_MAX_MEMBERS", 10),
+   *  New accounts get 2 vaults; migration 031 records the previous allowance
+   *  for every account that existed at rollout. Members remain capped at 3.
+   *  member cap gates only NEW seats — invitations and join-code redemptions
+   *  (`canAddMember`) — so a free vault that already holds more than the cap
+   *  keeps every existing member and simply cannot add another until it goes
+   *  Pro; nobody is removed or locked out by lowering this number. */
+  freeMaxVaults: int("FREE_MAX_VAULTS", 2),
+  freeMaxMembers: int("FREE_MAX_MEMBERS", 3),
+  /** Free-tier attachment storage per unsubscribed vault, in MB. Enforced on
+   *  the same terms as the two caps above — only when billing is enabled, and
+   *  never against a vault with an active subscription (`storageLimitBytes`).
+   *  Like them it gates only NEW uploads: lowering it never deletes a byte, it
+   *  just stops the next one. */
+  freeMaxStorageMb: int("FREE_MAX_STORAGE_MB", 1024),
   /** Hard ceiling on a single note-sync message / note body, in MB. Real notes
    *  are tiny (production p99 ≈ 600 kB; the largest legitimate page ≈ 7 MB), so
    *  anything past this is a runaway — most likely a forked-note feedback loop
    *  duplicating content on every bounce (2026-08-25: single updates reached
    *  17 MB and OOM-crash-looped the server). The cap is the circuit breaker. */
   maxNoteMb: int("MAX_NOTE_MB", 10),
+  // ---- Bulk sync engine (bootstrap + batch) ----
+  /**
+   * Per-request item ceilings for the batch registration routes, mirrored
+   * client-side in `apps/desktop/src/lib/sync/pool.ts` so the desktop chunks to
+   * them rather than earning a 400 `batch_too_large`.
+   *
+   * They are deliberately different numbers rather than one shared cap: a folder
+   * row is a handful of columns and resolves its parent from a path the server
+   * already indexed, while a note additionally walks `resolveParentFolder` and a
+   * permission gate. Sized so ONE request is bounded work at `PG_POOL_MAX`
+   * shared with the vault channel's backfill, not so the arithmetic is tidy.
+   */
+  batchMaxNotes: int("BATCH_MAX_NOTES", 200),
+  batchMaxFolders: int("BATCH_MAX_FOLDERS", 500),
+  batchMaxFiles: int("BATCH_MAX_FILES", 200),
+  batchMaxDocs: int("BATCH_MAX_DOCS", 100),
+  /**
+   * Total DECODED bytes one `docs/batch` may carry. The route also takes a
+   * 16 MB `bodyLimit`, which bounds what is read off the socket; this bounds
+   * what is held in heap after base64 decoding, which is the number that
+   * actually matters at a 512 MB cap with four of these in flight.
+   */
+  batchMaxDecodedBytes: int("BATCH_MAX_DECODED_BYTES", 4 * 1024 * 1024),
+  /**
+   * Bootstrap page budgets. A page is built in memory (merge + gzip) before a
+   * byte is written, so `bootstrapConcurrency × bootstrapMaxPageBytes` is the
+   * floor of the peak — ~50 MB at these defaults once the merge transient and
+   * the gzip buffer are counted. `bootstrapMaxPageDocs` bounds the per-page
+   * query fan-out instead of the bytes, for a vault of many tiny notes.
+   *
+   * A single doc larger than a page ships ALONE rather than being refused: a
+   * 6 MB note is legitimate and must still reach a joiner.
+   */
+  bootstrapMaxPageBytes: int("BOOTSTRAP_MAX_PAGE_BYTES", 4 * 1024 * 1024),
+  bootstrapMaxPageDocs: int("BOOTSTRAP_MAX_PAGE_DOCS", 256),
+  /** Concurrent page builds across the whole process. Past it a GET answers
+   *  503 + `Retry-After` with code `bootstrap_busy` — backpressure the client
+   *  can obey, rather than an OOM every joiner shares. */
+  bootstrapConcurrency: int("BOOTSTRAP_CONCURRENCY", 4),
+  /** How long a bootstrap session (its materialised doc list) stays valid.
+   *  Past it a GET answers 410 `session_expired` and the client re-POSTs with a
+   *  fresh `have` — which is also the resume path after a very long pause. */
+  bootstrapTtlHours: int("BOOTSTRAP_TTL_HOURS", 24),
 } as const;
 
 /**
@@ -180,3 +292,17 @@ export function billingEnabled(): boolean {
 }
 
 export type AppConfig = typeof config;
+
+// ---- Typed billing getters (Team seat billing) ----
+export type BillingModel = "vault" | "team";
+export const billingModel = (): BillingModel => config.billingModel;
+export const teamProductId = (interval: "month" | "year"): string | undefined =>
+  interval === "year" ? config.polarProductTeamYearlyId : config.polarProductTeamMonthlyId;
+export const teamPricePerSeatCents = (interval: "month" | "year"): number =>
+  interval === "year" ? config.teamPriceYearlyCents : config.teamPriceMonthlyCents;
+export const teamMinSeats = (): number => config.teamMinSeats;
+export const abuseMaxNotes = (): number => config.abuseMaxNotes;
+export const abuseMaxStorageBytes = (): number => config.abuseMaxStorageMb * 1024 * 1024;
+/** Legacy per-vault product ids, used only to classify existing subscriptions. */
+export const legacyProductIds = (): string[] =>
+  [config.polarProductMonthlyId, config.polarProductYearlyId].filter((x): x is string => !!x);

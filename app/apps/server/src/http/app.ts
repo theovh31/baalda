@@ -1,27 +1,79 @@
+import { getSession } from "./session.js";
+import { auditRequestActor, attributeMembershipEvent } from "../audit/access.js";
+import { accessAuditRoutes } from "./routes/access-audit.js";
 import { Hono } from "hono";
+import { readFileSync } from "node:fs";
+import { NOTES_WITH_STATE_FEATURE } from "../registry/seed-on-register.js";
+import { BOOTSTRAP_ONLY_FEATURE } from "./routes/bootstrap.js";
 import { compress } from "hono/compress";
 import { cors } from "hono/cors";
 import { oAuthDiscoveryMetadata, oAuthProtectedResourceMetadata } from "better-auth/plugins";
 import { config } from "../config.js";
 import { auth } from "../auth/auth.js";
+import { throttledSignIn } from "../auth/signin-throttle.js";
+import { accountKeyPepper, clearPasswordWrap, upgradeLoginHash } from "../auth/login-pepper.js";
+import {
+  CLIENT_VERSION_HEADER,
+  clientVersionPolicy,
+  requireSupportedClient,
+} from "./client-version.js";
 import { oauthConnectRoutes } from "./routes/oauth-connect.js";
+import { accountPageRoutes } from "./routes/account-pages.js";
+import { invitationRoutes } from "./routes/invitations.js";
+import { createMemberShareRoutes, memberRoutes } from "./routes/members.js";
+import { createAppearanceRoutes } from "./routes/appearance.js";
+import { createFontRoutes } from "./fonts.js";
+import { createSkillRoutes } from "./routes/skills.js";
+import { SKILL_ACCESS_FEATURE, SKILLS_FEATURE } from "../skills/feature.js";
+import { passwordResetRoutes } from "./routes/password-reset.js";
 import { openLinkRoutes } from "./routes/open-link.js";
 import { createPublicPageRoutes, publicLinkApiRoutes } from "./routes/public-links.js";
-import { blobRoutes } from "./routes/blobs.js";
+import { ACCESS_BOARD_FEATURE } from "../permissions/access-board.js";
+import { blobRoutes, FILES_WITH_BYTES_FEATURE, setBlobRegistryNotifier } from "./routes/blobs.js";
 import { createRegistryRoutes, ORIGIN_HEADER } from "./routes/registry.js";
+import { createBulkRoutes } from "./routes/bulk.js";
+import { bootstrapRoutes } from "./routes/bootstrap.js";
 import { syncTokenRoutes } from "./routes/sync-token.js";
 import { vaultTokenRoutes } from "./routes/vault-token.js";
 import { desktopOauthRoutes } from "./routes/desktop-oauth.js";
+import { SITE_ICON_PNG_BASE64 } from "../site-icon.js";
+import { bugReportRoutes } from "./routes/bug-reports.js";
 import { createShareRoutes, type ShareDeps } from "./routes/shares.js";
 import { createOrgRoutes } from "./routes/orgs.js";
+import { createVaultKeyRoutes } from "./routes/vault-keys.js";
+import { createKeyRecoveryRoutes } from "./routes/key-recovery.js";
+import { createMessageRoutes, MESSAGES_FEATURE } from "./routes/messages.js";
+import { createMcpKeyRoutes } from "./routes/mcp-keys.js";
+import { vaultKeyHeader } from "../crypto/transport.js";
+import { vaultKeysEnabled, VAULT_KEYS_FEATURE } from "../crypto/config.js";
 import { graphRoutes } from "./routes/graph.js";
 import { createMcpRoutes } from "./routes/mcp.js";
 import { createRepairRoutes } from "./routes/repair.js";
 import { createVersionRoutes } from "./routes/versions.js";
+import { createTrashRoutes } from "./routes/trash.js";
+import { createShrinkBrakeRoutes } from "./routes/shrink-brake.js";
 import { createBillingRoutes } from "./routes/billing.js";
 import { PolarBillingProvider } from "../billing/polar.js";
 import type { BillingProvider } from "../billing/provider.js";
 import type { DocWriter } from "../mcp/doc-writer.js";
+import { pool } from "../db/pool.js";
+import { handleMcpToken, isMcpGetSessionPath, isMcpTokenPath } from "../mcp/oauth-token-endpoint.js";
+import { rewrapOnIssue } from "../mcp/oauth-grant-keys.js";
+
+
+/**
+ * The server's package version, read ONCE at startup. `../../package.json`
+ * resolves to the server package from both `src/http/` (tsx) and `dist/http/`.
+ */
+const SERVER_VERSION: string = (() => {
+  try {
+    const raw = readFileSync(new URL("../../package.json", import.meta.url), "utf8");
+    const v = (JSON.parse(raw) as { version?: unknown }).version;
+    return typeof v === "string" ? v : "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 export interface AppDeps extends ShareDeps {
   /** Server-side note writer for the MCP tools (backed by the sync server). */
@@ -92,15 +144,34 @@ function allowedOrigins(): string[] {
  *                   invitations, members, etc.)
  *  - /api/sync-token → mint per-doc sync JWTs
  *  - /api/{vaults,folders,notes,files} → registry
+ *  - /api/vaults/:id/{folders,notes,files,docs}/batch → bulk registration + push
+ *  - /api/vaults/:id/bootstrap[/:sessionId] → whole-vault download session
  *  - /api/vaults/:id/blobs, /api/blobs/:id → attachment blob store
  *  - /api/notes/:id/versions, /api/vaults/:id/checkpoints → version history
  *  - /api/shares → folder/file ACL management
  *  - /api/notes/:docId/public-link → mint/inspect/revoke a public note link
  *  - /p/:token → public read-only note page (no auth; token is the capability)
  *  - /api/orgs/join-code, /api/orgs/join → vault join codes
+ *  - /api/invitations/mine, /api/invitations/:id/{preview,send} → invitation inbox/preview/email
+ *  - /api/password-reset/request → emailed reset link (reports the outcome)
+ *  - /forgot-password, /reset-password, /email-verified, /invite/:id → account pages
  *  - /api/vaults/:id/graph, /api/vaults/:id/search → note index (links+vectors)
  *  - /api/mcp → Model Context Protocol endpoint (AI clients); /api/mcp/tokens → token mgmt
  */
+/** RFC 9116 body for `contact`, or null when no contact is configured. */
+export function securityTxt(contact: string | undefined, now: Date = new Date()): string | null {
+  const value = contact?.trim();
+  if (!value) return null;
+  const expires = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString();
+  return [
+    `Contact: ${value}`,
+    `Expires: ${expires}`,
+    "Policy: https://github.com/naveedharri/baalda/blob/main/SECURITY.md",
+    "Preferred-Languages: en",
+    "",
+  ].join("\n");
+}
+
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
 
@@ -119,13 +190,40 @@ export function createApp(deps: AppDeps): Hono {
         "Authorization",
         "x-file-name",
         "x-rel-path",
+        // Content hash a client declares before an attachment upload, so known
+        // content is deduped without sending a byte.
+        "x-sha256",
+        // The `files` doc a legacy-POST upload's bytes belong to, so a tree
+        // binary's blob carries the doc identity its ACL is resolved from.
+        "x-doc-id",
+        // The version a tree binary's edit started from (409 `stale_base`).
+        "x-base-sha256",
         // Opaque per-client instance id on registry writes, so the vault channel
         // doesn't tell a client to re-pull its own structural change.
         ORIGIN_HEADER,
+        // The desktop's app version on every call, so the content-write routes
+        // can refuse a build too old to push safely (`client-version.ts`, #251).
+        CLIENT_VERSION_HEADER,
+        // The vault key a device presents for a keyed vault (`crypto/`): a
+        // webview refuses to send it cross-origin unless it is listed here.
+        "x-baalda-vk",
       ],
       // set-auth-token carries the session token the desktop client reads after
       // sign-in/up; without exposing it the browser hides it even on success.
-      exposeHeaders: ["set-auth-token"],
+      //
+      // The bootstrap page headers are here for exactly the same reason, and the
+      // failure is sharper: a cross-origin reader that cannot see
+      // `X-Baalda-Cursor` cannot tell a drained session from a page boundary, so
+      // it would stop after the first page of a whole-vault download and report
+      // success. The webview IS cross-origin to the API in every configuration
+      // we ship.
+      exposeHeaders: [
+        "set-auth-token",
+        "X-Baalda-Cursor",
+        "X-Baalda-Docs",
+        "X-Baalda-Bytes",
+        "ETag",
+      ],
     }),
   );
 
@@ -150,7 +248,76 @@ export function createApp(deps: AppDeps): Hono {
     return compressor(c, next);
   });
 
-  app.get("/health", (c) => c.json({ ok: true }));
+  // `features`: what this server accepts beyond the base protocol, so a desktop
+  // can pick a path with one call per server URL instead of wasting a chunk on
+  // an old server. `notes-with-state` = `notes/batch` and `POST /api/notes` take
+  // an item's `state` and answer `seeded`. A missing field means none; the
+  // per-item `seeded` flag stays the fallback (absent ⇒ not seeded).
+  // `access-board` = `GET /vaults/:id/access-board` answers the member Access
+  // tab in one request (desktops fall back to access-tree + summaries).
+  // `skills` = the team skills catalog (`/api/orgs/:orgId/skills`,
+  // `/api/skills/manifest`, docs/SKILLS.md).
+  // `version` is this server's package version (read once at startup);
+  // `minDesktopVersion` is the floor `client-version.ts` enforces on content
+  // writes, read live like the gate itself (null when the floor is off).
+  app.get("/health", (c) =>
+    c.json({
+      ok: true,
+      version: SERVER_VERSION,
+      minDesktopVersion: clientVersionPolicy().minRaw,
+      features: [
+        NOTES_WITH_STATE_FEATURE,
+        BOOTSTRAP_ONLY_FEATURE,
+        FILES_WITH_BYTES_FEATURE,
+        ACCESS_BOARD_FEATURE,
+        SKILLS_FEATURE,
+        SKILL_ACCESS_FEATURE,
+        // In-app messages (`/api/messages`, docs/MESSAGES.md).
+        MESSAGES_FEATURE,
+        // Client-held vault keys (W3), only while BAALDA_VAULT_KEYS is on.
+        ...(vaultKeysEnabled() ? [VAULT_KEYS_FEATURE] : []),
+      ],
+    }),
+  );
+
+  // ── Site icon ─────────────────────────────────────────────────────────────
+  // Connector directories and favicon services look up the icon of the MCP
+  // server's own origin (this host), not baalda.com. Without these they found
+  // nothing here and fell back to stale caches of other icons. The root page
+  // exists only to carry the <link rel="icon"> for fetchers that read HTML.
+  const siteIcon = new Uint8Array(Buffer.from(SITE_ICON_PNG_BASE64, "base64"));
+  const iconHeaders = {
+    "Content-Type": "image/png",
+    "Cache-Control": "public, max-age=86400",
+  };
+  app.get("/favicon.ico", (c) => c.body(siteIcon, 200, iconHeaders));
+  app.get("/icon.png", (c) => c.body(siteIcon, 200, iconHeaders));
+  app.get("/apple-touch-icon.png", (c) => c.body(siteIcon, 200, iconHeaders));
+  app.get("/", (c) =>
+    c.html(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Baalda</title>
+<link rel="icon" type="image/png" sizes="256x256" href="/icon.png" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+</head>
+<body style="font-family: system-ui, sans-serif; margin: 3rem;">
+<p><img src="/icon.png" alt="Baalda" width="64" height="64" /></p>
+<p>This is the Baalda sync and MCP server. The app lives at <a href="https://baalda.com">baalda.com</a>.</p>
+</body>
+</html>`),
+  );
+
+  // RFC 9116 security.txt, read per request from SECURITY_CONTACT (e.g.
+  // `mailto:security@example.com`). Unset ⇒ 404, so a self-hosted server never
+  // advertises someone else's contact.
+  app.get("/.well-known/security.txt", (c) => {
+    const body = securityTxt(process.env.SECURITY_CONTACT);
+    if (!body) return c.notFound();
+    return c.body(body, 200, { "content-type": "text/plain; charset=utf-8" });
+  });
 
   // ── MCP OAuth discovery (RFC 8414 / RFC 9728) ─────────────────────────────
   // These MUST sit at the origin root: our protected-resource metadata names
@@ -163,8 +330,32 @@ export function createApp(deps: AppDeps): Hono {
   app.get("/.well-known/oauth-protected-resource", (c) =>
     oAuthProtectedResourceMetadata(auth)(c.req.raw),
   );
+  // RFC 9728 §3.1 path-suffixed form for the MCP endpoint: a client that knows
+  // the resource as <origin>/api/mcp asks here first (production saw it 404).
+  // Same metadata, with `resource` naming that exact URL as §3.3 requires.
+  app.get("/.well-known/oauth-protected-resource/api/mcp", async (c) => {
+    const res = await oAuthProtectedResourceMetadata(auth)(c.req.raw);
+    if (!res.ok) return res;
+    const body = (await res.json()) as Record<string, unknown>;
+    const resource = typeof body.resource === "string" ? body.resource : new URL(c.req.url).origin;
+    return new Response(JSON.stringify({ ...body, resource: `${resource.replace(/\/+$/, "")}/api/mcp` }), {
+      status: res.status,
+      headers: res.headers,
+    });
+  });
+  // Clients following the older MCP discovery treat the MCP URL as the issuer
+  // and insert its path (RFC 8414 §3.1). Our issuer is the origin, so this is
+  // the same document as the bare one.
+  app.get("/.well-known/oauth-authorization-server/api/mcp", (c) =>
+    oAuthDiscoveryMetadata(auth)(c.req.raw),
+  );
+  // Self-hosted woff2 fonts for the pages below and the public link page.
+  app.route("/", createFontRoutes());
   // The human-facing login + consent screens of that OAuth flow.
   app.route("/", oauthConnectRoutes);
+  // Account pages the emails link to: forgot/reset password, email verified,
+  // and the invitation landing page (bounces into the app's deep link).
+  app.route("/", accountPageRoutes);
 
   // Clickable share links: https://<server>/open/note/… bounces into the app's
   // baalda:// deep link. Public — the URL carries identity, never access.
@@ -175,11 +366,93 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/", createPublicPageRoutes({ docWriter: deps.docWriter }));
 
   // Better Auth owns everything under /api/auth (web-standard Request handler).
-  app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
+  // Email sign-in passes the per-account failure throttle first (#237).
+  // With ACCOUNT_KEY_PEPPER set, a successful sign-in also upgrades an old
+  // unpeppered login hash to `p1$` in place (seamless keys F, best-effort).
+  app.post("/api/auth/sign-in/email", async (c) => {
+    const creds = accountKeyPepper()
+      ? ((await c.req.raw.clone().json().catch(() => null)) as { email?: unknown; password?: unknown } | null)
+      : null;
+    const res = await throttledSignIn(c.req.raw, auth.handler);
+    if (res.ok && typeof creds?.email === "string" && typeof creds.password === "string") {
+      await upgradeLoginHash({ email: creds.email.trim() }, creds.password);
+    }
+    return res;
+  });
+  // A successful password change leaves the account key's password wrap under
+  // the old password's unlock key, so it can never open again: clear it (the
+  // reset path does the same in `onPasswordReset`). Session read BEFORE the
+  // handler, which may revoke it (`revokeOtherSessions`).
+  app.post("/api/auth/change-password", async (c) => {
+    const session = await getSession(c);
+    const res = await auth.handler(c.req.raw);
+    if (res.ok && session) {
+      await clearPasswordWrap(session.userId).catch((err: unknown) =>
+        console.error(`[auth] clearing the password wrap after a change failed: ${(err as Error).name}`),
+      );
+    }
+    return res;
+  });
+  app.on(["GET", "POST"], "/api/auth/*", async (c) => {
+    // OAuth connector tokens are stored as hashes (W3): the token endpoint is
+    // wrapped, and Better Auth's HTTP session probe (which would accept a
+    // stored hash as a bearer) is closed; POST /api/mcp resolves tokens itself.
+    if (isMcpGetSessionPath(c.req.path)) return c.json(null);
+    if (c.req.method === "POST" && isMcpTokenPath(c.req.path)) {
+      return handleMcpToken(c.req.raw, auth.handler, pool, { onIssued: rewrapOnIssue });
+    }
+    if (c.req.method !== "POST" || !c.req.path.startsWith("/api/auth/organization/")) {
+      return auth.handler(c.req.raw);
+    }
+    const session = await getSession(c);
+    const response = await auditRequestActor.run(session?.userId ?? null, () => auth.handler(c.req.raw));
+    // Better Auth's leave endpoint bypasses its afterRemoveMember hook.
+    if (session && response.ok && c.req.path === "/api/auth/organization/leave") {
+      // Attribution is best-effort: an unreadable body must never turn a
+      // completed leave into a 500. The event keeps its honest null actor.
+      const member = await response.clone().json().catch(() => null) as { id?: string } | null;
+      if (member?.id) await attributeMembershipEvent(member.id, "delete", session.userId);
+    }
+    return response;
+  });
 
   // Desktop Google sign-in handoff — deliberately NOT under /api/auth (the
   // catch-all above would shadow it). See desktop-oauth.ts.
   app.route("/api", desktopOauthRoutes);
+  app.route("/api", bugReportRoutes);
+  // Invitation preview (public, by unguessable id) + the signed-in inbox that
+  // sidesteps Better Auth's verified-email gate on list-user-invitations.
+  app.route("/api", invitationRoutes);
+  app.route("/api", memberRoutes);
+  app.route("/api", accessAuditRoutes);
+  app.route("/api", createAppearanceRoutes(deps));
+  app.route("/api", createSkillRoutes());
+  app.route("/api", createMessageRoutes());
+  // Client-held vault keys (W3): off unless BAALDA_VAULT_KEYS is on. The
+  // header middleware only decodes X-Baalda-VK; it never logs or caches it.
+  app.use("/api/*", vaultKeyHeader);
+  app.route("/api", createVaultKeyRoutes());
+  app.route("/api", createKeyRecoveryRoutes());
+  app.route("/api", createMcpKeyRoutes());
+  app.route(
+    "/api",
+    createMemberShareRoutes({ disconnectDoc: deps.disconnectDoc, onAclChanged: deps.onAclChanged }),
+  );
+  // Password reset request that reports sent / no account / failed (Better
+  // Auth's own endpoint is neutral and swallows send errors).
+  app.route("/api", passwordResetRoutes);
+  // Outdated-client gate (#251) on every route that hands out the ability to
+  // push CRDT state: the per-doc token (the only key to a writable Hocuspocus
+  // socket), the vault-channel token and the batch push. Mounted here, ahead
+  // of the routers, so the policy lives in one place. Reads stay open, so an
+  // old build can still sign in and list its vault while its updater runs.
+  // The policy is evaluated once now so a malformed MIN_CLIENT_VERSION fails
+  // at startup rather than on the first push.
+  clientVersionPolicy();
+  const clientGate = requireSupportedClient();
+  app.use("/api/sync-token", clientGate);
+  app.use("/api/vault-sync-token", clientGate);
+  app.use("/api/vaults/:vaultId/docs/batch", clientGate);
   app.route("/api", syncTokenRoutes);
   app.route("/api", vaultTokenRoutes);
   app.route(
@@ -187,8 +460,27 @@ export function createApp(deps: AppDeps): Hono {
     createRegistryRoutes({
       onRegistryChanged: deps.onRegistryChanged,
       disconnectDoc: deps.disconnectDoc,
+      evictDoc: deps.evictDoc,
     }),
   );
+  // Bulk engine: the batched twins of the registry creates, plus the whole-vault
+  // bootstrap download. Mounted beside the registry because they ARE the
+  // registry — same shared `registry/batch-ops.ts` body, same refusal codes —
+  // only without a network round trip per item.
+  app.route(
+    "/api",
+    createBulkRoutes({
+      onRegistryChanged: deps.onRegistryChanged,
+      // The bulk delete route kicks + unloads the docs it removes, off the
+      // response path. `evictDoc` and not `disconnectDoc`: the rows are gone, so
+      // a cached `Y.Doc` served to the next connect would re-materialise them.
+      evictDoc: deps.evictDoc,
+    }),
+  );
+  app.route("/api", bootstrapRoutes);
+  // A one-step file upload (`files-with-bytes`) creates its `files` row at
+  // `complete`; it owes the same registry broadcast `POST /api/files` makes.
+  setBlobRegistryNotifier(deps.onRegistryChanged);
   app.route("/api", blobRoutes);
   app.route(
     "/api",
@@ -197,6 +489,8 @@ export function createApp(deps: AppDeps): Hono {
       onRegistryChanged: deps.onRegistryChanged,
     }),
   );
+  app.route("/api", createTrashRoutes({ onRegistryChanged: deps.onRegistryChanged }));
+  app.route("/api", createShrinkBrakeRoutes());
   app.route("/api", createRepairRoutes({ evictDoc: deps.evictDoc }));
   app.route("/api", createShareRoutes(deps));
   app.route("/api", publicLinkApiRoutes);
@@ -219,6 +513,7 @@ export function createApp(deps: AppDeps): Hono {
       docWriter: deps.docWriter,
       disconnectDoc: deps.disconnectDoc,
       onRegistryChanged: deps.onRegistryChanged,
+      onAclChanged: deps.onAclChanged,
     }),
   );
 

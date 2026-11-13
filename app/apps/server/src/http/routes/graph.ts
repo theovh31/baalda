@@ -1,15 +1,18 @@
 import { Hono } from "hono";
 import { pool } from "../../db/pool.js";
 import { orgRole, vaultOrg } from "../../permissions/lookup.js";
-import { listReadableDocsInVault } from "../../permissions/vault-docs.js";
+import { listReadableDocsInVault, vaultAccess } from "../../permissions/vault-docs.js";
 import { getSession } from "../session.js";
 import { searchNoteIndex } from "../../index/indexer.js";
+import { docCryptoOf, requireVaultKey } from "../../crypto/transport.js";
 
 /**
  * Read-only views over the note index (spec: links + vectors).
  *
  *  - GET /api/vaults/:vaultId/graph  → nodes + wikilink edges for a graph view.
- *  - GET /api/vaults/:vaultId/search → semantic + keyword search over notes.
+ *  - GET /api/vaults/:vaultId/search → semantic + keyword search over notes
+ *    AND over the text extracted from the vault's files (`kind` tells them
+ *    apart).
  *
  * Both are gated like GET /vaults/:vaultId/locks: any member of the vault
  * may read.
@@ -20,6 +23,16 @@ export const graphRoutes = new Hono();
 function relPathStem(relPath: string): string {
   const base = relPath.split("/").pop() ?? relPath;
   return base.replace(/\.[^.]+$/, "");
+}
+
+/**
+ * Comparison key for wikilink resolution: NFC + lower-case. macOS file names
+ * are often NFD while typed link text is NFC, so `[[Café]]` must still find
+ * `Café.md` (#332). Used at comparison time only; stored paths, titles and
+ * `note_links.to_title` keep their original bytes.
+ */
+function linkMatchKey(s: string): string {
+  return s.normalize("NFC").toLowerCase();
 }
 
 /** Gate: caller must be a member of the vault. 404/403 otherwise. */
@@ -37,7 +50,8 @@ async function gateVaultMember(
 
 // Graph: every note in the vault plus its outgoing wikilink edges. `toDocId` is
 // resolved by matching a link's raw title against note titles / rel_path stems
-// (case-insensitive) in the same vault; unresolved links keep toDocId = null.
+// (case- and Unicode-normalization-insensitive, `linkMatchKey`) in the same
+// vault; unresolved links keep toDocId = null.
 graphRoutes.get("/vaults/:vaultId/graph", async (c) => {
   const session = await getSession(c);
   if (!session) return c.json({ error: "Authentication required" }, 401);
@@ -68,12 +82,12 @@ graphRoutes.get("/vaults/:vaultId/graph", async (c) => {
     relPath: n.rel_path,
   }));
 
-  // Resolve targets by lowercased title AND rel_path stem.
+  // Resolve targets by title AND rel_path stem, both through linkMatchKey.
   const byTitle = new Map<string, string>();
   for (const n of noteRows) {
-    const title = (n.title ?? relPathStem(n.rel_path)).toLowerCase();
+    const title = linkMatchKey(n.title ?? relPathStem(n.rel_path));
     if (!byTitle.has(title)) byTitle.set(title, n.id);
-    const stem = relPathStem(n.rel_path).toLowerCase();
+    const stem = linkMatchKey(relPathStem(n.rel_path));
     if (!byTitle.has(stem)) byTitle.set(stem, n.id);
   }
 
@@ -95,7 +109,7 @@ graphRoutes.get("/vaults/:vaultId/graph", async (c) => {
     .map((l) => ({
       fromDoc: l.from_doc,
       toTitle: l.to_title,
-      toDocId: byTitle.get(l.to_title.toLowerCase()) ?? null,
+      toDocId: byTitle.get(linkMatchKey(l.to_title)) ?? null,
     }));
 
   return c.json({ nodes, links });
@@ -110,6 +124,9 @@ graphRoutes.get("/vaults/:vaultId/search", async (c) => {
 
   const gate = await gateVaultMember(vaultId, session.userId);
   if (!gate.ok) return c.json({ error: gate.error }, gate.status);
+  // W3: a keyed vault's search rows are sealed; this request's own key opens them.
+  const vkr = await requireVaultKey(c, vaultId);
+  if (!vkr.ok) return vkr.response;
 
   const q = (c.req.query("q") ?? "").trim();
   if (!q) return c.json({ error: "q query param required" }, 400);
@@ -120,6 +137,10 @@ graphRoutes.get("/vaults/:vaultId/search", async (c) => {
   // note content, so scoring unreadable notes would be a content oracle.
   // Mirrors the MCP search tool. Owner/admin + Open vaults see everything.
   const readable = await listReadableDocsInVault(session.userId, vaultId);
+  // Vault-wide read is what decides whether the hash-named `attachments/`
+  // blobs (which have no doc of their own) are searchable for this caller —
+  // the same answer `canReadAttachment` gives when one is downloaded.
+  const access = await vaultAccess(pool, session.userId, vaultId);
 
   // Scoring lives in index/indexer.ts, which walks the vault in keyset batches
   // and keeps only {docId, score} per note — note bodies and embedding vectors
@@ -130,6 +151,8 @@ graphRoutes.get("/vaults/:vaultId/search", async (c) => {
     query: q,
     k,
     readableDocIds: readable,
+    vaultWideReader: access?.vaultWide === true,
+    crypto: docCryptoOf(vaultId, vkr),
   });
 
   return c.json({ results });
